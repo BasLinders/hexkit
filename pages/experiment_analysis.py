@@ -1,3 +1,4 @@
+from email import message
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,6 +8,8 @@ import concurrent.futures
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.cm as cm
+import matplotlib.ticker as mticker
+from matplotlib import colormaps
 import plotly.graph_objects as go
 from scipy.stats import beta, norm, chisquare
 import math
@@ -229,14 +232,23 @@ def get_frequentist_inputs():
         
         if uploaded_file:
             df_hist = pd.read_csv(uploaded_file)
+            cols = df_hist.columns.tolist()
+            
+            st.write("### Select baseline columns")
+            c1, c2 = st.columns(2)
+            with c1:
+                idx1 = cols.index("period_1") if "period_1" in cols else 0
+                col_pre = st.selectbox("Historical Baseline (Period A)", cols, index=idx1, key="cuped_pre")
+            with c2:
+                idx2 = cols.index("period_2") if "period_2" in cols else 0
+                col_post = st.selectbox("Historical Follow-up (Period B)", cols, index=idx2, key="cuped_post")
+        
+            is_valid, message, overlap_count = check_cuped_validity(df_hist, col_pre, col_post)
             row_count = len(df_hist)
-            is_valid, message = check_cuped_validity(df_hist, col_pre, col_post)
-    
-            if not is_valid:
-                st.warning(f"{message}")
-            else:
-                st.success(f"{message}")
 
+            if not is_valid:
+                st.warning(message)
+            else:
                 with st.expander("Data Quality & CUPED Reliability", expanded=False):
                     st.markdown(f"**Users found in both periods:** `{row_count:,}`")
                     
@@ -260,18 +272,8 @@ def get_frequentist_inputs():
 
                     st.info("**Note:** CUPED effectiveness depends on 'Returning Users'. If your business has low repeat-visit rates, variance reduction will naturally be limited.")
 
-                cols = df_hist.columns.tolist()
-                
-                c1, c2 = st.columns(2)
-                with c1:
-                    idx1 = cols.index("historical_period_1") if "historical_period_1" in cols else 0
-                    col_pre = st.selectbox("Historical Baseline (e.g. Month 1)", cols, index=idx1)
-                with c2:
-                    idx2 = cols.index("historical_period_2") if "historical_period_2" in cols else 0
-                    col_post = st.selectbox("Historical Follow-up (e.g. Month 2)", cols, index=idx2)
-                
                 reduction_factor, corr = calculate_cuped_reduction_factor(df_hist, col_pre, col_post)
-                
+            
                 st.info(f"**Correlation Found:** {corr:.2f}")
                 st.metric("New Variance Level", f"{(reduction_factor * 100):.1f}%", 
                         delta=f"-{((1 - reduction_factor) * 100):.1f}% Noise", delta_color="normal")
@@ -319,7 +321,7 @@ def validate_inputs(visitors, conversions, aovs=None):
 
 # -- Bayesian helper functions --
 
-def calculate_probabilities(visitor_counts, conversion_counts, alpha_prior=1, beta_prior=1, num_samples=10000, seed=42):
+def calculate_probabilities(visitor_counts, conversion_counts, alpha_prior=1.0, beta_prior=1.0, num_samples=10000, seed=42):
     # np.random.seed(seed) -- older method
     np.random.default_rng(seed=seed) # modern method
     
@@ -372,7 +374,7 @@ def get_beta_priors(expected_conversion_rate: float, belief_strength: str, expec
 
     return alpha_prior, beta_prior
 
-def simulate_uplift_distributions(visitor_counts, conversion_counts, alpha_prior=1, beta_prior=1, num_samples=20000, seed=42):
+def simulate_uplift_distributions(visitor_counts, conversion_counts, alpha_prior=1.0, beta_prior=1.0, num_samples=20000, seed=42):
     np.random.seed(seed)
     num_variants = len(visitor_counts)
 
@@ -398,7 +400,7 @@ def simulate_uplift_distributions(visitor_counts, conversion_counts, alpha_prior
 
 def plot_uplift_histograms(uplift_distributions, observed_uplifts):
     num_challengers = len(uplift_distributions)
-    alphabet = string.ascii_uppercase
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
     fig, axes = plt.subplots(
         nrows=num_challengers, 
@@ -410,7 +412,9 @@ def plot_uplift_histograms(uplift_distributions, observed_uplifts):
 
     for i, ax in enumerate(axes):
         diffs_percentage = uplift_distributions[i] * 100
-        observed_uplift = observed_uplifts[i] * 100
+        # Ensure observed_uplift is a float, not an array
+        observed_uplift = float(observed_uplifts[i] * 100) 
+        
         challenger_label = alphabet[i + 1]
         control_label = alphabet[0]
         
@@ -425,6 +429,8 @@ def plot_uplift_histograms(uplift_distributions, observed_uplifts):
         num_bins = calculate_optimal_bins(diffs_percentage)
         
         n, bins, patches = ax.hist(diffs_percentage, bins=num_bins, edgecolor='black', alpha=0.6)
+        
+        # Color logic
         for patch in patches:
             if patch.get_x() < 0:
                 patch.set_facecolor('lightcoral')
@@ -436,32 +442,14 @@ def plot_uplift_histograms(uplift_distributions, observed_uplifts):
         range_min, range_max = mean_diff - 3.5 * std_diff, mean_diff + 3.5 * std_diff
         ax.set_xlim(range_min, range_max)
 
-        try:
-            plot_width_inches = fig.get_size_inches()[0]
-            range_width = range_max - range_min
-            
-            renderer = fig.canvas.get_renderer()
-            
-            sample_text = ax.text(0.5, 0.5, f'{range_min:.2f}%', transform=ax.transAxes, ha='center', va='center')
-            text_bbox = sample_text.get_window_extent(renderer)
-            text_height_pixels = text_bbox.height
-            sample_text.remove()
-
-            dpi = fig.dpi
-            text_height_inches = text_height_pixels / dpi
-            min_tick_spacing_inches = text_height_inches * 1.5
-            
-            num_ticks_inches = int(plot_width_inches / min_tick_spacing_inches) if min_tick_spacing_inches > 0 else 5
-            num_ticks = max(min(num_ticks_inches, 10), 2)
-            
-            xticks = np.linspace(range_min, range_max, num_ticks)
-            ax.set_xticks(xticks)
-            ax.set_xticklabels([f'{tick:.2f}%' for tick in xticks], rotation=45, ha='right')
-        except Exception:
-            ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.2f}%'))
-            plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+        # 2. FIXED TICK FORMATTING
+        # We avoid the complex 'renderer' logic which causes VSCode errors
+        ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f'{x:.2f}%'))
+        plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
 
         line_label = f'Observed Uplift ({challenger_label} vs {control_label}): {observed_uplift:.2f}%'
+        
+        # 3. FIXED AXVLINE (ensure x is a single float)
         line_observed_uplift = ax.axvline(x=observed_uplift, color='red', linestyle='--', linewidth=2, label=line_label)
         
         patch_a = mpatches.Patch(color='lightcoral', label=f'{control_label} is better')
@@ -473,7 +461,8 @@ def plot_uplift_histograms(uplift_distributions, observed_uplifts):
         ax.legend(handles=[line_observed_uplift, patch_a, patch_b])
         ax.grid(True, linestyle='--', alpha=0.6)
 
-    plt.tight_layout(pad=3.0)
+    # Use a tuple for rect to satisfy the type checker
+    fig.tight_layout(pad=3.0, rect=(0, 0, 1, 1)) 
     st.pyplot(fig)
     plt.close(fig)
 
@@ -482,27 +471,28 @@ def plot_winner_probabilities_chart(probabilities_to_be_best):
     
     alphabet = string.ascii_uppercase
     variant_labels = [f"Variant {alphabet[i]}" for i in range(num_variants)]
-    colormap = plt.colormaps.get('viridis')
-    colors = colormap(np.linspace(0, 1, num_variants))
+    cmap = colormaps['viridis'] 
+    colors = cmap(np.linspace(0, 1, num_variants))
     
     fig_height = 2 + num_variants * 0.8
-    plt.figure(figsize=(10, fig_height))
+    fig, ax = plt.subplots(figsize=(10, fig_height))
     
-    bars = plt.barh(variant_labels, probabilities_to_be_best, color=colors, edgecolor='black', alpha=0.8)
-    
-    plt.xlabel('Chance for Variants to be the Best')
-    plt.title('Chance per Variant to generate the most Conversions')
-    plt.xlim(0, 1.05)
-    plt.gca().invert_yaxis()
+    ax.barh(variant_labels, probabilities_to_be_best, color=colors, edgecolor='black', alpha=0.8)
+    ax.set_xlabel('Chance for Variants to be the Best')
+    ax.set_title('Chance per Variant to generate the most Conversions')
+    ax.set_xlim(0, 1.05)
+    ax.invert_yaxis()
 
     for index, value in enumerate(probabilities_to_be_best):
         if value > 0.9:
-            plt.text(value - 0.02, index, f"{value:.2%}", ha='right', va='center', color='white', fontweight='bold', fontsize=12)
+            ax.text(value - 0.02, index, f"{value:.2%}", ha='right', va='center', 
+                    color='white', fontweight='bold', fontsize=12)
         else:
-            plt.text(value + 0.01, index, f"{value:.2%}", ha='left', va='center', color='black', fontsize=11)
+            ax.text(value + 0.01, index, f"{value:.2%}", ha='left', va='center', 
+                    color='black', fontsize=11)
 
-    st.pyplot(plt)
-    plt.close()
+    st.pyplot(fig)
+    plt.close(fig)
 
 def perform_multi_variant_risk_assessment(
     visitor_counts, 
@@ -510,8 +500,8 @@ def perform_multi_variant_risk_assessment(
     aovs,
     probabilities_to_be_best,
     runtime_days,
-    alpha_prior=1, 
-    beta_prior=1, 
+    alpha_prior=1.0, 
+    beta_prior=1.0, 
     projection_period=183, 
     seed=42
 ):
@@ -712,18 +702,33 @@ def plot_cuped_comparison(results, visitor_counts):
     
     return fig
 
-def check_cuped_validity(df, col1, col2):
-    total_users = len(df)
+#def check_cuped_validity(df, col1, col2):
+#    total_users = len(df)
     # Count users who converted in at least one period
-    active_converters = df[(df[col1] > 0) | (df[col2] > 0)]
+#    active_converters = df[(df[col1] > 0) | (df[col2] > 0)]
     
-    if total_users < 100:
-        return False, "Sample size too small (<100 users) for reliable correlation."
+#    if total_users < 100:
+#        return False, "Sample size too small (<100 users) for reliable correlation."
     
-    if len(active_converters) / total_users < 0.01:
-        return False, "Very low conversion overlap. CUPED might provide noisy results."
+#    if len(active_converters) / total_users < 0.01:
+#        return False, "Very low conversion overlap. CUPED might provide noisy results."
     
-    return True, "Data quality looks good."
+#    return True, "Data quality looks good."
+
+def check_cuped_validity(df, col1, col2):
+    # Drop rows where either period is missing to find the 'Returning User' count
+    overlap_df = df.dropna(subset=[col1, col2])
+    overlap_count = len(overlap_df)
+    total_users = len(df)
+    
+    if overlap_count < 100:
+        return False, f"Critically low overlap ({overlap_count} users). Need at least 100 returning users.", overlap_count
+    
+    # Check if there is actual variance (don't want all 0s)
+    if overlap_df[col1].std() == 0 or overlap_df[col2].std() == 0:
+        return False, "One of the columns has zero variance (all values are the same).", overlap_count
+        
+    return True, "Data quality looks good.", overlap_count
     
 def display_ci_chart(results, current_variant_idx, alphabet):
     # Prepare data for Control (0) and the current Variant (i)
@@ -1018,12 +1023,12 @@ def plot_conversion_distributions(results):
             else:
                 label_text = ''
             
-            ax.fill_between(x_range * 100, pdf_variant, 0, where=fill_condition,
+            ax.fill_between(x_range * 100, pdf_variant, 0, where=fill_condition.tolist(),
                             color=shade_color, alpha=shade_alpha, label=label_text)
             
             prob_text_display = f"P({variant_label_char}>{control_label_char}): {prob_variant_better*100:.1f}%"
 
-            ax.axvline(bound_line_value, color='grey', linestyle=':', linewidth=1, alpha=0.7)
+            ax.axvline(float(bound_line_value), color='grey', linestyle=':', linewidth=1, alpha=0.7)
             
             mid_point_cr = (control_cr + variant_cr) / 2.0
             
@@ -1046,7 +1051,7 @@ def plot_conversion_distributions(results):
     ax.set_ylim(bottom=0)
     ax.grid(True, which='major', linestyle='--', linewidth=0.5, alpha=0.3)
 
-    fig.tight_layout(rect=[0, 0, 0.85, 1])
+    fig.tight_layout(rect=(0, 0, 0.85, 1))
 
     st.pyplot(fig)
     plt.close(fig)
@@ -1125,7 +1130,7 @@ def display_frequentist_summary(
 
         st.write("#### Confidence Interval Comparison")
         fig = display_ci_chart(results, i, alphabet)
-        st.altair_chart(fig, use_container_width=True)
+        st.altair_chart(fig, width='stretch')
         st.write("")
         
         # --- Superiority Test ---
@@ -1155,8 +1160,11 @@ def display_frequentist_summary(
                 z_stat_noninf = (conversion_rates[i] - conversion_rates[0] + non_inferiority_margin) / se_unpooled
                 p_value_noninf = 1 - norm.cdf(z_stat_noninf)
                 alpha_noninf = 1 - (confidence_noninf / 100)
+                z_crit_ni = norm.ppf(1 - alpha_noninf)
+                lower_bound_diff = (conversion_rates[i] - conversion_rates[0]) - (z_crit_ni * se_unpooled)
 
                 st.markdown(f" * **P-value (non-inferiority test):** {p_value_noninf:.4f} (margin: {non_inferiority_margin*100:.1f}%)")
+                st.markdown(f" * **Lower Bound of Difference:** {lower_bound_diff*100:.2f}% (Limit: {-non_inferiority_margin*100:.2f}%)")
                 
                 if p_value_noninf <= alpha_noninf:
                     st.success(f"Although not a winner, the non-inferiority test suggests that {alphabet[i]} is **not significantly worse** than {alphabet[0]} within the predefined margin.")
@@ -1280,7 +1288,7 @@ def run():
                             st.session_state.tail
                         )
 
-                        st.plotly_chart(plot_cuped_comparison(test_results, visitor_counts), use_container_width=True)
+                        st.plotly_chart(plot_cuped_comparison(test_results, visitor_counts), width='stretch')
 
                         if test_results['reduction_factor'] < 1.0:
                             st.caption(f"The curves above are narrowed by {((1-test_results['reduction_factor'])*100):.1f}% "
@@ -1303,11 +1311,11 @@ def run():
                         if test_results:
                             plot_conversion_distributions(test_results)
                             display_frequentist_summary(
-                                reduction_factor,
-                                test_results, 
-                                visitor_counts, 
+                                test_results,
+                                visitor_counts,
                                 conversion_counts,
-                                non_inferiority_margin=non_inferiority_margin
+                                non_inferiority_margin=non_inferiority_margin,
+                                reduction_factor=reduction_factor
                             )
                 except Exception as e:
                     st.error(f"An error occurred during calculation: {e}")
