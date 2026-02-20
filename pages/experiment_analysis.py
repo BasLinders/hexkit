@@ -668,8 +668,15 @@ def plot_cuped_comparison(results, visitor_counts):
     fig = go.Figure()
     
     # Generate a range of x-values (conversion rates) for the plot
-    x_min = max(0, results['lowest boundary'] - 0.05)
-    x_max = min(1, results['highest boundary'] + 0.05)
+    # x_min = max(0, results['lowest boundary'] - 0.05)
+    # x_max = min(1, results['highest boundary'] + 0.05)
+    all_means = np.array(results['conversion_rates'])
+    all_ses = np.array(results['standard_errors'])
+    reach = 4 * np.maximum(all_ses, 1e-9)
+    plot_min = np.min(all_means - reach)
+    plot_max = np.max(all_means + reach)
+    x_min = max(0.0, plot_min)
+    x_max = min(1.0, plot_max)
     x = np.linspace(x_min, x_max, 500)
 
     colors = ['#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A']
@@ -943,7 +950,7 @@ def plot_conversion_distributions(results):
     sidak_alpha = results['sidak_alpha']
     
     st.write("")
-    st.write("### Probability Density Graph:")
+    st.write("### Probability Density of Estimated Conversion Rates")
 
     fig, ax = plt.subplots(figsize=(12, 7))
 
@@ -1287,10 +1294,9 @@ def run():
                             confidence_level,
                             st.session_state.tail
                         )
-
-                        st.plotly_chart(plot_cuped_comparison(test_results, visitor_counts), width='stretch')
-
+                        
                         if test_results['reduction_factor'] < 1.0:
+                            st.plotly_chart(plot_cuped_comparison(test_results, visitor_counts), width='stretch')
                             st.caption(f"The curves above are narrowed by {((1-test_results['reduction_factor'])*100):.1f}% "
                                     "based on your historical benchmark data.")
 
