@@ -205,7 +205,7 @@ def get_frequentist_inputs():
             The result: Narrower confidence intervals and the ability to detect smaller effects with the same sample size.
 
             **How it works**
-            *HEXKIT* uses your uploaded historical data to calculate the Pearson correlation coefficient ($\rho^2$) between two time periods. This tells us how consistent your users are over time.
+            *HEXKIT* has a CUPED-light implementation (multi-period historical benchmark instead of historical benchmark combined with user-level experiment data) that uses your uploaded historical data to calculate the Pearson correlation coefficient ($\rho^2$) between two time periods. This tells us how consistent your users are over time.
             We then apply this correlation as a variance adjustment factor to your current experiment results. The Standard Error is adjusted using the formula $$ SE_{adjusted} = \sqrt{\frac{p(1-p)(1-\rho^2)}{n}} $$. This effectively 'shrinks' the probability density curves, removing the portion of variance that was already predictable from pre-experiment behavior.   
         """)
     
