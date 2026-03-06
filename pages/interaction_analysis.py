@@ -218,10 +218,10 @@ def run():
     # --- How to Use ---
     with st.expander("How to Use This Tool"):
         st.markdown("""
-        1. **Sidebar Setup**: Use the sidebar to set the number of tests you are running and name them.
-        2. **Enter Data**: Fill in the table for every combination that occurred (e.g., Control/Control, B/Control, B/X).
-        3. **Rows**: Use the **(+)** button at the bottom of the table to add new combination rows.
-        4. **Baseline**: Ensure at least one row represents your 'Control' group for each test.
+        1. **Define Tests & Variants**: In the sidebar, name your tests and list their variants separated by commas (e.g., `Control, Blue, Red`).
+        2. **The Matrix**: The table will automatically generate every possible combination of those variants.
+        3. **First is Baseline**: The **first variant** you list for each test is treated as the "Control" by the statistical model.
+        4. **Fill & Calculate**: Enter your numbers and hit 'Calculate' to see which specific variants—or combinations—are driving results.
         """)
         st.info("**Important:** Be sure to group experiment variants together when you enter data (e.g., B and B/X) to capture the interaction effects properly. Read rows from left to right to know which combinations to enter data for.")
 
