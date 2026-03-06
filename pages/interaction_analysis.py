@@ -13,40 +13,50 @@ st.set_page_config(
 
 def user_input():
     st.sidebar.header("Configuration")
-    
     num_tests = st.sidebar.number_input("Number of concurrent tests", min_value=1, max_value=5, value=2)
     
-    test_names: List[str] = []
+    test_configs = []
     for i in range(num_tests):
-        name = st.sidebar.text_input(f"Test {i+1} Name", value=f"test_{i+1}")
-        test_names.append(name)
+        st.sidebar.markdown(f"---")
+        name = st.sidebar.text_input(f"Test {i+1} Name", value=f"test_{i+1}", key=f"t_name_{i}")
+        # Let users define custom variants for EACH test
+        variants_str = st.sidebar.text_input(
+            f"Variants for {name} (comma-separated)", 
+            value="A, B", 
+            key=f"t_vars_{i}"
+        )
+        # Clean the input into a list of strings
+        variants = [v.strip() for v in variants_str.split(",") if v.strip()]
+        test_configs.append({"name": name, "variants": variants})
 
     st.write("### Experiment Data Entry")
     
-    # Generate all combinations of Control/Variant
-    variants = [['A', 'B'] for _ in range(num_tests)]
-    combinations = list(itertools.product(*variants))
+    # Extract names and variant lists for the matrix
+    test_names = [config["name"] for config in test_configs]
+    all_variant_levels = [config["variants"] for config in test_configs]
     
-    # --- Fix: Build rows safely to avoid Pylance Type Mismatch ---
+    # Generate the combinations (e.g., Control/Variant_B/Variant_C)
+    combinations = list(itertools.product(*all_variant_levels))
+    
     init_data: List[Dict[str, Any]] = []
     for combo in combinations:
-        # 1. Create the test variant part (Strings)
+        # Merge test variant part and numeric part safely for Pylance
         test_part = {test_names[i]: str(combo[i]) for i in range(num_tests)}
-        # 2. Create the data part (Integers)
         data_part = {"visitors": 0, "conversions": 0}
-        # 3. Merge them using the union operator (Python 3.9+)
-        full_row = test_part | data_part
-        init_data.append(full_row)
+        init_data.append(test_part | data_part)
     
-    # Initialize DataFrame with explicit types for numeric columns
     default_df = pd.DataFrame(init_data)
     default_df["visitors"] = default_df["visitors"].astype(int)
     default_df["conversions"] = default_df["conversions"].astype(int)
     
-    st.markdown(f"Fill in the data for all **{len(combinations)}** combinations below.")
+    st.markdown(f"Fill in data for all **{len(combinations)}** unique segments below:")
     
-    # use_container_width replaces width='stretch'
-    edited_df = st.data_editor(default_df, num_rows="fixed", use_container_width=True)
+    edited_df = st.data_editor(
+        default_df, 
+        num_rows="fixed", 
+        use_container_width=True,
+        hide_index=True
+    )
     
     return edited_df, test_names
 
