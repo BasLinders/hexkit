@@ -183,32 +183,6 @@ def run():
     This tool helps you analyze the interactions between multiple concurrent A/B tests.
     """)
 
-    df, test_cols = user_input()
-
-    # --- SQL Query Helper ---
-    with st.expander("SQL Query Helper (Get your data)"):
-        st.markdown("""
-        To get the data for this tool, you need to group your users by **every** experiment they were exposed to. 
-        Use the template below in your data warehouse (BigQuery, Snowflake, etc.):
-        """)
-        
-        # Dynamically generate the column names based on user input
-        test_cols_sql = ",\n    ".join([f"{name}_variant" for name in test_cols])
-        group_by_sql = ", ".join([str(i+1) for i in range(len(test_cols))])
-        
-        sql_lines = [
-            "SELECT",
-            f"    {test_cols_sql},",
-            "    COUNT(user_id) AS visitors,",
-            "    SUM(conversion_flag) AS conversions",
-            "FROM user_experiment_log",
-            f"GROUP BY {group_by_sql}"
-        ]
-
-        sql_code = "\n".join(sql_lines)
-        st.code(sql_code, language="sql")
-        st.info("**Note:** Ensure your variant names (e.g., 'A', 'B') match the names you type into the table below.")
-    
     # --- When to use this tool ---
     with st.expander("Why Use This Tool?"):
         st.markdown("""
@@ -252,6 +226,32 @@ def run():
         
         The **interaction term** ($\beta_3$) tells us if the combined effect of two variants is significantly different from the sum of their individual effects.
         """)
+
+    df, test_cols = user_input()
+
+    # --- SQL Query Helper ---
+    with st.expander("SQL Query Helper (Get your data)"):
+        st.markdown("""
+        To get the data for this tool, you need to group your users by **every** experiment they were exposed to. 
+        Use the template below in your data warehouse (BigQuery, Snowflake, etc.):
+        """)
+        
+        # Dynamically generate the column names based on user input
+        test_cols_sql = ",\n    ".join([f"{name}_variant" for name in test_cols])
+        group_by_sql = ", ".join([str(i+1) for i in range(len(test_cols))])
+        
+        sql_lines = [
+            "SELECT",
+            f"    {test_cols_sql},",
+            "    COUNT(user_id) AS visitors,",
+            "    SUM(conversion_flag) AS conversions",
+            "FROM user_experiment_log",
+            f"GROUP BY {group_by_sql}"
+        ]
+
+        sql_code = "\n".join(sql_lines)
+        st.code(sql_code, language="sql")
+        st.info("**Note:** Ensure your variant names (e.g., 'A', 'B') match the names you type into the table below.")
 
     if st.button("Calculate Interaction Effects", type="primary"):
         if not df.empty and (df['visitors'] > 0).all():
