@@ -58,24 +58,6 @@ def preprocess_data(df):
 
 # Detect outliers
 
-#def detect_outliers(df, kpi, outlier_stdev):
-#    model = smf.ols(f'{kpi} ~ C(experience_variant_label)', data=df).fit()
-#    influence = model.get_influence()
-#    standardized_residuals = influence.resid_studentized_internal
-#    leverage = influence.hat_matrix_diag
-#    dffits = influence.dffits[0]
-
-#    residual_threshold = outlier_stdev
-#    leverage_threshold = outlier_stdev * (model.df_model + 1) / len(df)
-#    dffits_threshold = outlier_stdev * np.sqrt((model.df_model + 1) / len(df))
-
-#    residuals_outliers = np.abs(standardized_residuals) > residual_threshold
-#    leverage_outliers = leverage > leverage_threshold
-#    dffits_outliers = np.abs(dffits) > dffits_threshold
-#    outliers_mask = residuals_outliers | leverage_outliers | dffits_outliers
-
-#    return outliers_mask, model  # Return the initial model
-
 def detect_outliers(df, kpi, outlier_stdev, large_file_threshold=10000):
     try:
         if len(df) > large_file_threshold:
@@ -115,37 +97,6 @@ def detect_outliers(df, kpi, outlier_stdev, large_file_threshold=10000):
         return pd.Series([False] * len(df)), None
 
 # Winsorize and IQR filter combined
-
-#def winsorize_iqr_filter(df, kpi, outlier_stdev, percentile):
-#    # Ensure outlier_stdev is not None before using it
-#    if outlier_stdev is None:
-#        outlier_stdev = 3  # Default value if not provided
-#
-#    # Calculate IQR
-#    Q1 = df[kpi].quantile(0.25)
-#    Q3 = df[kpi].quantile(0.75)
-#    IQR = Q3 - Q1
-
-    # Define upper and lower bounds using both IQR and standard deviation
-#    lower_bound = max(Q1 - 1.5 * IQR, df[kpi].mean() - (outlier_stdev * df[kpi].std()))
-#    upper_bound = min(Q3 + 1.5 * IQR, df[kpi].mean() + (outlier_stdev * df[kpi].std()))
-
-    # Ensure percentile is not None before using it
-#    if percentile is None:
-#        percentile = 95  # Default percentile if not provided
-
-#    # Alternative Winsorization using percentile-based capping
-#    lower_percentile = (100 - percentile) / 200
-#    upper_percentile = 1 - lower_percentile
-#    percentile_lower = df[kpi].quantile(lower_percentile)
-#    percentile_upper = df[kpi].quantile(upper_percentile)
-
-    # Apply Winsorization
-#    df_copy = df.copy()  # Create a copy to avoid SettingWithCopyWarning
-#    df_copy[kpi] = np.where(df_copy[kpi] < percentile_lower, percentile_lower, df_copy[kpi])
-#    df_copy[kpi] = np.where(df_copy[kpi] > percentile_upper, percentile_upper, df_copy[kpi])
-
-#    return df_copy, lower_bound, upper_bound, percentile_lower, percentile_upper
 
 def winsorize_data(df, kpi, method, outlier_stdev=None, percentile=None):
     df_copy = df.copy() # Create a copy to avoid modifying the original DataFrame
@@ -207,76 +158,6 @@ def log_transform_data(df, kpi):
     return df_copy
 
 # Perform statistical tests and provide conclusions
-
-#def perform_stat_tests_and_conclusions(df, kpi, model):
-#    st.write("## Test Results")
-#    st.write("Below are the results of your experiment data, dictated by the chosen tests.")
-    # Shapiro-Wilk test on RESIDUALS, not the raw data
-#    shapiro_stat, shapiro_p_val = shapiro(model.resid)
-#    groups = [group[kpi].dropna() for _, group in df.groupby('experience_variant_label', observed=True)]
-#    levene_stat, levene_p_val = levene(*groups)
-
-#    st.write("### Shapiro-Wilk Test (Normality of Residuals)") # Corrected description
-#    st.write(f"Statistic = {shapiro_stat:.4f}, p-value = {shapiro_p_val:.4f}")
-
-#    st.write("### Levene's Test (Homogeneity of Variance)")
-#    st.write(f"Statistic = {levene_stat:.4f}, p-value = {levene_p_val:.4f}")
-
-#    significant = "no significant"
-#    if shapiro_p_val >= 0.05 and levene_p_val >= 0.05:
-#        st.write("### Standard ANOVA")
-#        st.write("\nPerforming standard ANOVA (data is normal and variances are homogeneous).")
-#        anova_results = sm.stats.anova_lm(model, typ=2)
-#        st.write(anova_results)
-
-#        if anova_results['PR(>F)'].iloc[0] < 0.05:
-#            significant = "significant"
-#            tukey_results = pairwise_tukeyhsd(df[kpi], df['experience_variant_label'])
-#            st.write("Tukey's Honestly Significant Difference test results:")
-#            st.write(tukey_results)
-#    elif levene_p_val >= 0.05:  # Check homogeneity of variance for Welch's ANOVA
-#        st.write("### Welch's ANOVA")
-#        st.write("\nPerforming Welch's ANOVA (data is not normal, but variances are homogeneous).")
-        # Welch's ANOVA using pingouin
-#        aov = welch_anova(data=df, dv=kpi, between='experience_variant_label')
-#        st.write(aov)
-        # No post-hoc test is typically used with Welch's ANOVA if only two groups
-#        if aov['p-unc'][0] < 0.05:
-#            significant = "significant"
-
-#    else:  # Variances are heterogeneous
-#        if len(df['experience_variant_label'].unique()) > 2:
-#            st.write("### Kruskal-Wallis Test")
-#            st.write("\nPerforming Kruskal-Wallis test (non-parametric, variances heterogeneous, three or more groups).")
-#            statistic, p_value = kruskal(*groups)
-#            st.write(f"Kruskal-Wallis Test: Statistic = {statistic:.4f}, p-value = {p_value:.4g}")
-#            if p_value < 0.05:
-#                significant = "significant"
-#        else:
-#            st.write("\nPerforming Mann-Whitney U test (non-parametric, variances heterogeneous, two groups).")
-#            group1, group2 = groups
-#            statistic, p_value = mannwhitneyu(group1, group2)
-#            st.write("### Mann-Whitney U Test")
-#            st.write(f"Mann-Whitney U Test: Statistic = {statistic:.4f}, p-value = {p_value:.4g}")
-#            if p_value < 0.05:
-#                significant = "significant"
-
-#    summary_stats = df.groupby('experience_variant_label', observed=True)[kpi].agg(['mean', 'std'])
-#    highest_mean_variant = summary_stats['mean'].idxmax()
-#    highest_std_variant = summary_stats['std'].idxmax()
-#    st.write("### Summary Statistics")
-#    st.dataframe(summary_stats)
-
-#    st.write(f"- The variant with the highest mean is '{highest_mean_variant}' with {summary_stats['mean'].loc[highest_mean_variant]:.2f}.")
-#    st.write(f"- The variant with the highest standard deviation is '{highest_std_variant}' with {summary_stats['std'].loc[highest_std_variant]:.2f}.")
-
-#    st.write("### Conclusion")
-#    if significant == "significant" and highest_mean_variant == "B" and highest_std_variant == "B":
-#        st.write(f"Congratulations! Variant B is the <span style='color: green;'>winner</span>!", unsafe_allow_html=True)
-#    elif significant == "significant" and highest_mean_variant == "A" and highest_std_variant == "A":
-#        st.write(f"<span style='color: orange;'>Loss prevented</span>! Variant B performed significantly worse.", unsafe_allow_html=True)
-#    else:
-#        st.write("No significant differences detected. More data may be needed.")
 
 def perform_stat_tests_and_conclusions(df, kpi, model_after):
     st.write("---") # Separator
@@ -697,6 +578,6 @@ def run():
             plt.clf()
 
             perform_stat_tests_and_conclusions(processed_df, kpi, model_after)  # Pass the refitted model
-
+            
 if __name__ == "__main__":
     run()
