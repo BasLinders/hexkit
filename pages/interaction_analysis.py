@@ -2,7 +2,7 @@ import pandas as pd
 import itertools
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
-import seaborn as sns
+import textwrap
 from typing import Dict, Any, List
 import streamlit as st
 
@@ -76,9 +76,34 @@ def perform_logistic_regression(df, test_cols):
             family=sm.families.Binomial(), 
             freq_weights=df['Count']
         ).fit()
+
+        # --- Clean up the summary table for better readability ---
+        summary_table = model.summary2().tables[1]
+        
+        new_names = {}
+        for old_name in summary_table.index:
+            if old_name == 'Intercept':
+                new_names[old_name] = 'Baseline (Control)'
+                continue
+            
+            # Clean up the name
+            # 1. Handle Interactions (containing ':')
+            if ':' in old_name:
+                parts = old_name.split(':')
+                clean_parts = [p.replace('C(', '').split(')')[0] for p in parts]
+                new_names[old_name] = f"{' & '.join(clean_parts)} Interaction"
+            # 2. Handle Main Effects
+            else:
+                clean_name = old_name.replace('C(', '').split(')')[0]
+                variant_name = old_name.split('[T.')[1].replace(']', '')
+                new_names[old_name] = f"{clean_name} ({variant_name})"
+        
+        # Apply the new names to the summary table
+        summary_table.index = summary_table.index.map(new_names)
         
         st.write("### Model Summary")
-        st.write(model.summary())
+        #st.write(model.summary())
+        st.dataframe(summary_table.astype(float).round(4), use_container_width=True)
         
         # Interaction Logic
         p_values = model.pvalues
@@ -89,7 +114,8 @@ def perform_logistic_regression(df, test_cols):
             st.warning(f"Detected {len(significant_interactions)} significant interaction(s):")
             for idx, pval in significant_interactions.items():
                 coef = model.params[idx]
-                st.write(f"- **{idx}**: p={pval:.2e}, Coef: {coef:.4f} ({'Positive' if coef > 0 else 'Negative'} Interaction)")
+                display_name = new_names.get(idx, idx)
+                st.write(f"- **{display_name}**: p={pval:.2e}, Coef: {coef:.4f} ({'Positive' if coef > 0 else 'Negative'} Interaction)")
         else:
             st.success("No significant test interactions detected.")
             
@@ -167,19 +193,21 @@ def run():
         """)
         
         # Dynamically generate the column names based on user input
-        test_cols_sql = ", \n    ".join([f"{name}_variant" for name in test_cols])
+        test_cols_sql = ",\n    ".join([f"{name}_variant" for name in test_cols])
         group_by_sql = ", ".join([str(i+1) for i in range(len(test_cols))])
         
-        sql_code = f"""
-        SELECT 
-            {test_cols_sql},
-            COUNT(user_id) AS visitors,
-            SUM(conversion_flag) AS conversions
-        FROM user_experiment_log
-        GROUP BY {group_by_sql}
-        """
+        sql_lines = [
+            "SELECT",
+            f"    {test_cols_sql},",
+            "    COUNT(user_id) AS visitors,",
+            "    SUM(conversion_flag) AS conversions",
+            "FROM user_experiment_log",
+            f"GROUP BY {group_by_sql}"
+        ]
+
+        sql_code = "\n".join(sql_lines)
         st.code(sql_code, language="sql")
-        st.info("**Note:** Ensure your variant names (e.g., 'Control', 'B') match the names you type into the table below.")
+        st.info("**Note:** Ensure your variant names (e.g., 'A', 'B') match the names you type into the table below.")
     
     # --- When to use this tool ---
     with st.expander("Why Use This Tool?"):
