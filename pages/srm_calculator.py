@@ -1,5 +1,7 @@
 import streamlit as st
 import scipy.stats as stats
+import altair as alt
+import pandas as pd
 import statistics
 import string
 import math
@@ -40,15 +42,29 @@ def render_results(results, visitor_counts, num_variants):
     alphabet = string.ascii_uppercase
     p_value = results["p_value"]
     
-    # Visualizing the difference
-    st.write("### Visual Comparison")
-    chart_data = {
+    # Prepare Data for Altair
+    raw_data = {
         "Variant": [alphabet[i] for i in range(num_variants)],
         "Observed": visitor_counts,
         "Expected": [round(x) for x in results["expected_counts"]]
     }
-    # Reshaping for a grouped bar chart
-    st.bar_chart(data=chart_data, x="Variant", y=["Observed", "Expected"], color=["#1f77b4", "#ff7f0e"])
+    df = pd.DataFrame(raw_data)
+    
+    # Transform data from columns to rows (Melt)
+    df_melted = df.melt('Variant', var_name='Metric', value_name='Count')
+
+    st.write("### Visual Comparison")
+
+    # Create the Altair Chart
+    chart = alt.Chart(df_melted).mark_bar().encode(
+        x=alt.X('Variant:N', title='Experiment Variant', 
+                axis=alt.Axis(labelAngle=0)),
+        y=alt.Y('Count:Q', title='Number of Visitors'),
+        color=alt.Color('Metric:N', scale=alt.Scale(range=['#ff7f0e', '#1f77b4'])),
+        xOffset='Metric:N' # Creates the "grouped" bar effect
+    ).properties(width='container', height=400)
+
+    st.altair_chart(chart, width="stretch")
 
     if results["is_mismatch"]:
         st.error(f"SRM Detected! P-value: {p_value:.4f}")
@@ -59,7 +75,7 @@ def render_results(results, visitor_counts, num_variants):
 
     # Show the table below the chart
     with st.expander("View Raw Data Table"):
-        st.dataframe(chart_data)
+        st.dataframe(raw_data)
 
 def run():
     st.title("Sample Ratio Mismatch (SRM) Checker")
