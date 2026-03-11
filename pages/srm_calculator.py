@@ -1,12 +1,88 @@
 import streamlit as st
 import scipy.stats as stats
+import altair as alt
+import pandas as pd
 import statistics
 import string
+import math
 
 st.set_page_config(
     page_title="SRM calculator",
     page_icon="🔢",
 )
+
+def calculate_srm(visitor_counts, expected_proportions):
+    """
+    Performs the Chi-squared test to check for Sample Ratio Mismatch.
+    """
+    total_visitors = sum(visitor_counts)
+    sum_props = sum(expected_proportions)
+
+    if sum_props == 0:
+        raise ValueError("Total proportions must be greater than zero.")
+
+    expected_distribution = [p / sum_props for p in expected_proportions]
+    
+    # Calculate expected frequencies: E = Total * p
+    expected_counts = [total_visitors * p for p in expected_distribution]
+    
+    # Perform the chi-squared test
+    chi2, p_value = stats.chisquare(f_obs=visitor_counts, f_exp=expected_counts)
+    
+    return {
+        "p_value": p_value,
+        "expected_counts": expected_counts,
+        "mean_expected": statistics.mean(expected_counts),
+        "is_mismatch": p_value < 0.01
+    }
+    
+def initialize_state(num_variants):
+    for i in range(num_variants):
+        if f"obs_{i}" not in st.session_state:
+            st.session_state[f"obs_{i}"] = 0
+        if f"exp_{i}" not in st.session_state:
+            st.session_state[f"exp_{i}"] = 50.0 # Default to 50/50 for 2 variants
+
+def render_results(results, visitor_counts, num_variants):
+    alphabet = string.ascii_uppercase
+    p_value = results["p_value"]
+    
+    # Prepare Data for Altair
+    raw_data = {
+        "Variant": [alphabet[i] for i in range(num_variants)],
+        "Observed": visitor_counts,
+        "Expected": [round(x) for x in results["expected_counts"]]
+    }
+    df = pd.DataFrame(raw_data)
+    
+    # Transform data from columns to rows (Melt)
+    df_melted = df.melt('Variant', var_name='Metric', value_name='Count')
+    df_melted['opacity'] = df_melted['Metric'].apply(lambda x: 0.4 if x == 'Expected' else 1.0)
+
+    st.write("### Visual Comparison")
+
+    # Create the Altair Chart
+    chart = alt.Chart(df_melted).mark_bar().encode(
+        x=alt.X('Variant:N', title='Experiment Variant', 
+                axis=alt.Axis(labelAngle=0)),
+        y=alt.Y('Count:Q', title='Number of Visitors'),
+        color=alt.Color('Metric:N', scale=alt.Scale(range=['#ff7f0e', '#1f77b4'])),
+        opacity=alt.Opacity('opacity:Q', legend=None),
+        xOffset='Metric:N' # Creates the "grouped" bar effect
+    ).properties(height=400)
+
+    st.altair_chart(chart, use_container_width=True)
+
+    if results["is_mismatch"]:
+        st.error(f"SRM Detected! P-value: {p_value:.4f}")
+        st.markdown("The distribution of data significantly deviates from what was expected. This usually suggests an issue with the randomization engine or tracking implementation.")
+    else:
+        st.success(f"No SRM Detected. P-value: {p_value:.4f}")
+        st.markdown("The visitor distribution is within the expected range.")
+
+    # Show the table below the chart
+    with st.expander("View Raw Data Table"):
+        st.dataframe(raw_data)
 
 def run():
     st.title("Sample Ratio Mismatch (SRM) Checker")
@@ -16,83 +92,56 @@ def run():
 
     Happy Learning!
     """
-
-    num_variants = st.number_input("How many variants did your experiment have (including control)?", min_value=2, max_value=26, step=1)
-    st.session_state.setdefault('visitor_counts', [0] * num_variants)
-    st.session_state.setdefault('expected_proportions', [0.0] * num_variants)
-
-    # Resize lists if `num_variants` has changed, while preserving existing values
-    if num_variants != len(st.session_state.visitor_counts):
-        st.session_state.visitor_counts = (st.session_state.visitor_counts[:num_variants] + [0] * num_variants)[:num_variants]
-        st.session_state.expected_proportions = (st.session_state.expected_proportions[:num_variants] + [0.0] * num_variants)[:num_variants]
-
-    # Display headers
+    
+    num_variants = st.number_input("Number of variants?", min_value=2, max_value=26, step=1)
+    
     col1, col2 = st.columns(2)
-    with col1:
-        st.write("### Visitors")
-    with col2:
-        st.write("### Expected Percentage")
-
-    # Alphabet for variant labels (up to 26 variants)
     alphabet = string.ascii_uppercase
 
-    # Generate input fields for each variant dynamically
+    visitor_counts = []
+    expected_proportions = []
+
     for i in range(num_variants):
         with col1:
-            st.session_state.visitor_counts[i] = st.number_input(
-                f"How many visitors did variant {alphabet[i]} have?",
-                min_value=0, step=1, value=st.session_state.visitor_counts[i]
-            )
+            # Use 'key' to let streamlit save to session state
+            val_obs = st.number_input(f"Visitors ({alphabet[i]})", min_value=0, step=1, key=f"obs_{i}")
+            visitor_counts.append(val_obs)
         with col2:
-            st.session_state.expected_proportions[i] = st.number_input(
-                f"What percentage of users should be in variant {alphabet[i]}?",
-                min_value=0.0, max_value=100.0, step=0.01, value=float(st.session_state.expected_proportions[i])
-            )
+            val_exp = st.number_input(f"Expected % ({alphabet[i]})", min_value=0, max_value=100, key=f"exp_{i}")
+            expected_proportions.append(val_exp)
+        
+    if st.button("Check for SRM", type="primary"):
+        total_visitors = sum(visitor_counts)
+        current_sum = sum(expected_proportions)
 
-    # Assign session state values to 'normal' variables for further processing
-    visitor_counts = st.session_state.visitor_counts
-    expected_proportions = st.session_state.expected_proportions
+        # Critical Blockers: No data entered
+        if total_visitors == 0:
+            st.error("Please enter visitor counts.")
+        
+        # Critical Blockers: Total proportions are zero or negative
+        elif current_sum <= 0:
+            st.error("Total expected proportions must be greater than 0%.")
 
-    st.write("")
-    if st.button("Check for Sample Ratio Mismatch", type="primary"):
-        if sum(expected_proportions) != 100:
-            st.error("The total sample proportion should be equal to 100.")
+        # Successful path (with optional non-blocking warnings)
         else:
-            observed = visitor_counts
-            expected_distribution = [p / 100 for p in expected_proportions]
+            # Show helpful tips if the math isn't exactly 100
+            if not math.isclose(current_sum, 100.0, abs_tol=0.1):
+                avg_p = current_sum / num_variants
+                st.warning(f"Note: Total proportions add up to **{current_sum}%**. We've normalized these to 100% for the calculation.")
+                
+                # Scalable tip for the '50% default' mistake
+                if num_variants > 2 and math.isclose(avg_p, 50.0, abs_tol=1.0):
+                    suggested_p = round(100 / num_variants)
+                    st.info(f"For {num_variants} variants, an even split would be **{suggested_p}%** each.")
 
-            # Calculate expected frequencies based on observed data and expected distribution
-            total_visitors = sum(observed)
-            expected = [total_visitors * p for p in expected_distribution]
-
-            # Perform the chi-squared test
-            chi2, p_value = stats.chisquare(f_obs=observed, f_exp=expected)
-
-            # Define SRM result based on p-value threshold
-            if p_value < 0.01:
-                conclusion = "<span style='color: #FF6600; font-weight: 600;'>possible sample ratio mismatch</span>"
-                srm_result = (
-                    f"{conclusion}! The distribution of data between your variants significantly deviates from the "
-                    f"expected proportions of {expected_distribution}. Check the distribution."
-                )
-            else:
-                conclusion = "<span style='color: #009900; font-weight: 600;'>valid distribution</span>"
-                srm_result = (
-                    f"{conclusion}. The amount of visitors per variant does not significantly deviate from the expected split"
-                    )
-
-            # Display results
-            st.write("")
-            st.write("### Conclusion")
-            st.write(f"P-value: {p_value:.4f}. The expected amount of visitors per variant on average is {round(statistics.mean(expected))}.") 
-            st.write(f"This suggests a {srm_result}.", unsafe_allow_html=True)
-            if num_variants > 2:
-                st.write("### Expected vs. Observed Values")
-                st.write("The specific distribution for your entered data:")
-                data = {"Variant" : [alphabet[i] for i in range(num_variants)],
-                        "Observed" : observed,
-                        "Expected" : [round(x) for x in expected]}
-                st.dataframe(data)
+            # Run and render
+            try:
+                results = calculate_srm(visitor_counts, expected_proportions)
+                render_results(results, visitor_counts, num_variants)
+            except ValueError as e:
+                st.error("Cannot calculate SRM with the current inputs. Ensure all variants have visitors and the expected percentage is greater than 0.")
+            except Exception as e:
+                st.error("An unexpected error occurred. Please check your inputs.")
 
 if __name__ == "__main__":
     run()
