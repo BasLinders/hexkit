@@ -16,7 +16,12 @@ def calculate_srm(visitor_counts, expected_proportions):
     Performs the Chi-squared test to check for Sample Ratio Mismatch.
     """
     total_visitors = sum(visitor_counts)
-    expected_distribution = [p / 100 for p in expected_proportions]
+    sum_props = sum(expected_proportions)
+
+    if sum_props == 0:
+        raise ValueError("Total proportions must be greater than zero.")
+
+    expected_distribution = [p / sum_props for p in expected_proportions]
     
     # Calculate expected frequencies: E = Total * p
     expected_counts = [total_visitors * p for p in expected_distribution]
@@ -52,6 +57,7 @@ def render_results(results, visitor_counts, num_variants):
     
     # Transform data from columns to rows (Melt)
     df_melted = df.melt('Variant', var_name='Metric', value_name='Count')
+    df_melted['opacity'] = df_melted['Metric'].apply(lambda x: 0.4 if x == 'Expected' else 1.0)
 
     st.write("### Visual Comparison")
 
@@ -61,10 +67,11 @@ def render_results(results, visitor_counts, num_variants):
                 axis=alt.Axis(labelAngle=0)),
         y=alt.Y('Count:Q', title='Number of Visitors'),
         color=alt.Color('Metric:N', scale=alt.Scale(range=['#ff7f0e', '#1f77b4'])),
+        opacity=alt.Opacity('opacity:Q', legend=None),
         xOffset='Metric:N' # Creates the "grouped" bar effect
-    ).properties(width='container', height=400)
+    ).properties(height=400)
 
-    st.altair_chart(chart, width="stretch")
+    st.altair_chart(chart, use_container_width=True)
 
     if results["is_mismatch"]:
         st.error(f"SRM Detected! P-value: {p_value:.4f}")
@@ -100,18 +107,41 @@ def run():
             val_obs = st.number_input(f"Visitors ({alphabet[i]})", min_value=0, step=1, key=f"obs_{i}")
             visitor_counts.append(val_obs)
         with col2:
-            val_exp = st.number_input(f"Expected % ({alphabet[i]})", min_value=0.0, max_value=100.0, key=f"exp_{i}")
+            val_exp = st.number_input(f"Expected % ({alphabet[i]})", min_value=0, max_value=100, key=f"exp_{i}")
             expected_proportions.append(val_exp)
         
     if st.button("Check for SRM", type="primary"):
-        # Validation logic
-        if not math.isclose(sum(expected_proportions), 100.0, rel_tol=1e-5):
-            st.error(f"The total expected percentage must equal 100% (currently {sum(expected_proportions):.2f}%).")
-        elif sum(visitor_counts) == 0:
+        total_visitors = sum(visitor_counts)
+        current_sum = sum(expected_proportions)
+
+        # Critical Blockers: No data entered
+        if total_visitors == 0:
             st.error("Please enter visitor counts.")
+        
+        # Critical Blockers: Total proportions are zero or negative
+        elif current_sum <= 0:
+            st.error("Total expected proportions must be greater than 0%.")
+
+        # Successful path (with optional non-blocking warnings)
         else:
-            results = calculate_srm(visitor_counts, expected_proportions)
-            render_results(results, visitor_counts, num_variants)
+            # Show helpful tips if the math isn't exactly 100
+            if not math.isclose(current_sum, 100.0, abs_tol=0.1):
+                avg_p = current_sum / num_variants
+                st.warning(f"Note: Total proportions add up to **{current_sum}%**. We've normalized these to 100% for the calculation.")
+                
+                # Scalable tip for the '50% default' mistake
+                if num_variants > 2 and math.isclose(avg_p, 50.0, abs_tol=1.0):
+                    suggested_p = round(100 / num_variants)
+                    st.info(f"For {num_variants} variants, an even split would be **{suggested_p}%** each.")
+
+            # Run and render
+            try:
+                results = calculate_srm(visitor_counts, expected_proportions)
+                render_results(results, visitor_counts, num_variants)
+            except ValueError as e:
+                st.error("Cannot calculate SRM with the current inputs. Ensure all variants have visitors and the expected percentage is greater than 0.")
+            except Exception as e:
+                st.error("An unexpected error occurred. Please check your inputs.")
 
 if __name__ == "__main__":
     run()
