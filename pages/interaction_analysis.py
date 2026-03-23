@@ -1,17 +1,170 @@
 import itertools
+import re
 import textwrap
 from typing import Any, Dict, List, Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 import streamlit as st
-
-from interaction_engine import InteractionEngine
 
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Interaction Analysis", page_icon="🔢")
+
+
+# ---------------------------------------------------------------------------
+# InteractionEngine (inlined — no external import required)
+# ---------------------------------------------------------------------------
+
+# Pre-compiled regex for parsing statsmodels coefficient names like:
+# "C(test1)[T.VariantB]"  →  group(1)="test1", group(2)="VariantB"
+_COEF_TERM_RE = re.compile(r"C\((\w+)\)\[T\.([^\]]+)\]")
+
+
+class InteractionEngine:
+    """
+    Analyzes synergies and clashes between concurrent A/B tests.
+
+    Uses a Generalized Linear Model (GLM) with a Binomial family.
+    The model is fit on pre-aggregated (conversions, visitors) count data
+    using a two-column binomial response, which produces correct standard
+    errors and p-values without inflating the effective sample size.
+    """
+
+    # Maximum number of concurrent tests allowed in a single model.
+    # A full factorial model produces 2^N terms; beyond 4 tests the model
+    # becomes numerically unstable and very hard to interpret.
+    MAX_TESTS = 4
+
+    @staticmethod
+    def prepare_aggregated_format(
+        input_df: pd.DataFrame, test_cols: List[str]
+    ) -> pd.DataFrame:
+        """
+        Prepares a cleaned, aggregated dataframe for model fitting.
+
+        Each row represents one unique combination of test variants.
+        The response is kept as (conversions, non_conversions) — a two-column
+        binomial response — which is the statistically correct approach for
+        pre-aggregated count data.
+        """
+        df = input_df.copy()
+        for col in test_cols:
+            df[col] = df[col].astype(str)
+        df["non_conversions"] = df["visitors"] - df["conversions"]
+        return df
+
+    def fit_interaction_model_from_formula(
+        self, df: pd.DataFrame, test_cols: List[str]
+    ):
+        """
+        Fits a full-factorial GLM-Binomial model using the statsmodels
+        formula API.
+
+        Uses a two-column binomial response (conversions, non_conversions),
+        which is correct for pre-aggregated count data and does NOT inflate
+        the effective sample size the way freq_weights would.
+
+        Raises
+        ------
+        ValueError
+            On invalid inputs or model fitting failure.
+        """
+        self._validate_inputs(df, test_cols)
+
+        formula_rhs = " * ".join([f"C({col})" for col in test_cols])
+        formula = f"conversions + non_conversions ~ {formula_rhs}"
+
+        try:
+            model = sm.formula.glm(
+                formula=formula,
+                data=df,
+                family=sm.families.Binomial(),
+            ).fit()
+        except Exception as e:
+            raise ValueError(f"Interaction model fitting failed: {e}") from e
+
+        return model
+
+    @staticmethod
+    def format_summary_table(model) -> pd.DataFrame:
+        """
+        Returns a copy of the coefficient summary table with human-readable
+        index labels.
+        """
+        summary = model.summary2().tables[1].copy()
+        summary.index = summary.index.map(InteractionEngine._rename_coefficient)
+        return summary
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _validate_inputs(self, df: pd.DataFrame, test_cols: List[str]) -> None:
+        """Raises ValueError for any input that would cause a bad model fit."""
+        if not test_cols:
+            raise ValueError("test_cols must contain at least one column name.")
+
+        if len(test_cols) > self.MAX_TESTS:
+            raise ValueError(
+                f"Cannot fit a factorial model with {len(test_cols)} tests "
+                f"(maximum is {self.MAX_TESTS}). The model would produce "
+                f"{2 ** len(test_cols)} terms and become numerically unstable."
+            )
+
+        missing_cols = [
+            c for c in [*test_cols, "visitors", "conversions"] if c not in df.columns
+        ]
+        if missing_cols:
+            raise ValueError(f"Required columns missing from dataframe: {missing_cols}")
+
+        if df["conversions"].lt(0).any():
+            raise ValueError("'conversions' column contains negative values.")
+
+        if df["visitors"].lt(0).any():
+            raise ValueError("'visitors' column contains negative values.")
+
+        if (df["conversions"] > df["visitors"]).any():
+            raise ValueError(
+                "Some rows have more conversions than visitors. "
+                "Check your input data."
+            )
+
+        if df[test_cols].isnull().any().any():
+            raise ValueError("Test variant columns contain null values.")
+
+    @staticmethod
+    def _rename_coefficient(name: str) -> str:
+        """
+        Converts a single statsmodels coefficient name to a readable label.
+
+        Uses a pre-compiled regex rather than chained string replacements so
+        that changes to statsmodels' formatting surface as unmatched patterns
+        (returned verbatim) rather than silently garbled names.
+        """
+        if name == "Intercept":
+            return "Baseline (Control Group)"
+
+        if ":" in name:
+            parts = name.split(":")
+            clean_parts = []
+            for part in parts:
+                m = _COEF_TERM_RE.fullmatch(part.strip())
+                clean_parts.append(
+                    f"{m.group(1)} ({m.group(2)})" if m else part.strip()
+                )
+            return " & ".join(clean_parts) + " — Clash/Synergy"
+
+        m = _COEF_TERM_RE.fullmatch(name.strip())
+        if m:
+            return f"{m.group(1)} ({m.group(2)})"
+
+        # Fallback: return verbatim so nothing silently disappears
+        return name
+
 
 # Singleton engine — constructed once per session
 _engine = InteractionEngine()
@@ -92,14 +245,15 @@ def user_input() -> Tuple[pd.DataFrame, List[str]]:
     default_df = _build_default_df(test_configs, test_names)
 
     # --- Session-state persistence -------------------------------------------
-    # Rebuild the default only when the set of columns changes (i.e. the user
-    # reconfigured the tests), otherwise keep whatever the user typed in.
-    current_cols = list(default_df.columns)
-    if (
-        "input_df" not in st.session_state
-        or list(st.session_state["input_df"].columns) != current_cols
-    ):
+    col_signature = str(list(default_df.columns))
+    schema_changed = st.session_state.get("_col_sig") != col_signature
+
+    if schema_changed:
+        st.session_state["_col_sig"] = col_signature
+        # Only initialize the base dataframe when the schema changes
         st.session_state["input_df"] = default_df
+        # Removing the editor key forces Streamlit to rebuild the widget
+        st.session_state.pop("_data_editor", None)
 
     st.write("### Experiment Data Entry")
     st.markdown(
@@ -107,14 +261,18 @@ def user_input() -> Tuple[pd.DataFrame, List[str]]:
         "The **first variant** listed for each test is treated as the control."
     )
 
+    # Streamlit will automatically apply any user edits stored in 
+    # st.session_state["_data_editor"] to the base "input_df".
     edited_df = st.data_editor(
         st.session_state["input_df"],
+        key="_data_editor",
         num_rows="fixed",
         use_container_width=True,
         hide_index=True,
     )
-    # Persist edits immediately so they survive reruns
-    st.session_state["input_df"] = edited_df
+    
+    # We DO NOT write edited_df back to st.session_state["input_df"] here.
+    # We just return it for downstream calculations.
 
     return edited_df, test_names
 
