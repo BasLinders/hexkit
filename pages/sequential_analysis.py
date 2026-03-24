@@ -284,10 +284,15 @@ def analysis_section(df, params):
             if latest_llr > upper_bound:
                 st.success(f"**Result: SIGNIFICANT POSITIVE** - {variant} is superior. You can stop.")
             elif latest_llr < lower_bound:
-                if latest_cr < base_cr:
-                    st.error(f"**Result: SIGNIFICANT NEGATIVE** - {variant} is worse than baseline. Stop immediately.")
+                # Calculate the relative difference to see if it's practically a tie
+                relative_diff = (latest_cr - base_cr) / base_cr if base_cr > 0 else 0
+                
+                if relative_diff < -0.05: # More than a 5% relative drop
+                    st.error(f"**Result: NEGATIVE IMPACT** - {variant} is noticeably worse than the baseline ({relative_diff:.1%} relative drop). Stop testing.")
+                elif relative_diff < 0:
+                    st.warning(f"**Result: FLAT / FUTILITY** - {variant} is practically tied with the baseline. It will not reach your target lift.")
                 else:
-                    st.error(f"**Result: FUTILITY** - {variant} is unlikely to reach the target.")
+                    st.warning(f"**Result: FLAT / FUTILITY** - {variant} is slightly ahead, but will not reach your target lift.")
             else:
                 if latest_vis >= max_visitors:
                     st.warning("Maximum sample size reached without a decision.")
