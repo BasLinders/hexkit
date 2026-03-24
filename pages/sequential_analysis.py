@@ -5,59 +5,65 @@ import numpy as np
 import uuid
 from st_supabase_connection import SupabaseConnection
 
-# --- CONFIGURATION & CONNECTION ---
+# --- CONSTANTS & CONFIGURATION ---
 st.set_page_config(page_title="Sequential Analysis", layout="wide")
+
+TEST_TYPE_ONE_SAMPLE = "One-sample (fixed baseline)"
+TEST_TYPE_MULTI_SAMPLE = "Multi-sample (Control vs. Variants)"
 
 # Initialize Supabase Connection
 conn = st.connection("supabase", type=SupabaseConnection)
 
+def is_valid_uuid(val):
+    """Validates if a string is a properly formatted UUID."""
+    try:
+        uuid.UUID(str(val))
+        return True
+    except ValueError:
+        return False
+
 # --- STATISTICAL FUNCTIONS ---
 
 def calculate_msprt_boundaries(alpha, beta, num_variants=1):
-    """
-    Calculates boundaries for mSPRT.
-    Uses always-valid thresholds for continuous monitoring.
-    """
-    # Boundary A (Upper): Defined for multiple comparisons to maintain the overall Alpha.
-    # Formula: ln(num_variants / alpha)
-    upper = np.log(num_variants / alpha) # more conservative alpha threshold for mSPRT
-
-    # Boundary B (Lower): Log-likelihood ratio threshold for accepting H0 (Futility)
-    # Approximation: B = beta / (1 - alpha)
-    #lower = np.log(beta / (1 - alpha))
-    lower = np.log(beta) # more conservative beta threshold for mSPRT
-    
+    """Calculates boundaries for mSPRT."""
+    upper = np.log(num_variants / alpha) 
+    lower = np.log(beta) 
     return upper, lower
 
-def calculate_msprt_llr(visitors_base, conversions_base, visitors_var, conversions_var, tau=0.01):
+def calculate_msprt_llr(visitors_base, conversions_base, visitors_var, conversions_var, tau=0.01, fixed_baseline_cr=None):
     """
-    Calculates the Log-Likelihood Ratio for a SINGLE variant against a baseline/control.
-    For multi-variant tests, this should be called in a loop for each variant.
+    Calculates the Log-Likelihood Ratio. 
+    Handles both two-sample pooled variance and one-sample fixed variance.
     """
-    # Guardrails for empty data
-    if visitors_base == 0 or visitors_var == 0:
+    if visitors_var == 0:
         return 0.0
 
-    # Conversion rates
-    p_base = conversions_base / visitors_base
     p_var = conversions_var / visitors_var
 
-    # Pooled conversion rate for variance calculation
-    p_pool = (conversions_base + conversions_var) / (visitors_base + visitors_var)
+    if fixed_baseline_cr is not None:
+        # ONE-SAMPLE: Variance of a single proportion
+        p_base = fixed_baseline_cr
+        var = p_var * (1 - p_var) / visitors_var
+        
+        if var == 0:
+            return 0.0
+        diff = p_var - p_base
+    else:
+        # TWO-SAMPLE: Pooled variance of the difference
+        if visitors_base == 0:
+            return 0.0
+            
+        p_base = conversions_base / visitors_base
+        p_pool = (conversions_base + conversions_var) / (visitors_base + visitors_var)
 
-    # Avoid log(0) or division by zero in edge cases
-    if p_pool <= 0 or p_pool >= 1:
-        return 0.0
+        if p_pool <= 0 or p_pool >= 1:
+            return 0.0
 
-    # Approximate variance of the difference
-    var = p_pool * (1 - p_pool) * (1/visitors_base + 1/visitors_var)
-    
-    # Catch edge case where variance is perfectly 0
-    if var == 0:
-        return 0.0
-
-    # Observed difference
-    diff = p_var - p_base
+        var = p_pool * (1 - p_pool) * (1/visitors_base + 1/visitors_var)
+        
+        if var == 0:
+            return 0.0
+        diff = p_var - p_base
 
     # mSPRT LLR Formula
     llr = 0.5 * (np.log(var / (var + tau)) + (diff**2 / var) * (tau / (var + tau)))
@@ -65,6 +71,7 @@ def calculate_msprt_llr(visitors_base, conversions_base, visitors_var, conversio
     return llr
 
 # --- DATABASE FUNCTIONS ---
+
 def get_experiment_params(experiment_id):
     """Fetch setup parameters for an ID."""
     try:
@@ -77,7 +84,7 @@ def get_experiment_params(experiment_id):
         return None
 
 def save_experiment_params(experiment_id, p0, tau, alpha, beta, max_visitors, test_type, num_variants):
-    """Save the immutable rules of the experiment, including the number of variants."""
+    """Save the immutable rules of the experiment."""
     try:
         data = {
             "experiment_id": experiment_id,
@@ -87,16 +94,17 @@ def save_experiment_params(experiment_id, p0, tau, alpha, beta, max_visitors, te
             "beta": float(beta),
             "max_visitors": int(max_visitors),
             "test_type": str(test_type),
-            "num_variants": int(num_variants) # NEW: Store how many variants we are testing
+            "num_variants": int(num_variants)
         }
         conn.table("experiment_params").insert(data).execute()
         return True
     except Exception as e:
         st.error(f"Error creating experiment: {e}")
         return False
-        
+
+@st.cache_data(ttl=60)
 def get_experiment_data(experiment_id):
-    """Fetches data in the new LONG format (variant_name, visitors, conversions)."""
+    """Fetches data in the LONG format (variant_name, visitors, conversions)."""
     try:
         response = conn.table("msprt_data").select("*").eq("experiment_id", experiment_id).order("measurement_date").execute()
         if len(response.data) > 0:
@@ -111,51 +119,53 @@ def get_experiment_data(experiment_id):
         return pd.DataFrame()
 
 def save_data_points(experiment_id, date, variant_data_list):
-    """
-    Insert a batch of data points for a single date.
-    variant_data_list should look like: 
-    [{"variant_name": "Control", "visitors": 100, "conversions": 5}, {"variant_name": "Variant 1", ...}]
-    """
+    """Insert a batch of data points for a single date."""
     try:
         insert_payload = []
         for data in variant_data_list:
             insert_payload.append({
                 "experiment_id": experiment_id,
                 "measurement_date": str(date),
-                "variant_name": data["variant_name"], # NEW: explicitly name the group
+                "variant_name": data["variant_name"],
                 "visitors": int(data["visitors"]),
                 "conversions": int(data["conversions"])
             })
         
-        # Bulk insert into Supabase
         conn.table("msprt_data").insert(insert_payload).execute()
         st.toast("Data points saved successfully!", icon="✅")
+        get_experiment_data.clear() # Invalidate cache
         return True
     except Exception as e:
         st.error(f"Error saving data: {e}")
         return False
 
 def delete_data_points_by_date(experiment_id, date):
-    """Deletes all rows for a specific date (to undo a daily entry block)"""
+    """Deletes all rows for a specific date."""
     try:
         conn.table("msprt_data").delete().eq("experiment_id", experiment_id).eq("measurement_date", str(date)).execute()
         st.toast(f"Entries for {date} deleted", icon="🗑️")
+        get_experiment_data.clear() # Invalidate cache
         return True
     except Exception as e:
         st.error(f"Error deleting data: {e}")
         return False
 
 # --- VISUALIZATIONS ---
+
 def show_visualization(chart_df, upper_bound, lower_bound):
     if chart_df.empty:
         st.warning("No data to visualize yet.")
         return
         
     y_values = [chart_df['llr'].max(), chart_df['llr'].min(), upper_bound, lower_bound]
-    max_y = max(y_values) * 1.2
-    min_y = min(y_values) * 1.2
+    
+    # Additive padding handles negative numbers safely
+    padding = (max(y_values) - min(y_values)) * 0.1
+    if padding == 0: padding = 1.0 # Fallback
+    
+    max_y = max(y_values) + padding
+    min_y = min(y_values) - padding
 
-    # NEW: color='variant_name' creates a separate line for each variant
     line = alt.Chart(chart_df).mark_line(point=True).encode(
         x = alt.X('measurement_date:T', title='Date'),
         y = alt.Y('llr:Q', title='Log Likelihood Ratio', scale=alt.Scale(domain=[min_y, max_y])),
@@ -174,40 +184,45 @@ def show_visualization(chart_df, upper_bound, lower_bound):
     st.altair_chart(chart, use_container_width=True)
 
 # --- ANALYSIS ---
+
 def analysis_section(df, params):
     st.divider()
     st.subheader("Sequential Analysis")
 
-    alpha = params['alpha']
-    beta = params['beta']
-    tau_param = params['tau']
-    test_type = params['test_type']
-    max_visitors = params['max_visitors']
+    alpha = params.get('alpha', 0.05)
+    beta = params.get('beta', 0.20)
+    tau_param = params.get('tau', 0.01)
+    test_type = params.get('test_type', TEST_TYPE_ONE_SAMPLE)
+    max_visitors = params.get('max_visitors', 10000)
     num_variants = params.get('num_variants', 1)
 
     upper_bound, lower_bound = calculate_msprt_boundaries(alpha, beta, num_variants=num_variants)
     
-    # Identify unique variants (excluding control)
     variants_to_test = [v for v in df['variant_name'].unique() if v != "Control"]
-    
-    # We will build a unified dataframe for the chart
     chart_data = []
 
     for variant in variants_to_test:
         var_df = df[df['variant_name'] == variant].copy()
         
-        if test_type == "Multi-sample (Control vs. Variants)":
+        # Guard against duplicate dates
+        var_df = var_df.groupby('measurement_date').last().reset_index()
+        
+        if test_type == TEST_TYPE_MULTI_SAMPLE:
             ctrl_df = df[df['variant_name'] == 'Control'].copy()
-            # Merge control and variant data on date to calculate LLR per day
+            ctrl_df = ctrl_df.groupby('measurement_date').last().reset_index()
+            
             merged = pd.merge(var_df, ctrl_df, on='measurement_date', suffixes=('_var', '_ctrl'))
             
+            if merged.empty:
+                st.warning(f"Waiting for aligned Control & Variant dates for {variant}.")
+                continue
+                
             merged['llr'] = merged.apply(lambda row: calculate_msprt_llr(
                 visitors_base=row['visitors_ctrl'], conversions_base=row['conversions_ctrl'],
                 visitors_var=row['visitors_var'], conversions_var=row['conversions_var'], 
                 tau=tau_param
             ), axis=1)
             
-            # For the UI summary
             latest_vis = merged.iloc[-1]['visitors_var']
             latest_conv = merged.iloc[-1]['conversions_var']
             base_vis = merged.iloc[-1]['visitors_ctrl']
@@ -216,18 +231,20 @@ def analysis_section(df, params):
         else:
             # One-sample logic
             merged = var_df.copy()
-            p0_param = params['p0']
+            if merged.empty:
+                continue
+                
+            p0_param = params.get('p0', 0.10)
             merged['llr'] = merged.apply(lambda row: calculate_msprt_llr(
-                visitors_base=row['visitors'], conversions_base=row['visitors'] * p0_param, # Simulated baseline
+                visitors_base=0, conversions_base=0, 
                 visitors_var=row['visitors'], conversions_var=row['conversions'], 
-                tau=tau_param
+                tau=tau_param, fixed_baseline_cr=p0_param 
             ), axis=1)
             
             latest_vis = merged.iloc[-1]['visitors']
             latest_conv = merged.iloc[-1]['conversions']
             base_cr = p0_param
 
-        # Save for visualization
         merged['variant_name'] = variant
         chart_data.append(merged[['measurement_date', 'variant_name', 'llr', 'visitors_var' if 'visitors_var' in merged.columns else 'visitors']])
 
@@ -244,13 +261,11 @@ def analysis_section(df, params):
             st.write(f"**Observed CR:** {latest_cr:.2%} vs **Baseline CR:** {base_cr:.2%}")
             
             # --- PROGRESS BAR ---
-            # Approximate probability of success (very rough estimate)
-            prob_success = min(max((latest_llr / upper_bound) * 100, 0), 100) if latest_llr > 0 else 0
-            st.write(f"**Estimated Confidence:** {prob_success:.2f}%")
-            st.progress(prob_success / 100)
+            progress = min(max((latest_llr / upper_bound) * 100, 0), 100) if latest_llr > 0 else 0
+            st.write(f"**Progress to Decision Boundary:** {progress:.0f}%")
+            st.progress(progress / 100)
 
             # --- TIME ESTIMATION ---
-            # Only estimate if test is inconclusive and showing positive movement
             if latest_llr > 0 and not (latest_llr > upper_bound or latest_llr < lower_bound):
                 first_date = merged['measurement_date'].min()
                 last_date = merged['measurement_date'].max()
@@ -263,7 +278,7 @@ def analysis_section(df, params):
                 if llr_per_vis > 0 and avg_daily_visitors > 0:
                     est_vis_needed = remaining_llr / llr_per_vis
                     est_days = est_vis_needed / avg_daily_visitors
-                    st.info(f"**Estimation:** At current velocity, you need approx. **{est_vis_needed:.0f}** more visitors (**{est_days:.1f} days**) to reach the success boundary.")
+                    st.info(f"**Rough Estimate:** Assuming linear growth, you need approx. **{est_vis_needed:.0f}** more visitors (**{est_days:.1f} days**) to reach success.")
 
             # --- DECISION LOGIC ---
             if latest_llr > upper_bound:
@@ -279,10 +294,8 @@ def analysis_section(df, params):
                 else:
                     st.info("INCONCLUSIVE - Continue collecting data.")
 
-    # Show the combined visual
     if chart_data:
         final_chart_df = pd.concat(chart_data)
-        # Rename column for Altair consistency
         if 'visitors_var' in final_chart_df.columns:
             final_chart_df = final_chart_df.rename(columns={'visitors_var': 'visitors'})
         show_visualization(final_chart_df, upper_bound, lower_bound)
@@ -318,8 +331,7 @@ def show_documentation():
         1.  **Start New:** Generate a unique ID and define your success metrics (Alpha / significance, Beta / power). 
             * *Note: These are locked once the test starts to ensure integrity.*
         2.  **Update Regularly:** Come back daily/weekly to input your **cumulative** data.
-        3.  **Check the Graph:** 
-            * **Upper Limit:** Success! (Reject Null)
+        3.  **Check the Graph:** * **Upper Limit:** Success! (Reject Null)
             * **Lower Limit:** Futility/Failure. (Accept Null)
             * **In Between lines:** Inconclusive - keep testing.
         
@@ -328,39 +340,27 @@ def show_documentation():
         """)
 
 # --- USER INPUT ---
+
 def setup_sidebar(defaults, is_locked):
     with st.sidebar:
         st.header("1. Experiment Setup")
 
         # 1. Test Type Selection
-        options = ["One-sample (fixed baseline)", "Multi-sample (Control vs. Variants)"]
+        options = [TEST_TYPE_ONE_SAMPLE, TEST_TYPE_MULTI_SAMPLE]
         saved_type = defaults.get('test_type', options[0])
-        try:
-            default_index = options.index(saved_type)
-        except ValueError:
-            default_index = 0
+        default_index = options.index(saved_type) if saved_type in options else 0
 
         test_type = st.radio("Test format", options, index=default_index, disabled=is_locked)
         
-        # NEW: Ask for the number of variants if Multi-sample
-        if test_type == "Multi-sample (Control vs. Variants)":
+        if test_type == TEST_TYPE_MULTI_SAMPLE:
             num_variants_val = int(defaults.get('num_variants', 1))
-            num_variants = st.number_input(
-                "Number of Variants (excluding Control)", 
-                min_value=1, max_value=10, value=num_variants_val, step=1, 
-                disabled=is_locked,
-                help="1 = standard A/B test. 2 = A/B/C test. 3 = A/B/C/D test."
-            )
+            num_variants = st.number_input("Number of Variants (excluding Control)", min_value=1, max_value=10, value=num_variants_val, step=1, disabled=is_locked)
+            p0_label = "Estimated baseline CR (p0)"
+            p0_help = "Used only for sample size estimates. Control CR will be measured live."
         else:
-            num_variants = 1 # Force 1 for one-sample tests
-
-        # Dynamic Labels
-        if test_type == "One-sample (fixed baseline)":
+            num_variants = 1 
             p0_label = "Baseline CR (p0)"
             p0_help = "The fixed historical conversion rate (CR) you want to beat."
-        else:
-            p0_label = "Estimated baseline CR (p0)"
-            p0_help = "Used only to calculate sample size estimates. The actual Control CR will be measured live."
 
         # 2. Mode Selection
         mode = st.radio("Mode", ["Load Existing", "Start New"], label_visibility="collapsed")
@@ -374,12 +374,12 @@ def setup_sidebar(defaults, is_locked):
                 st.rerun()
             
             if st.session_state.get('exp_id'):
-                st.success(f"New ID: {st.session_state['exp_id']}")
-        
-        else: # Load Existing
+                st.success("Save this ID to load your test later:")
+                st.code(st.session_state['exp_id']) 
+        else: 
             input_id = st.text_input("Paste Experiment UUID")
             if st.button("Load"):
-                if input_id:
+                if is_valid_uuid(input_id):
                     st.session_state['exp_id'] = input_id
                     params = get_experiment_params(input_id)
                     if params:
@@ -389,6 +389,8 @@ def setup_sidebar(defaults, is_locked):
                     else:
                         st.error("Experiment ID not found or no parameters set.")
                     st.rerun()
+                else:
+                    st.error("Invalid UUID format.")
 
         st.divider()
 
@@ -398,20 +400,27 @@ def setup_sidebar(defaults, is_locked):
         if is_locked:
             st.info("Parameters are locked for this ID.")
 
+        p0_param = float(defaults.get('p0', 0.10))
+
         with st.form("setup_form"):
-            p0_val = float(defaults.get('p0', 0.10)) if test_type == "One-sample (fixed baseline)" else 0.01
             tau_val = float(defaults.get('tau') or 0.01)
             alpha_val = float(defaults.get('alpha', 0.05))
             beta_val = float(defaults.get('beta', 0.20))
             max_visitors_val = int(defaults.get('max_visitors', 10000))
 
-            p0_param = st.number_input(p0_label, value=p0_val, format="%.4f", disabled=is_locked, help=p0_help) if test_type == "One-sample (fixed baseline)" else 0.01
+            if test_type == TEST_TYPE_ONE_SAMPLE:
+                p0_param = st.number_input(p0_label, value=p0_param, format="%.4f", disabled=is_locked, help=p0_help)
+            else:
+                st.caption(f"**{p0_label}:** Not required for strict calculations in Multi-sample mode.")
+                p0_param = 0.01
+
             tau_param = st.select_slider(
                 "Test sensitivity (Tau)",
                 options=[0.0001, 0.001, 0.005, 0.01, 0.05, 0.1],
                 value=tau_val,
-                help="Lower values (0.001) are more conservative. Higher values (0.05) detect large effects faster."
-                )
+                help="Lower values (0.001) are more conservative. Higher values (0.05) detect large effects faster.",
+                disabled=is_locked
+            )
             max_visitors = st.number_input("Max Visitors (Safety Cap)", value=max_visitors_val, step=100, disabled=is_locked)
             
             c1, c2 = st.columns(2)
@@ -426,7 +435,6 @@ def setup_sidebar(defaults, is_locked):
                     elif tau_param <= 0:
                         st.error("Sensitivity (Tau) must be greater than 0.")
                     else:
-                        # NEW: We now pass num_variants to the database
                         saved = save_experiment_params(st.session_state['exp_id'], p0_param, tau_param, alpha, beta, max_visitors, test_type, num_variants)
                         if saved:
                             st.session_state['params_locked'] = True
@@ -438,28 +446,19 @@ def setup_sidebar(defaults, is_locked):
             else:
                 st.form_submit_button("Parameters Locked", disabled=True)
                 
-    return {
-        "p0": p0_param,
-        "tau": tau_param,
-        "alpha": alpha,
-        "beta": beta,
-        "max_visitors": max_visitors,
-        "test_type": test_type,
-        "num_variants": num_variants
-    }
+    return st.session_state.get('fetched_params', {})
 
 def render_data_entry_form(exp_id, df, params):
     st.subheader("Update Data")
-    current_test_type = params['test_type']
+    st.info("💡 **Reminder:** Enter the **cumulative** totals up to this date, not just the daily increment.")
+    
+    current_test_type = params.get('test_type', TEST_TYPE_ONE_SAMPLE)
     num_variants = params.get('num_variants', 1)
 
     with st.form("entry_form"):
         d_date = st.date_input("Date")
-        
-        # We will collect all inputs into this list
         variant_data_list = []
 
-        # Helper to get previous values from the long dataframe
         def get_prev(v_name):
             if not df.empty:
                 v_df = df[df['variant_name'] == v_name]
@@ -467,7 +466,7 @@ def render_data_entry_form(exp_id, df, params):
                     return int(v_df.iloc[-1]['visitors']), int(v_df.iloc[-1]['conversions'])
             return 0, 0
 
-        if current_test_type == "Multi-sample (Control vs. Variants)":
+        if current_test_type == TEST_TYPE_MULTI_SAMPLE:
             st.divider()
             st.markdown("### Control Group")
             p_vis_c, p_conv_c = get_prev("Control")
@@ -477,7 +476,6 @@ def render_data_entry_form(exp_id, df, params):
             variant_data_list.append({"variant_name": "Control", "visitors": d_vis_c, "conversions": d_conv_c})
             
             st.markdown("### Variant Groups")
-            # Dynamically generate input fields for X variants
             for i in range(1, num_variants + 1):
                 v_name = f"Variant {i}"
                 p_vis, p_conv = get_prev(v_name)
@@ -497,7 +495,6 @@ def render_data_entry_form(exp_id, df, params):
 
         st.divider()
         if st.form_submit_button("Add Data Point"):
-            # Simple validation to ensure visitors >= conversions
             if any(item['visitors'] < item['conversions'] for item in variant_data_list):
                 st.error("Visitors cannot be less than conversions for any group.")
             else:
@@ -505,6 +502,7 @@ def render_data_entry_form(exp_id, df, params):
                 st.rerun()
 
 # --- UI LOGIC / ORCHESTRATION ---
+
 def run():
     st.title("Sequential Experiment Analysis (SPRT)")
     st.markdown("""
@@ -513,21 +511,18 @@ def run():
     **This tool is different.** It uses **mixture Sequential Probability Ratio Testing (mSPRT)**, allowing you to update data and check results **any time** without invalidating your statistics.
     """)
 
-    # Load documentation
     show_documentation()
     
-    # Initialize Session State for locking
     if 'params_locked' not in st.session_state: st.session_state['params_locked'] = False
     if 'fetched_params' not in st.session_state: st.session_state['fetched_params'] = {}
 
-    # Logic: Use fetched values if locked, otherwise use defaults
     defaults = st.session_state.get('fetched_params', {})
     is_locked = st.session_state.get('params_locked', False)
     
-    # --- SIDEBAR: SETUP & LOADING ---
+    # --- SIDEBAR ---
     params = setup_sidebar(defaults, is_locked)
 
-    # --- MAIN PAGE CONTENT ---
+    # --- MAIN CONTENT ---
     exp_id = st.session_state.get('exp_id')
     
     if not exp_id or not st.session_state.get('params_locked'):
@@ -538,19 +533,17 @@ def run():
     
     df = get_experiment_data(exp_id)
     
-    # Use the test type from the locked params, fallback to One-sample
-    current_test_type = st.session_state['fetched_params'].get('test_type', "One-sample (fixed baseline)")
-    
     # --- DATA ENTRY ---
     render_data_entry_form(exp_id, df, params)
 
     # --- UNDO FUNCTIONALITY ---
     if not df.empty:
         last_date = df['measurement_date'].max()
-
-        if st.button(f"Undo last entry {last_date}", type="secondary"):
-            delete_data_points_by_date(exp_id, last_date)
-            st.rerun()
+        with st.expander("Danger Zone: Undo Entries"):
+            st.warning("Deleting data cannot be undone.")
+            if st.button(f"Delete ALL variant entries for {last_date}", type="primary"):
+                delete_data_points_by_date(exp_id, last_date)
+                st.rerun()
     
     # --- ANALYSIS SECTION ---
     if not df.empty:
