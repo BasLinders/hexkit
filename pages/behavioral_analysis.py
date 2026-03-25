@@ -62,21 +62,17 @@ def detect_outliers(df, kpi, outlier_stdev, large_file_threshold=10000):
     try:
         # Method A: IQR for Large Files (Faster)
         if len(df) > large_file_threshold:
-            st.info(f"Dataset is large ({len(df):,} rows). Using IQR method for outlier detection.")
-            outliers_mask = pd.Series([False] * len(df), index=df.index)
+            st.info(f"Dataset is large ({len(df):,} rows). Using vectorized IQR method for outlier detection.")
             
-            for variant in df['experience_variant_label'].unique():
-                variant_data = df[df['experience_variant_label'] == variant][kpi].dropna()
-                if not variant_data.empty:
-                    Q1 = variant_data.quantile(0.25)
-                    Q3 = variant_data.quantile(0.75)
-                    IQR = Q3 - Q1
-                    lower_bound = Q1 - (outlier_stdev * IQR) # Using user's strictness setting
-                    upper_bound = Q3 + (outlier_stdev * IQR)
-                    
-                    variant_outliers = (variant_data < lower_bound) | (variant_data > upper_bound)
-                    outliers_mask.loc[variant_data.index] = variant_outliers
-            return outliers_mask
+            q1 = df.groupby('experience_variant_label')[kpi].transform(lambda x: x.quantile(0.25))
+            q3 = df.groupby('experience_variant_label')[kpi].transform(lambda x: x.quantile(0.75))
+            iqr = q3 - q1
+            
+            lower_bound = q1 - (outlier_stdev * iqr)
+            upper_bound = q3 + (outlier_stdev * iqr)
+            
+            mask = (df[kpi] < lower_bound) | (df[kpi] > upper_bound)
+            return mask.fillna(False)
 
         # Method B: OLS Influence for Smaller Files (More Precise)
         else:
