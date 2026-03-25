@@ -1,8 +1,8 @@
+import patsy
 import itertools
 import re
 import textwrap
 from typing import Any, Dict, List, Tuple
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -57,31 +57,27 @@ class InteractionEngine:
         df["non_conversions"] = df["visitors"] - df["conversions"]
         return df
 
-    def fit_interaction_model_from_formula(
-        self, df: pd.DataFrame, test_cols: List[str]
-    ):
+    def fit_interaction_model(self, df: pd.DataFrame, test_cols: List[str]):
         """
-        Fits a full-factorial GLM-Binomial model using the statsmodels
-        formula API.
+        Fits a full-factorial GLM-Binomial model using explicit matrices.
 
         Uses a two-column binomial response (conversions, non_conversions),
         which is correct for pre-aggregated count data and does NOT inflate
         the effective sample size the way freq_weights would.
-
-        Raises
-        ------
-        ValueError
-            On invalid inputs or model fitting failure.
         """
         self._validate_inputs(df, test_cols)
 
+        # 1. Prepare 2D Endogenous Variable (Response) explicitly
+        endog = df[["conversions", "non_conversions"]].to_numpy()
+
+        # 2. Build Exogenous Design Matrix via patsy
         formula_rhs = " * ".join([f"C({col})" for col in test_cols])
-        formula = f"conversions + non_conversions ~ {formula_rhs}"
+        exog = patsy.dmatrix(f"~ {formula_rhs}", data=df, return_type='dataframe')
 
         try:
-            model = sm.formula.glm(
-                formula=formula,
-                data=df,
+            model = sm.GLM(
+                endog=endog,
+                exog=exog,
                 family=sm.families.Binomial(),
             ).fit()
         except Exception as e:
@@ -534,7 +530,7 @@ def run() -> None:
         # --- Prepare data & fit model via engine ---
         try:
             df_prepared = InteractionEngine.prepare_aggregated_format(edited_df, test_cols)
-            model = _engine.fit_interaction_model_from_formula(df_prepared, test_cols)
+            model = _engine.fit_interaction_model(df_prepared, test_cols)
         except ValueError as exc:
             st.error(f"Model fitting failed: {exc}")
             st.stop()
