@@ -248,7 +248,6 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after):
             test_name = "Standard One-Way ANOVA"
             st.write(f"**Test Chosen:** {test_name}")
             st.markdown("_Reason: Residuals are normal and variances are homogeneous._")
-            # Note: Using the pre-fitted model for anova_lm
             anova_results = sm.stats.anova_lm(model_after, typ=2)
             p_value = anova_results['PR(>F)'].iloc[0]
             test_statistic = anova_results['F'].iloc[0]
@@ -262,10 +261,11 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after):
                 st.write(tukey_results.summary())
                 posthoc_results = tukey_results
 
-        elif is_homogeneous: # Not Normal, but Homogeneous Variances
+        elif is_normal and not is_homogeneous: 
+            # Normal, but Heterogeneous Variances (This is where Welch's belongs)
             test_name = "Welch's ANOVA"
             st.write(f"**Test Chosen:** {test_name}")
-            st.markdown("_Reason: Residuals not normal, but variances are homogeneous. Welch's is robust._")
+            st.markdown("_Reason: Residuals are normal, but variances are heterogeneous. Welch's is robust to unequal variances._")
             aov = welch_anova(data=df_clean, dv=kpi, between='experience_variant_label')
             p_value = aov['p-unc'].iloc[0]
             test_statistic = aov['F'].iloc[0]
@@ -276,16 +276,17 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after):
             is_significant = p_value < 0.05
             if is_significant and num_groups > 2:
                 st.write("**Post-Hoc Test (Games-Howell):**")
-                st.markdown("_Reason: Welch's ANOVA was significant, identifying which specific groups differ (suitable for potentially unequal variances even if Levene's was borderline, and robust)._")
+                st.markdown("_Reason: Welch's ANOVA was significant, identifying which specific groups differ (suitable for unequal variances)._")
                 posthoc_results = pairwise_gameshowell(data=df_clean, dv=kpi, between='experience_variant_label')
                 st.dataframe(posthoc_results)
 
-        else: # Heterogeneous Variances
+        else: 
+            # Non-Normal Data -> Drop to Non-parametric tests regardless of variance
             if num_groups > 2:
                 # Kruskal-Wallis
                 test_name = "Kruskal-Wallis H Test"
                 st.write(f"**Test Chosen:** {test_name}")
-                st.markdown("_Reason: Non-parametric test suitable for 3+ groups with heterogeneous variances._")
+                st.markdown("_Reason: Data is not normally distributed; non-parametric test suitable for 3+ groups._")
                 statistic, p_value = kruskal(*groups)
                 test_statistic = statistic
                 st.write(f"* H-statistic = {statistic:.4f}")
