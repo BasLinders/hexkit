@@ -49,18 +49,18 @@ def display_dynamic_documentation(analysis_method):
             """)
 
         with st.expander("Frequentist: How it works"):
-            st.markdown("""
+            st.markdown(r"""
             1.  **Metric Calculation:** Calculates the standard conversion rates and uses a $z$-test for proportions.
             2.  **Standard Error Calculation:** The engine uses an **unpooled standard error** $(SE_{unpooled})$ that incorporates the CUPED reduction factor ($r$):
-                $SE = \sqrt{\frac{p_c(1-p_c)r}{n_c} + \frac{p_v(1-p_v)r}{n_v}}$
+                $$SE = \sqrt{\frac{p_c(1-p_c)r}{n_c} + \frac{p_v(1-p_v)r}{n_v}}$$
             3.  **Non-Inferiority Z-Score:** We calculate the $Z$-stat by adding the **Non-Inferiority Margin ($\Delta$)** back into the observed difference:
-                $Z_{NI} = \frac{(CR_v - CR_c) + \Delta}{SE_{unpooled}}$
+                $$Z_{NI} = \frac{(CR_v - CR_c) + \Delta}{SE_{unpooled}}$$
             4.  **Lower Bound Estimation:** The engine calculates the lower bound of the difference. If this bound stays above $-\Delta$, the variant is considered "safe."
             5.  **CUPED Adjustment:** If CSV data is provided, it calculates the **Pearson Correlation ($\rho$)**. It then applies a variance reduction factor of $(1 - \rho^2)$ to the standard error, narrowing your confidence intervals.
             """)
 
         with st.expander("Frequentist: Interpretation"):
-            st.markdown("""
+            st.markdown(r"""
             * **p-value (Z-test):** If $p < 0.05$, we reject the null hypothesis. There is less than a 5% chance the observed lift is due to random noise.
             * **Confidence Intervals (CI):** If the CI for the *relative lift* does not cross $0\%$, the result is statistically significant.
             * **P-value (Non-Inferiority):** Tests the null hypothesis that the Variant is worse than the Control by more than the margin. If $p \le \alpha$, we reject the idea that the variant is a "loser" and label it non-inferior.
@@ -79,7 +79,7 @@ def display_dynamic_documentation(analysis_method):
             """)
 
         with st.expander("Bayesian: How it works"):
-            st.markdown("""
+            st.markdown(r"""
             1.  **Prior & Posterior:** Unless specified by entering expectations, we start with a **Beta-Binomial conjugate prior** ($\alpha=1, \beta=1$). As data comes in, we update this to a posterior distribution.
             2. **Uplift Distribution:** Calculates the difference in daily conversions between variants across all simulations to build a full distribution of potential outcomes.
             3.  **Monte Carlo Simulation:** We run 20,000 simulations per variant to model the probability density.
