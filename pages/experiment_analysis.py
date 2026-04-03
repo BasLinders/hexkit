@@ -52,9 +52,9 @@ def display_dynamic_documentation(analysis_method):
             st.markdown("""
             1.  **Metric Calculation:** Calculates the standard conversion rates and uses a $z$-test for proportions.
             2.  **Standard Error Calculation:** The engine uses an **unpooled standard error** $(SE_{unpooled})$ that incorporates the CUPED reduction factor ($r$):
-                $$SE = \sqrt{\frac{p_c(1-p_c)r}{n_c} + \frac{p_v(1-p_v)r}{n_v}}$$
+                $SE = \sqrt{\frac{p_c(1-p_c)r}{n_c} + \frac{p_v(1-p_v)r}{n_v}}$
             3.  **Non-Inferiority Z-Score:** We calculate the $Z$-stat by adding the **Non-Inferiority Margin ($\Delta$)** back into the observed difference:
-                $$Z_{NI} = \frac{(CR_v - CR_c) + \Delta}{SE_{unpooled}}$$
+                $Z_{NI} = \frac{(CR_v - CR_c) + \Delta}{SE_{unpooled}}$
             4.  **Lower Bound Estimation:** The engine calculates the lower bound of the difference. If this bound stays above $-\Delta$, the variant is considered "safe."
             5.  **CUPED Adjustment:** If CSV data is provided, it calculates the **Pearson Correlation ($\rho$)**. It then applies a variance reduction factor of $(1 - \rho^2)$ to the standard error, narrowing your confidence intervals.
             """)
