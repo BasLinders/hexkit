@@ -32,6 +32,67 @@ def initialize_session_state():
     st.session_state.setdefault("probability_winner", 80.0)
     st.session_state.setdefault("runtime_days", 0)
 
+# --- Information / documentation --- 
+def display_dynamic_documentation(analysis_method):
+    st.subheader(f"Documentation: {analysis_method}")
+
+    if analysis_method == "Frequentist Analysis":
+        with st.expander("Frequentist Analysis: What it provides"):
+            st.markdown("""
+            This engine focuses on **Null Hypothesis Statistical Testing (NHST)** to determine if the observed difference between variants is statistically significant.
+            
+            * **Fixed-Horizon Testing:** Ideal for tests where you have a pre-determined sample size.
+            * **Error Control:** Strictly controls for **Type I Errors** (False Positives) via $p$-values.
+            * **Dual-Gate Evaluation:** First, it checks for a traditional superior win ($p < 0.05$). If that isn't met, it automatically pivots to a **Non-Inferiority Test**.
+            * **Risk Mitigation:** Specifically designed for feature parity tests or migrations where the primary goal is "Do No Harm."
+            * **Variance-Adjusted Sensitivity:** Uses CUPED to strip out historical noise, allowing for a tighter, more accurate assessment of the difference between variants.
+            """)
+
+        with st.expander("Frequentist: How it works"):
+            st.markdown("""
+            1.  **Metric Calculation:** Calculates the standard conversion rates and uses a $z$-test for proportions.
+            2.  **Standard Error Calculation:** The engine uses an **unpooled standard error** $(SE_{unpooled})$ that incorporates the CUPED reduction factor ($r$):
+                $$SE = \sqrt{\frac{p_c(1-p_c)r}{n_c} + \frac{p_v(1-p_v)r}{n_v}}$$
+            3.  **Non-Inferiority Z-Score:** We calculate the $Z$-stat by adding the **Non-Inferiority Margin ($\Delta$)** back into the observed difference:
+                $$Z_{NI} = \frac{(CR_v - CR_c) + \Delta}{SE_{unpooled}}$$
+            4.  **Lower Bound Estimation:** The engine calculates the lower bound of the difference. If this bound stays above $-\Delta$, the variant is considered "safe."
+            5.  **CUPED Adjustment:** If CSV data is provided, it calculates the **Pearson Correlation ($\rho$)**. It then applies a variance reduction factor of $(1 - \rho^2)$ to the standard error, narrowing your confidence intervals.
+            """)
+
+        with st.expander("Frequentist: Interpretation"):
+            st.markdown("""
+            * **p-value (Z-test):** If $p < 0.05$, we reject the null hypothesis. There is less than a 5% chance the observed lift is due to random noise.
+            * **Confidence Intervals (CI):** If the CI for the *relative lift* does not cross $0\%$, the result is statistically significant.
+            * **P-value (Non-Inferiority):** Tests the null hypothesis that the Variant is worse than the Control by more than the margin. If $p \le \alpha$, we reject the idea that the variant is a "loser" and label it non-inferior.
+            * **Lower Bound of Difference:** Represents the "worst-case scenario" for the variant’s performance. If the bound is $-0.5\%$ and your limit is $-1.0\%$, the test passes.
+            * **Success Status:** A green success message indicates that while the variant might not be a "winner," it is statistically unlikely to cause a regression beyond your defined tolerance.
+            """)
+
+    else:  # Bayesian
+        with st.expander("Bayesian Analysis: What it provides"):
+            st.markdown("""
+            This engine provides a **probabilistic** view of the experiment, moving away from "significant/not significant" to "how much better is it?"
+            
+            * **Risk-Aware Decisioning:** Quantifies the **Expected Monetary Risk**—the literal monetary amount you stand to lose if the variant is actually worse.
+            * **Business Impact:** Translates statistical lift into a **6-month revenue projection** based on your AOV as a constant.
+            * **Direct Probabilities:** Gives you a clear "Chance to Beat Control" percentage.
+            """)
+
+        with st.expander("Bayesian: How it works"):
+            st.markdown("""
+            1.  **Prior & Posterior:** Unless specified by entering expectations, we start with a **Beta-Binomial conjugate prior** ($\alpha=1, \beta=1$). As data comes in, we update this to a posterior distribution.
+            2. **Uplift Distribution:** Calculates the difference in daily conversions between variants across all simulations to build a full distribution of potential outcomes.
+            3.  **Monte Carlo Simulation:** We run 20,000 simulations per variant to model the probability density.
+            4.  **Revenue Modeling:** Projects the cumulative effect of the daily difference multiplied by the Average Order Value (AOV) over a **183-day horizon**.
+            """)
+
+        with st.expander("Bayesian: Interpretation"):
+            st.markdown("""
+            * **Chance to Beat Control:** The probability that the Variant is superior to the Control. A value $>95\%$ is a strong winner.
+            * **Expected Total Contribution:** The net expected monetary gain over 6 months. This accounts for both the upside and the downside risk.
+            * **Probability Density Graph:** Visualizes the uncertainty. Thinner, taller peaks indicate higher certainty in the conversion rate.
+            """)
+
 # -- Data input functions
 def get_bayesian_inputs():
     st.session_state.num_variants = st.number_input(
@@ -1184,16 +1245,7 @@ def display_frequentist_summary(
 def run():
     st.title("Experiment Analysis")
     st.markdown("""
-    This app provides methods for Bayesian analysis and Frequentist analysis (z-test). Choose the appropriate method for your case.
-    
-    ### Bayesian features
-    - Probability assessement
-    - Simulations of uplifts
-    - Business risk assessment
-    
-    ### Frequentist features
-    - Assessment for statistical significance
-    - Non-inferiority assessment for non-significant uplifts
+    This app provides methods for Bayesian (beta RVS) and Frequentist analysis (z-test). Choose the appropriate method for your case.
     """)
     st.write("---")
     initialize_session_state()
@@ -1204,6 +1256,8 @@ def run():
         horizontal=True,
         help="Frequentist analysis uses z-tests and confidence intervals to assess statistical significance. Bayesian analysis uses simulations to estimate probabilities and potential business impact."
     )
+    st.write("---")
+    display_dynamic_documentation(analysis_method)
     st.write("---")
 
     # ==============================================================================
