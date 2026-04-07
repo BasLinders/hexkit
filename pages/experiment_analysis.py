@@ -551,15 +551,16 @@ def plot_winner_probabilities_chart(probabilities_to_be_best):
         luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
         return 'black' if luminance > 0.5 else 'white'
 
-    for index, value in enumerate(probabilities_to_be_best):
+    for index, (value, color) in enumerate(zip(probabilities_to_be_best, colors)):
         text_color = get_contrast_color(color)
         
         if value > 0.9:
             ax.text(value - 0.02, index, f"{value:.2%}", ha='right', va='center', 
                     color=text_color, fontweight='bold', fontsize=12)
         else:
-            ax.text(value + 0.01, index, f"{value:.2%}", ha='left', va='center', 
-                    color='black', fontsize=11)
+            ax.text(value + 0.01, index, f"{value:.2%}",
+                    ha='left', va='center', 
+                    color=text_color, fontsize=11)
 
     st.pyplot(fig)
     plt.close(fig)
