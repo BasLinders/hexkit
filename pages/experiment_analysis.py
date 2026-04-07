@@ -547,7 +547,7 @@ def plot_winner_probabilities_chart(probabilities_to_be_best):
     for index, value in enumerate(probabilities_to_be_best):
         if value > 0.9:
             ax.text(value - 0.02, index, f"{value:.2%}", ha='right', va='center', 
-                    color='white', fontweight='bold', fontsize=12)
+                    color='black', fontweight='bold', fontsize=12)
         else:
             ax.text(value + 0.01, index, f"{value:.2%}", ha='left', va='center', 
                     color='black', fontsize=11)
