@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.cm as cm
 import matplotlib.ticker as mticker
+import matplotlib.colors as mcolors
 from matplotlib import colormaps
 import plotly.graph_objects as go
 from scipy.stats import beta, norm, chisquare
@@ -544,10 +545,18 @@ def plot_winner_probabilities_chart(probabilities_to_be_best):
     ax.set_xlim(0, 1.05)
     ax.invert_yaxis()
 
+    def get_contrast_color(rgb):
+        # Convert RGB to perceived luminance (WCAG formula)
+        r, g, b = rgb[:3]
+        luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        return 'black' if luminance > 0.5 else 'white'
+
     for index, value in enumerate(probabilities_to_be_best):
+        text_color = get_contrast_color(color)
+        
         if value > 0.9:
             ax.text(value - 0.02, index, f"{value:.2%}", ha='right', va='center', 
-                    color='black', fontweight='bold', fontsize=12)
+                    color=text_color, fontweight='bold', fontsize=12)
         else:
             ax.text(value + 0.01, index, f"{value:.2%}", ha='left', va='center', 
                     color='black', fontsize=11)
