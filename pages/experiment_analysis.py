@@ -560,7 +560,7 @@ def plot_winner_probabilities_chart(probabilities_to_be_best):
         else:
             ax.text(value + 0.01, index, f"{value:.2%}",
                     ha='left', va='center', 
-                    color=text_color, fontsize=11)
+                    color='black', fontsize=11)
 
     st.pyplot(fig)
     plt.close(fig)
