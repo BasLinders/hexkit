@@ -7,8 +7,10 @@ st.set_page_config(
 )
 
 # Main Page UI
+logo_url = "st.image(Path="https://github.com/BasLinders/hexkit/blob/main/Hexkit-logo-bicolor_small.png")"
 
-st.title("HEXKIT")
+#st.title("HEXKIT")
+st.image(logo_url)
 st.write("### <span style='color: orange;'>v1.0</span>", unsafe_allow_html=True)
 st.write("""
 This is the main page for the Happy Horizon Experimentation Toolkit. You can navigate to individual apps using the sidebar.
