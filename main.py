@@ -7,7 +7,7 @@ st.set_page_config(
 )
 
 # Main Page UI
-logo_url = "st.image(Path="https://github.com/BasLinders/hexkit/blob/main/Hexkit-logo-bicolor_small.png")"
+logo_url = "https://github.com/BasLinders/hexkit/blob/main/Hexkit-logo-bicolor_small.png"
 
 #st.title("HEXKIT")
 st.image(logo_url)
