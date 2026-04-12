@@ -4,7 +4,10 @@ import statsmodels.api as sm
 from statsmodels.formula.api import ols
 import statsmodels.formula.api as smf
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
+import scipy.stats as stats
 from scipy.stats import shapiro, levene, kruskal, mannwhitneyu
+from scipy.optimize import minimize
+from scipy.special import gammaln
 import seaborn as sns
 import matplotlib.pyplot as plt
 from pingouin import welch_anova, qqplot, pairwise_gameshowell
@@ -55,6 +58,62 @@ def preprocess_data(df):
         df['profit'] = pd.to_numeric(df['profit'], errors='coerce')
 
     return df, errors
+
+# Gamma model
+def fit_gamma(data):
+    """
+    Fits a Gamma distribution (shape k, scale theta) to data using MLE.
+    Returns: (k, theta, log_likelihood)
+    """
+    # Remove zeros/negatives as Gamma is defined for x > 0
+    data = data[data > 0]
+    
+    # Initial guesses using Method of Moments
+    mean_x = np.mean(data)
+    var_x = np.var(data)
+    k_start = mean_x**2 / var_x
+    theta_start = var_x / mean_x
+
+    # Negative Log-Likelihood function
+    def neg_log_likelihood(params):
+        k, theta = params
+        if k <= 0 or theta <= 0:
+            return 1e10
+        # Gamma PDF log-likelihood formula
+        n = len(data)
+        ll = (n * (k - 1) * np.mean(np.log(data)) - 
+              n * k * np.log(theta) - 
+              n * np.mean(data) / theta - 
+              n * gammaln(k))
+        return -ll
+
+    res = minimize(neg_log_likelihood, [k_start, theta_start], method='L-BFGS-B', bounds=[(1e-5, None), (1e-5, None)])
+    k_mle, theta_mle = res.x
+    return k_mle, theta_mle, -res.fun
+
+def perform_gamma_test(df, kpi):
+    # 1. Null Model: Fit one Gamma to all data
+    all_data = df[kpi].values
+    _, _, ll_null = fit_gamma(all_data)
+    
+    # 2. Alternative Model: Fit Gamma to each variant separately
+    ll_alt = 0
+    variants = df['experience_variant_label'].unique()
+    num_variants = len(variants)
+    
+    for v in variants:
+        variant_data = df[df['experience_variant_label'] == v][kpi].values
+        _, _, ll_v = fit_gamma(variant_data)
+        ll_alt += ll_v
+        
+    # 3. Likelihood Ratio Test
+    # Degrees of freedom = (params in Alt) - (params in Null)
+    # Alt has 2 parameters (k, theta) per variant. Null has 2.
+    df_diff = (2 * num_variants) - 2
+    lr_stat = 2 * (ll_alt - ll_null)
+    p_value = 1 - stats.chi2.cdf(lr_stat, df=df_diff)
+    
+    return p_value, lr_stat
 
 # Detect outliers
 
@@ -159,7 +218,7 @@ def log_transform_data(df, kpi):
 
 # Perform statistical tests and provide conclusions
 
-def perform_stat_tests_and_conclusions(df, kpi, model_after):
+def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
     st.write("---") # Separator
     st.write("## Statistical Test Results")
     st.write("_(Based on Normality of Residuals and Homogeneity of Variance)_")
@@ -243,23 +302,41 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after):
     is_significant = False # Initialize
 
     try:
-        if is_normal and is_homogeneous:
-            # Standard ANOVA
-            test_name = "Standard One-Way ANOVA"
-            st.write(f"**Test Chosen:** {test_name}")
-            st.markdown("_Reason: Residuals are normal and variances are homogeneous._")
-            anova_results = sm.stats.anova_lm(model_after, typ=2)
-            p_value = anova_results['PR(>F)'].iloc[0]
-            test_statistic = anova_results['F'].iloc[0]
+        if approach == "Gamma GLM (Best for Revenue/Items)":
+            st.write("### Native Gamma Likelihood Ratio Test")
+            try:
+                # Fixed the function call name here to match your definition
+                p_value, lr_stat = perform_gamma_test(df_clean, kpi)
+                
+                st.write(f"* Likelihood Ratio Statistic: {lr_stat:.4f}")
+                st.write(f"* p-value: {p_value:.4g}")
+                
+                is_significant = p_value < 0.05
+                test_name = "Native Gamma MLE"
+                
+            except Exception as e:
+                st.error(f"Native Gamma Fit failed: {e}")
+                p_value = np.nan
 
-            st.dataframe(anova_results)
-            is_significant = p_value < 0.05
-            if is_significant and num_groups > 2:
-                st.write("**Post-Hoc Test (Tukey's HSD):**")
-                st.markdown("_Reason: ANOVA was significant, identifying which specific groups differ._")
-                tukey_results = pairwise_tukeyhsd(df_clean[kpi], df_clean['experience_variant_label'], alpha=0.05)
-                st.write(tukey_results.summary())
-                posthoc_results = tukey_results
+        elif approach == "Heuristic (Auto-detect)":
+            if is_normal and is_homogeneous:
+                # Standard ANOVA
+                test_name = "Standard One-Way ANOVA"
+                st.write(f"**Test Chosen:** {test_name}")
+                st.markdown("_Reason: Residuals are normal and variances are homogeneous._")
+                anova_results = sm.stats.anova_lm(model_after, typ=2)
+                p_value = anova_results['PR(>F)'].iloc[0]
+                test_statistic = anova_results['F'].iloc[0]
+
+                st.dataframe(anova_results)
+                is_significant = p_value < 0.05
+                
+                if is_significant and num_groups > 2:
+                    st.write("**Post-Hoc Test (Tukey's HSD):**")
+                    st.markdown("_Reason: ANOVA was significant, identifying which specific groups differ._")
+                    tukey_results = pairwise_tukeyhsd(df_clean[kpi], df_clean['experience_variant_label'], alpha=0.05)
+                    st.write(tukey_results.summary())
+                    posthoc_results = tukey_results
 
         elif is_normal and not is_homogeneous: 
             # Normal, but Heterogeneous Variances (This is where Welch's belongs)
@@ -455,8 +532,16 @@ def run():
         # Only show this checkbox if the user SELECTED profit AND the column actually has zeros
         if kpi == 'profit' and (df['profit'] == 0).any():
              filter_zero_profit = st.checkbox("Exclude rows where profit is zero (recommended for ANOVA)", value=True)
-
+            
+        # Select how to handle outliers
         outlier_handling = st.selectbox("Select how to handle outliers:", ['None', 'Winsorizing (STD/Percentile)', 'Log Transform', 'Removal'], help='Choose the method for handling outliers. "None" uses a default > 5 standard deviation definition for detection purposes. Only use Log Transform when your data does not contain negative numbers.')
+
+        # Select analysis approach (Gamma model for revenue/items per transaction, heuristic framework for e.g. profit
+        analysis_approach = st.selectbox(
+            "Select Statistical Approach:",
+            ["Heuristic (Auto-detect)", "Gamma GLM (Best for Revenue/Items)"],
+            help="Heuristic follows a Normality/Variance decision tree. Gamma GLM is optimized for strictly positive, right-skewed continuous data."
+        )
 
         method = None
         outlier_stdev = None
@@ -578,7 +663,7 @@ def run():
             st.pyplot(fig_hist)
             plt.clf()
 
-            perform_stat_tests_and_conclusions(processed_df, kpi, model_after)  # Pass the refitted model
+            perform_stat_tests_and_conclusions(processed_df, kpi, model_after, analysis_approach)
             
 if __name__ == "__main__":
     run()
