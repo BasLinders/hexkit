@@ -294,7 +294,7 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
     # --- Main Statistical Test ---
     st.write("### 2. Main Comparison Test")
 
-    test_name = ""
+    test_name = "Generic Comparison"
     p_value = np.nan
     test_statistic = np.nan
     effect_size = None
@@ -338,79 +338,79 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
                     st.write(tukey_results.summary())
                     posthoc_results = tukey_results
 
-        elif is_normal and not is_homogeneous: 
-            # Normal, but Heterogeneous Variances (This is where Welch's belongs)
-            test_name = "Welch's ANOVA"
-            st.write(f"**Test Chosen:** {test_name}")
-            st.markdown("_Reason: Residuals are normal, but variances are heterogeneous. Welch's is robust to unequal variances._")
-            aov = welch_anova(data=df_clean, dv=kpi, between='experience_variant_label')
-            p_value = aov['p-unc'].iloc[0]
-            test_statistic = aov['F'].iloc[0]
-            effect_size = aov['np2'].iloc[0] # Partial eta-squared from pingouin
-            st.dataframe(aov)
-            if effect_size is not None:
-                st.write(f"* _Effect Size (Partial Eta-Squared): {effect_size:.4f}_")
-            is_significant = p_value < 0.05
-            if is_significant and num_groups > 2:
-                st.write("**Post-Hoc Test (Games-Howell):**")
-                st.markdown("_Reason: Welch's ANOVA was significant, identifying which specific groups differ (suitable for unequal variances)._")
-                posthoc_results = pairwise_gameshowell(data=df_clean, dv=kpi, between='experience_variant_label')
-                st.dataframe(posthoc_results)
-
-        else: 
-            # Non-Normal Data -> Drop to Non-parametric tests regardless of variance
-            if num_groups > 2:
-                # Kruskal-Wallis
-                test_name = "Kruskal-Wallis H Test"
+            elif is_normal and not is_homogeneous: 
+                # Normal, but Heterogeneous Variances (This is where Welch's belongs)
+                test_name = "Welch's ANOVA"
                 st.write(f"**Test Chosen:** {test_name}")
-                st.markdown("_Reason: Data is not normally distributed; non-parametric test suitable for 3+ groups._")
-                statistic, p_value = kruskal(*groups)
-                test_statistic = statistic
-                st.write(f"* H-statistic = {statistic:.4f}")
-                st.write(f"* p-value = {p_value:.4g}") # Use general format for potentially small p-values
+                st.markdown("_Reason: Residuals are normal, but variances are heterogeneous. Welch's is robust to unequal variances._")
+                aov = welch_anova(data=df_clean, dv=kpi, between='experience_variant_label')
+                p_value = aov['p-unc'].iloc[0]
+                test_statistic = aov['F'].iloc[0]
+                effect_size = aov['np2'].iloc[0] # Partial eta-squared from pingouin
+                st.dataframe(aov)
+                if effect_size is not None:
+                    st.write(f"* _Effect Size (Partial Eta-Squared): {effect_size:.4f}_")
                 is_significant = p_value < 0.05
-                 # Calculate effect size: Eta-squared_H = (H - k + 1) / (n - k) where k=num groups, n=total samples
-                n_total = len(df_clean)
-                if n_total > num_groups: # Avoid division by zero or negative
-                    effect_size_eta_h = (test_statistic - num_groups + 1) / (n_total - num_groups)
-                    st.write(f"* _Approx. Effect Size (Eta-squared_H): {effect_size_eta_h:.4f}_")
-
-                if is_significant:
-                    st.write("**Post-Hoc Test (Dunn's Test with Bonferroni correction):**")
-                    st.markdown("_Reason: Kruskal-Wallis was significant, identifying which specific groups differ._")
-
-                    # Dunn's test for post-hoc analysis                
-                    try:
-                        posthoc_results_df = sp.posthoc_dunn(groups, p_adjust='bonferroni')
-                        group_names = df_clean['experience_variant_label'].unique()
-                        name_map = {i+1: name for i, name in enumerate(group_names)}
-                        posthoc_results_df.rename(columns=name_map, index=name_map, inplace=True)
-                        
-                        st.write("_(p-values adjusted using Bonferroni method)_")
-                        st.dataframe(posthoc_results_df)
-                    except Exception as posthoc_e:
-                         st.error(f"Error during Dunn's post-hoc test: {posthoc_e}")
-
-            else: # Exactly 2 groups with Heterogeneous Variances
-                 # Mann-Whitney U
-                test_name = "Mann-Whitney U Test"
-                st.write(f"**Test Chosen:** {test_name}")
-                st.markdown("_Reason: Non-parametric test suitable for 2 groups with heterogeneous variances._")
-                # Ensure groups have data
-                if len(groups[0]) > 0 and len(groups[1]) > 0:
-                    statistic, p_value = mannwhitneyu(groups[0], groups[1], alternative='two-sided')
+                if is_significant and num_groups > 2:
+                    st.write("**Post-Hoc Test (Games-Howell):**")
+                    st.markdown("_Reason: Welch's ANOVA was significant, identifying which specific groups differ (suitable for unequal variances)._")
+                    posthoc_results = pairwise_gameshowell(data=df_clean, dv=kpi, between='experience_variant_label')
+                    st.dataframe(posthoc_results)
+    
+            else: 
+                # Non-Normal Data -> Drop to Non-parametric tests regardless of variance
+                if num_groups > 2:
+                    # Kruskal-Wallis
+                    test_name = "Kruskal-Wallis H Test"
+                    st.write(f"**Test Chosen:** {test_name}")
+                    st.markdown("_Reason: Data is not normally distributed; non-parametric test suitable for 3+ groups._")
+                    statistic, p_value = kruskal(*groups)
                     test_statistic = statistic
-                    st.write(f"* U-statistic = {statistic:.4f}")
-                    st.write(f"* p-value = {p_value:.4g}")
+                    st.write(f"* H-statistic = {statistic:.4f}")
+                    st.write(f"* p-value = {p_value:.4g}") # Use general format for potentially small p-values
                     is_significant = p_value < 0.05
-                    # Calculate effect size: Rank-Biserial Correlation r = 1 - (2*U) / (n1*n2)
-                    n1 = len(groups[0])
-                    n2 = len(groups[1])
-                    effect_size_rank_biserial = 1 - (2 * test_statistic) / (n1 * n2)
-                    st.write(f"* _Effect Size (Rank-Biserial Correlation): {effect_size_rank_biserial:.4f}_")
-                else:
-                    st.warning("Warning: Cannot perform Mann-Whitney U test as at least one group has no data.")
-                    p_value = np.nan # Ensure no significance is declared
+                     # Calculate effect size: Eta-squared_H = (H - k + 1) / (n - k) where k=num groups, n=total samples
+                    n_total = len(df_clean)
+                    if n_total > num_groups: # Avoid division by zero or negative
+                        effect_size_eta_h = (test_statistic - num_groups + 1) / (n_total - num_groups)
+                        st.write(f"* _Approx. Effect Size (Eta-squared_H): {effect_size_eta_h:.4f}_")
+    
+                    if is_significant:
+                        st.write("**Post-Hoc Test (Dunn's Test with Bonferroni correction):**")
+                        st.markdown("_Reason: Kruskal-Wallis was significant, identifying which specific groups differ._")
+    
+                        # Dunn's test for post-hoc analysis                
+                        try:
+                            posthoc_results_df = sp.posthoc_dunn(groups, p_adjust='bonferroni')
+                            group_names = df_clean['experience_variant_label'].unique()
+                            name_map = {i+1: name for i, name in enumerate(group_names)}
+                            posthoc_results_df.rename(columns=name_map, index=name_map, inplace=True)
+                            
+                            st.write("_(p-values adjusted using Bonferroni method)_")
+                            st.dataframe(posthoc_results_df)
+                        except Exception as posthoc_e:
+                             st.error(f"Error during Dunn's post-hoc test: {posthoc_e}")
+    
+                else: # Exactly 2 groups with Heterogeneous Variances
+                     # Mann-Whitney U
+                    test_name = "Mann-Whitney U Test"
+                    st.write(f"**Test Chosen:** {test_name}")
+                    st.markdown("_Reason: Data is not normally distributed (Non-parametric alternative to ANOVA)._")
+                    # Ensure groups have data
+                    if len(groups[0]) > 0 and len(groups[1]) > 0:
+                        statistic, p_value = mannwhitneyu(groups[0], groups[1], alternative='two-sided')
+                        test_statistic = statistic
+                        st.write(f"* U-statistic = {statistic:.4f}")
+                        st.write(f"* p-value = {p_value:.4g}")
+                        is_significant = p_value < 0.05
+                        # Calculate effect size: Rank-Biserial Correlation r = 1 - (2*U) / (n1*n2)
+                        n1 = len(groups[0])
+                        n2 = len(groups[1])
+                        effect_size_rank_biserial = 1 - (2 * test_statistic) / (n1 * n2)
+                        st.write(f"* _Effect Size (Rank-Biserial Correlation): {effect_size_rank_biserial:.4f}_")
+                    else:
+                        st.warning("Warning: Cannot perform Mann-Whitney U test as at least one group has no data.")
+                        p_value = np.nan # Ensure no significance is declared
 
     except Exception as e:
         st.error(f"An error occurred during the main statistical test ({test_name}): {e}")
