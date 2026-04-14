@@ -1,0 +1,14 @@
+credentials:
+  usernames:
+    user1:
+      email: user1@yourdomain.com
+      name: User One
+      password: '$2b$12$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'  # use hashed password
+    user2:
+      email: user2@anotherdomain.org
+      name: User Two
+      password: '$2b$12$yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'  # use hashed password
+cookie:
+  name: hexkit_auth_cookie
+  key: some_signature_key  # random string, e.g., output of `openssl rand -hex 32`
+  expiry_days: 30
