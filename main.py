@@ -12,7 +12,7 @@ st.sidebar.image(logo_url, use_container_width=True)
 
 # st.title("HEXKIT")
 # st.image(logo_url)
-st.write("### <span style='color: orange;'>v1.1</span>", unsafe_allow_html=True)
+st.write("### <span style='color: orange;'>v1.2</span>", unsafe_allow_html=True)
 st.write("""
 This is the main page for the Happy Horizon Experimentation Toolkit. You can navigate to individual apps using the sidebar.
 
