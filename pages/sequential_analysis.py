@@ -315,12 +315,10 @@ def analysis_section(df, params):
             
             if latest_llr > 0:
                 direction = f"▲ {normalized_clamped * 100:.0f}% toward **success boundary**"
-                bar_color = "normal"
             else:
                 distance_to_lower = abs(latest_llr - lower_bound)
                 pct_to_futility = max(0, 100 - (distance_to_lower / abs(lower_bound)) * 100)
                 direction = f"▼ {pct_to_futility:.0f}% toward **futility boundary**"
-                bar_color = "normal"
             
             st.write(f"**Trajectory:** {direction}")
             st.progress(normalized_clamped)
@@ -487,7 +485,6 @@ def setup_sidebar(defaults, is_locked):
         p0_param = float(defaults.get('p0', 0.10))
 
         with st.form("setup_form"):
-            tau_val = float(defaults.get('tau') or 0.01)
             alpha_val = float(defaults.get('alpha', 0.05))
             beta_val = float(defaults.get('beta', 0.20))
             max_visitors_val = int(defaults.get('max_visitors', 10000))
@@ -508,7 +505,8 @@ def setup_sidebar(defaults, is_locked):
                 help="The smallest relative lift you care about detecting (e.g. 5 = 5% relative improvement over baseline)."
             )
             mde = mde_pct / 100.0
-            tau_param = derive_tau_from_mde(p0_param if p0_param > 0 else 0.10, mde)
+            tau_p0 = p0_param if test_type == TEST_TYPE_ONE_SAMPLE and p0_param > 0 else 0.10
+            tau_param = derive_tau_from_mde(tau_p0, mde)
             
             if not is_locked:
                 st.caption(f"Derived sensitivity (tau): `{tau_param:.6f}` — based on your MDE and baseline CR.")
