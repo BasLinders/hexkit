@@ -43,7 +43,7 @@ def calculate_msprt_llr(visitors_base, conversions_base, visitors_var, conversio
     if fixed_baseline_cr is not None:
         # ONE-SAMPLE: Variance of a single proportion
         p_base = fixed_baseline_cr
-        var = p_var * (1 - p_var) / visitors_var
+        var = p_base * (1 - p_base) / visitors_var
         
         if var == 0:
             return 0.0
@@ -70,6 +70,37 @@ def calculate_msprt_llr(visitors_base, conversions_base, visitors_var, conversio
 
     return llr
 
+def derive_tau_from_mde(p0, mde):
+    """
+    Derives tau from MDE and baseline CR.
+    Tau represents the expected absolute effect size variance.
+    We set it to half the absolute MDE squared; a reasonable
+    prior that centers sensitivity around the effect we care about.
+    """
+    absolute_mde = p0 * mde
+    tau = (absolute_mde / 2) ** 2
+
+    return float(np.clip(tau, 1e-6, 0.5))
+
+def conditional_power_check(latest_llr, upper_bound, latest_vis, max_visitors):
+    """
+    Estimates whether there's a plausible path to significance.
+    Uses linear projection of LLR per visitor to the cap.
+    Returns (can_recover: bool, projected_llr: float)
+    """
+    if latest_vis == 0:
+        return True, 0.0
+    
+    remaining_visitors = max_visitors - latest_vis
+    if remaining_visitors <= 0:
+        return latest_llr >= upper_bound, latest_llr
+    
+    llr_per_visitor = latest_llr / latest_vis
+    projected_llr = latest_llr + (llr_per_visitor * remaining_visitors)
+    can_recover = projected_llr >= upper_bound
+    
+    return can_recover, projected_llr
+
 # --- DATABASE FUNCTIONS ---
 
 def get_experiment_params(experiment_id):
@@ -83,7 +114,7 @@ def get_experiment_params(experiment_id):
         st.error(f"Error fetching params: {e}")
         return None
 
-def save_experiment_params(experiment_id, p0, tau, alpha, beta, max_visitors, test_type, num_variants):
+def save_experiment_params(experiment_id, p0, tau, alpha, beta, max_visitors, test_type, num_variants, mde_pct):
     """Save the immutable rules of the experiment."""
     try:
         data = {
@@ -94,7 +125,8 @@ def save_experiment_params(experiment_id, p0, tau, alpha, beta, max_visitors, te
             "beta": float(beta),
             "max_visitors": int(max_visitors),
             "test_type": str(test_type),
-            "num_variants": int(num_variants)
+            "num_variants": int(num_variants),
+            "mde_pct": float(mde_pct)
         }
         conn.table("experiment_params").insert(data).execute()
         return True
@@ -152,35 +184,51 @@ def delete_data_points_by_date(experiment_id, date):
 
 # --- VISUALIZATIONS ---
 
-def show_visualization(chart_df, upper_bound, lower_bound):
+def show_visualization(chart_df, upper_bound, lower_bound, max_visitors):
     if chart_df.empty:
         st.warning("No data to visualize yet.")
         return
-        
+
     y_values = [chart_df['llr'].max(), chart_df['llr'].min(), upper_bound, lower_bound]
-    
-    # Additive padding handles negative numbers safely
     padding = (max(y_values) - min(y_values)) * 0.1
-    if padding == 0: padding = 1.0 # Fallback
-    
+    if padding == 0:
+        padding = 1.0
     max_y = max(y_values) + padding
     min_y = min(y_values) - padding
 
     line = alt.Chart(chart_df).mark_line(point=True).encode(
-        x = alt.X('measurement_date:T', title='Date'),
-        y = alt.Y('llr:Q', title='Log Likelihood Ratio', scale=alt.Scale(domain=[min_y, max_y])),
-        color = alt.Color('variant_name:N', title='Variant')
+        x=alt.X('measurement_date:T', title='Date'),
+        y=alt.Y('llr:Q', title='Log Likelihood Ratio', scale=alt.Scale(domain=[min_y, max_y])),
+        color=alt.Color('variant_name:N', title='Variant')
     )
 
-    success_zone = alt.Chart(pd.DataFrame({'y': [upper_bound], 'y2': [max_y]})).mark_rect(color='green', opacity=0.1).encode(y='y', y2='y2')
-    futility_zone = alt.Chart(pd.DataFrame({'y': [min_y], 'y2': [lower_bound]})).mark_rect(color='red', opacity=0.1).encode(y='y', y2='y2')
+    success_zone = alt.Chart(pd.DataFrame({'y': [upper_bound], 'y2': [max_y]})).mark_rect(
+        color='green', opacity=0.1).encode(y='y', y2='y2')
+    futility_zone = alt.Chart(pd.DataFrame({'y': [min_y], 'y2': [lower_bound]})).mark_rect(
+        color='red', opacity=0.1).encode(y='y', y2='y2')
 
-    upper_line = alt.Chart(pd.DataFrame({'y': [upper_bound]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
-    lower_line = alt.Chart(pd.DataFrame({'y': [lower_bound]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
-    
-    chart = (success_zone + futility_zone + upper_line + lower_line + line).properties(height=400).interactive()
+    upper_line = alt.Chart(pd.DataFrame({'y': [upper_bound]})).mark_rule(
+        color='green', strokeDash=[5, 5]).encode(y='y')
+    lower_line = alt.Chart(pd.DataFrame({'y': [lower_bound]})).mark_rule(
+        color='red', strokeDash=[5, 5]).encode(y='y')
 
-    st.markdown("### Test Trajectory")
+    # Visitor cap annotation
+    cap_visitors = max_visitors
+    latest_visitors = chart_df['visitors'].max() if 'visitors' in chart_df.columns else None
+    cap_note = ""
+    if latest_visitors is not None:
+        pct_used = min(latest_visitors / cap_visitors * 100, 100)
+        cap_note = f" — {pct_used:.0f}% of cap used ({latest_visitors:,} / {cap_visitors:,} visitors)"
+
+    chart = (
+        success_zone + futility_zone + upper_line + lower_line + line
+    ).properties(height=400).interactive()
+
+    st.markdown(f"### Test Trajectory{cap_note}")
+    st.caption(
+        "Time estimates assume linear LLR growth, which may not hold. "
+        "Treat projections as directional, not precise."
+    )
     st.altair_chart(chart, use_container_width=True)
 
 # --- ANALYSIS ---
@@ -261,9 +309,19 @@ def analysis_section(df, params):
             st.write(f"**Observed CR:** {latest_cr:.2%} vs **Baseline CR:** {base_cr:.2%}")
             
             # --- PROGRESS BAR ---
-            progress = min(max((latest_llr / upper_bound) * 100, 0), 100) if latest_llr > 0 else 0
-            st.write(f"**Progress to Decision Boundary:** {progress:.0f}%")
-            st.progress(progress / 100)
+            total_range = upper_bound - lower_bound  # e.g. typically a positive span
+            normalized = (latest_llr - lower_bound) / total_range  # 0 = at lower, 1 = at upper
+            normalized_clamped = min(max(normalized, 0.0), 1.0)
+            
+            if latest_llr > 0:
+                direction = f"▲ {normalized_clamped * 100:.0f}% toward **success boundary**"
+            else:
+                distance_to_lower = abs(latest_llr - lower_bound)
+                pct_to_futility = max(0, 100 - (distance_to_lower / abs(lower_bound)) * 100)
+                direction = f"▼ {pct_to_futility:.0f}% toward **futility boundary**"
+            
+            st.write(f"**Trajectory:** {direction}")
+            st.progress(normalized_clamped)
 
             # --- TIME ESTIMATION ---
             if latest_llr > 0 and not (latest_llr > upper_bound or latest_llr < lower_bound):
@@ -282,28 +340,47 @@ def analysis_section(df, params):
 
             # --- DECISION LOGIC ---
             if latest_llr > upper_bound:
-                st.success(f"**Result: SIGNIFICANT POSITIVE** - {variant} is superior. You can stop.")
+                st.success(f"**Result: SIGNIFICANT POSITIVE** — {variant} is superior. You can stop.")
+            
             elif latest_llr < lower_bound:
-                # Calculate the relative difference to see if it's practically a tie
-                relative_diff = (latest_cr - base_cr) / base_cr if base_cr > 0 else 0
-                
-                if relative_diff < -0.05: # More than a 5% relative drop
-                    st.error(f"**Result: NEGATIVE IMPACT** - {variant} is noticeably worse than the baseline ({relative_diff:.1%} relative drop). Stop testing.")
-                elif relative_diff < 0:
-                    st.warning(f"**Result: FLAT / FUTILITY** - {variant} is practically tied with the baseline. It will not reach your target lift.")
+                mde_pct = params.get('mde_pct', 5.0)
+                mde_absolute = base_cr * (mde_pct / 100.0)
+                observed_diff = latest_cr - base_cr
+            
+                if observed_diff < -mde_absolute:
+                    st.error(
+                        f"**Result: NEGATIVE IMPACT** — {variant} is meaningfully worse than baseline "
+                        f"({observed_diff:.2%} absolute, exceeds your MDE of {mde_absolute:.2%}). Stop testing."
+                    )
                 else:
-                    st.warning(f"**Result: FLAT / FUTILITY** - {variant} is slightly ahead, but will not reach your target lift.")
+                    st.warning(
+                        f"**Result: FLAT / FUTILITY** — {variant} will not reach your target lift. "
+                        f"Observed difference ({observed_diff:+.2%}) is within noise."
+                    )
+            
+            elif latest_vis >= max_visitors:
+                can_recover, projected_llr = conditional_power_check(
+                    latest_llr, upper_bound, latest_vis, max_visitors
+                )
+                if can_recover:
+                    st.warning(
+                        f"**Cap Reached — Borderline:** Projected final LLR is `{projected_llr:.2f}` vs "
+                        f"upper bound `{upper_bound:.2f}`. Consider extending your cap slightly."
+                    )
+                else:
+                    st.error(
+                        f"**Cap Reached — Futility:** At the current trajectory, this test will not reach "
+                        f"significance (projected LLR: `{projected_llr:.2f}`, needs `{upper_bound:.2f}`). "
+                        f"Stop and call it flat."
+                    )
             else:
-                if latest_vis >= max_visitors:
-                    st.warning("Maximum sample size reached without a decision.")
-                else:
-                    st.info("INCONCLUSIVE - Continue collecting data.")
+                st.info("**INCONCLUSIVE** — Continue collecting data.")
 
     if chart_data:
         final_chart_df = pd.concat(chart_data)
         if 'visitors_var' in final_chart_df.columns:
             final_chart_df = final_chart_df.rename(columns={'visitors_var': 'visitors'})
-        show_visualization(final_chart_df, upper_bound, lower_bound)
+        show_visualization(final_chart_df, upper_bound, lower_bound, max_visitors)
 
 # --- DOCUMENTATION ---
 def show_documentation():
@@ -408,7 +485,6 @@ def setup_sidebar(defaults, is_locked):
         p0_param = float(defaults.get('p0', 0.10))
 
         with st.form("setup_form"):
-            tau_val = float(defaults.get('tau') or 0.01)
             alpha_val = float(defaults.get('alpha', 0.05))
             beta_val = float(defaults.get('beta', 0.20))
             max_visitors_val = int(defaults.get('max_visitors', 10000))
@@ -419,13 +495,22 @@ def setup_sidebar(defaults, is_locked):
                 st.caption(f"**{p0_label}:** Not required for strict calculations in Multi-sample mode.")
                 p0_param = 0.01
 
-            tau_param = st.select_slider(
-                "Test sensitivity (Tau)",
-                options=[0.0001, 0.001, 0.005, 0.01, 0.05, 0.1],
-                value=tau_val,
-                help="Lower values (0.001) are more conservative. Higher values (0.05) detect large effects faster.",
-                disabled=is_locked
+            mde_pct = st.number_input(
+                "Minimum Detectable Effect (MDE %)",
+                min_value=0.1,
+                max_value=50.0,
+                value=float(defaults.get('mde_pct', 5.0)),
+                step=0.1,
+                disabled=is_locked,
+                help="The smallest relative lift you care about detecting (e.g. 5 = 5% relative improvement over baseline)."
             )
+            mde = mde_pct / 100.0
+            tau_p0 = p0_param if test_type == TEST_TYPE_ONE_SAMPLE and p0_param > 0 else 0.10
+            tau_param = derive_tau_from_mde(tau_p0, mde)
+            
+            if not is_locked:
+                st.caption(f"Derived sensitivity (tau): `{tau_param:.6f}` — based on your MDE and baseline CR.")
+                
             max_visitors = st.number_input("Max Visitors (Safety Cap)", value=max_visitors_val, step=100, disabled=is_locked)
             
             c1, c2 = st.columns(2)
@@ -439,13 +524,20 @@ def setup_sidebar(defaults, is_locked):
                         st.error("Generate an ID first!")
                     elif tau_param <= 0:
                         st.error("Sensitivity (Tau) must be greater than 0.")
+                    elif alpha + beta >= 1:
+                        st.error("Alpha + Beta must be less than 1. Typical values: Alpha=0.05, Beta=0.20.")
+                    elif alpha <= 0 or alpha >= 1:
+                        st.error("Alpha must be between 0 and 1.")
+                    elif beta <= 0 or beta >= 1:
+                        st.error("Beta must be between 0 and 1.")
                     else:
-                        saved = save_experiment_params(st.session_state['exp_id'], p0_param, tau_param, alpha, beta, max_visitors, test_type, num_variants)
+                        saved = save_experiment_params(st.session_state['exp_id'], p0_param, tau_param, alpha, beta, max_visitors, test_type, num_variants, mde_pct)
                         if saved:
                             st.session_state['params_locked'] = True
                             st.session_state['fetched_params'] = {
                                 'p0': p0_param, 'tau': tau_param, 'alpha': alpha, 'beta': beta, 
-                                'max_visitors': max_visitors, 'test_type': test_type, 'num_variants': num_variants
+                                'max_visitors': max_visitors, 'test_type': test_type, 'num_variants': num_variants,
+                                'mde_pct': mde_pct
                             }
                             st.rerun()
             else:
