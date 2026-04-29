@@ -801,7 +801,47 @@ def display_results_per_variant(
                 On smaller datasets of < 1000 conversions, interpret with care.
                 This table is purely a measurement of potential impact - no guarantee!
             """)
-            st.write("")
+            with st.expander("How is the business case calculated?"):
+                st.markdown(r"""
+                    The business risk assessment translates the Bayesian simulation into a 6-month monetary projection.
+                    It runs 20,000 simulations per variant and applies the following logic:
+
+                    **Conversion rate sampling**
+                    For each simulation, a conversion rate is drawn from the posterior Beta distribution, updated with
+                    the observed visitors and conversions. The daily conversion volume is then estimated as:
+                    $$\text{Daily Conversions} = CR_{sampled} \times \frac{\text{Visitors}}{\text{Runtime (days)}}$$
+
+                    **AOV sampling**
+                    Rather than treating AOV as a fixed constant, it is drawn from a log-normal distribution on each
+                    simulation. The distribution is parameterised so that the expected value equals your input AOV exactly —
+                    only variance is added, not bias. The degree of spread is controlled by the AOV Variability slider
+                    (coefficient of variation: std / mean).
+
+                    **Lift prior**
+                    If a lift prior is applied, importance weights are computed for each simulation based on how
+                    plausible the observed lift is under your prior beliefs. These weights adjust all monetary
+                    figures without discarding any simulations.
+
+                    **Uplift and risk**
+                    The daily difference in conversions between the challenger and control is calculated per simulation.
+                    Positive and negative differences are separated:
+
+                    | | Formula |
+                    |---|---|
+                    | Expected Daily Gain | Mean of positive differences × sampled challenger AOV |
+                    | Expected Daily Loss | Mean of negative differences × sampled control AOV |
+                    | Monetary Uplift | Daily Gain × 183 days × P(challenger better) |
+                    | Monetary Risk | Daily Loss × 183 days × P(control better) |
+                    | Total Contribution | Monetary Uplift + Monetary Risk |
+
+                    **Interpretation**
+                    - A positive Total Contribution means the expected gain outweighs the expected loss over 6 months.
+                    - Monetary Risk is always negative or zero. It represents the downside if the variant underperforms.
+                    - On datasets with fewer than 1,000 conversions, the simulation may surface more extreme values.
+                    Treat projections on small samples as directional, not precise.
+
+                    _This table is a measurement of potential impact only; not a guarantee of future revenue.
+                """)
             st.dataframe(df)
     else:
         st.write("")
