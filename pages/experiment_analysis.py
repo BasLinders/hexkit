@@ -5,16 +5,20 @@ import numpy as np
 import string
 import io
 import concurrent.futures
+import altair as alt
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.cm as cm
 import matplotlib.ticker as mticker
 import matplotlib.colors as mcolors
 from matplotlib import colormaps
+from matplotlib.figure import Figure
 import plotly.graph_objects as go
 from scipy.stats import beta, norm, chisquare
 import math
-import altair as alt
+from dataclasses import dataclass
+from typing import Literal, List, Tuple, Dict
+
 
 st.set_page_config(
     page_title="Experiment Analysis",
@@ -26,7 +30,8 @@ def initialize_session_state():
     num_variants = st.session_state.num_variants
     st.session_state.setdefault("visitor_counts", [0] * num_variants)
     st.session_state.setdefault("conversion_counts", [0] * num_variants)
-    st.session_state.setdefault("aovs", [None] * num_variants)
+    st.session_state.setdefault("aovs", [None] * num_variants),
+    st.session_state.setdefault("aov_cv", 0.5),
     st.session_state.setdefault("confidence_level", 95)
     st.session_state.setdefault("test_duration", 7)
     st.session_state.setdefault("tail", 'Greater')
@@ -147,10 +152,6 @@ def get_bayesian_inputs():
     st.write("---")
     st.write("#### Average Order Value (€)")
 
-    # Create columns for the AOV inputs. The number of columns is equal to the number of variants.
-    # aov_cols = st.columns(num_variants)
-
-    # Don't create columns. Streamlit can't handle multi-column input well.
     for i in range(num_variants):
         st.session_state.aovs[i] = st.number_input(
             f"Average Order Value for Variant {alphabet[i]}",
@@ -158,6 +159,15 @@ def get_bayesian_inputs():
             value=st.session_state.aovs[i],
             key=f"b_aov_{i}"
         )
+    
+    st.session_state.aov_cv = st.slider(
+        "AOV Variability",
+        min_value=0.1, max_value=2.0, step=0.1,
+        value=st.session_state.get("aov_cv", 0.5),
+        help="Coefficient of variation for order value (std / mean). "
+             "Lower = stable pricing, higher = wide price range. "
+             "Does not affect the average prediction, only the spread."
+    )
 
     st.write("---")
     st.write("### General Test Settings")
@@ -175,25 +185,46 @@ def get_bayesian_inputs():
         value=st.session_state.runtime_days
     )
 
-    use_priors = st.checkbox("Use adjusted priors?", help="Take into account previous test data when evaluating this experiment.")
+    use_priors = st.checkbox(
+        "Apply a lift prior?",
+        help="Express skepticism about large lifts before seeing the data. Recommended for most experiments."
+    )
+    
     if use_priors:
         st.write("##### Prior Beliefs")
         col1, col2 = st.columns(2)
         with col1:
-            expected_sample_size = st.number_input("What is the total expected sample size of the experiment?", min_value=1000, step=1, value=10000)
+            expected_lift_pct = st.number_input(
+                "Expected Lift (%)",
+                min_value=-99.0, max_value=1000.0, step=0.1, value=0.0,
+                help="Your best guess at the relative lift before seeing results. Use 0 if you have no directional expectation."
+            )
         with col2:
-            expected_conversion = st.number_input("Expected Conversion Rate (%)", min_value=0.01, max_value=100.00, step=0.01, value=5.0)
-
-        belief_strength = st.selectbox("Strength of Belief", ["weak", "moderate", "strong"], index=1, help="Indicate how strong your belief is in the expected conversion rate.")
-        alpha_prior, beta_prior = get_beta_priors(expected_conversion, belief_strength, expected_sample_size)
+            skepticism = st.selectbox(
+                "Skepticism",
+                ["skeptical", "moderate", "uninformative"],
+                index=0,
+                help="How strongly you believe large lifts are implausible. 'Skeptical' resists extreme results; 'uninformative' applies almost no pressure."
+            )
+    
+        beta_prior = get_beta_priors()
+        lift_prior = get_lift_prior(expected_lift_pct=expected_lift_pct, skepticism=skepticism)
+    
+        st.caption(
+            f"A **{skepticism}** prior is applied with an expected lift of **{expected_lift_pct:+.1f}%**. "
+            f"At your typical sample sizes, this will only meaningfully affect results when the data is ambiguous."
+        )
     else:
-        alpha_prior, beta_prior = 1.0, 1.0
+        beta_prior = get_beta_priors()
+        lift_prior = get_lift_prior(expected_lift_pct=0.0, skepticism="uninformative")
 
     return (
         st.session_state.visitor_counts,
         st.session_state.conversion_counts,
         st.session_state.aovs,
-        alpha_prior, beta_prior,
+        st.session_state.aov_cv,
+        beta_prior,
+        lift_prior,
         st.session_state.probability_winner,
         st.session_state.runtime_days
     )
@@ -348,7 +379,11 @@ def get_frequentist_inputs():
         st.session_state.test_duration
         )
 
-def validate_inputs(visitors, conversions, aovs=None):
+def validate_inputs(
+    visitors, 
+    conversions, 
+    aovs=None
+) -> bool:
     
     visitors_list = visitors if isinstance(visitors, list) else [visitors]
     conversions_list = conversions if isinstance(conversions, list) else [conversions]
@@ -383,84 +418,135 @@ def validate_inputs(visitors, conversions, aovs=None):
 
 # -- Bayesian helper functions --
 
-def calculate_probabilities(visitor_counts, conversion_counts, alpha_prior=1.0, beta_prior=1.0, num_samples=10000, seed=42):
-    # np.random.seed(seed) -- older method
-    np.random.default_rng(seed=seed) # modern method
-    
+def calculate_probabilities(
+    visitor_counts,
+    conversion_counts,
+    beta_prior: BetaPrior,
+    lift_prior: LiftPrior,
+    num_samples: int = 10000,
+    seed: int = 42,
+) -> Tuple[np.ndarray, List[List[float]]]:
+    rng = np.random.default_rng(seed=seed)
+
     num_variants = len(visitor_counts)
-    
+
     all_samples = []
     for i in range(num_variants):
-        alpha_post = alpha_prior + conversion_counts[i]
-        beta_post = beta_prior + (visitor_counts[i] - conversion_counts[i])
-        
-        samples = beta.rvs(alpha_post, beta_post, size=num_samples)
+        alpha_post = beta_prior.alpha + conversion_counts[i]
+        beta_post = beta_prior.beta  + (visitor_counts[i] - conversion_counts[i])
+        samples = rng.beta(alpha_post, beta_post, size=num_samples)
         all_samples.append(samples)
-        
-    samples_matrix = np.array(all_samples)
+
+    samples_matrix = np.array(all_samples)  # shape: (num_variants, num_samples)
+
+    # Apply lift prior weights relative to control for each challenger,
+    # then average across challengers to get a single weight per sample
+    control_samples = samples_matrix[0]
+    if num_variants > 1:
+        per_challenger_weights = np.array([
+            compute_lift_weights(control_samples, samples_matrix[i], lift_prior)
+            for i in range(1, num_variants)
+        ])
+        weights = per_challenger_weights.mean(axis=0)
+        weights /= weights.sum()
+    else:
+        weights = np.ones(num_samples) / num_samples
 
     best_variant_indices = np.argmax(samples_matrix, axis=0)
-    
-    probabilities_to_be_best = []
-    for i in range(num_variants):
-        prob = (best_variant_indices == i).mean()
-        probabilities_to_be_best.append(prob)
-        
+
+    probabilities_to_be_best = [
+        np.average(best_variant_indices == i, weights=weights)
+        for i in range(num_variants)
+    ]
+
     return probabilities_to_be_best, samples_matrix
 
-def get_beta_priors(expected_conversion_rate: float, belief_strength: str, expected_sample_size: int):
-    expected_conversion_rate = expected_conversion_rate / 100
-    if belief_strength not in ['weak', 'moderate', 'strong']:
-        raise ValueError("belief_strength must be 'weak', 'moderate', or 'strong'")
+@dataclass(frozen=True)
+class BetaPrior:
+    alpha: float
+    beta: float
+    
+@dataclass(frozen=True)
+class LiftPrior:
+    mean_log_lift: float
+    std_log_lift: float
 
-    if not (0 <= expected_conversion_rate <= 1):
-        raise ValueError("expected_conversion_rate must be between 0 and 1.")
+_LIFT_PRIOR_STD: dict[str, float] = {
+    "skeptical": 0.10,
+    "moderate": 0.25,
+    "uninformative": 1.00,
+}
 
-    if expected_sample_size <= 0:
-        raise ValueError("expected_sample_size must be a positive integer.")
+def get_beta_priors() -> BetaPrior:
+    """
+    Returns a fixed uninformative prior. At your sample sizes the data
+    dominates regardless; beliefs about lift are expressed via get_lift_prior.
+    """
+    return BetaPrior(alpha=1.0, beta=1.0)
 
-    # Base prior strength adjustment based on sample size.
-    # The larger the sample size, the weaker the prior should be.
-    sample_size_factor = 1 / (1 + math.log(expected_sample_size)) if expected_sample_size > 1 else 1.0
+def get_lift_prior(
+    expected_lift_pct: float,
+    skepticism: Literal["skeptical", "moderate", "uninformative"],
+) -> LiftPrior:
+    if skepticism not in _LIFT_PRIOR_STD:
+        raise ValueError(
+            f"skepticism must be one of {list(_LIFT_PRIOR_STD)}, got {skepticism!r}."
+        )
+    if expected_lift_pct <= -100:
+        raise ValueError("expected_lift_pct must be greater than -100.")
 
-    prior_strengths = {
-        'weak': 10 * sample_size_factor,
-        'moderate': 100 * sample_size_factor,
-        'strong': 1000 * sample_size_factor,
-    }
+    return LiftPrior(
+        mean_log_lift=np.log1p(expected_lift_pct / 100.0),
+        std_log_lift=_LIFT_PRIOR_STD[skepticism],
+    )
 
-    k = prior_strengths[belief_strength]
+def compute_lift_weights(
+    cr_samples_control: np.ndarray,
+    cr_samples_challenger: np.ndarray,
+    prior: LiftPrior,
+) -> np.ndarray:
+    log_lift = np.log(cr_samples_challenger) - np.log(cr_samples_control)
+    log_w = norm.logpdf(log_lift, prior.mean_log_lift, prior.std_log_lift)
+    w = np.exp(log_w - log_w.max())
+    return w / w.sum()
 
-    alpha_prior = expected_conversion_rate * k
-    beta_prior = (1 - expected_conversion_rate) * k
-
-    return alpha_prior, beta_prior
-
-def simulate_uplift_distributions(visitor_counts, conversion_counts, alpha_prior=1.0, beta_prior=1.0, num_samples=20000, seed=42):
-    np.random.seed(seed)
+def simulate_uplift_distributions(
+    visitor_counts, 
+    conversion_counts, 
+    beta_prior: BetaPrior,
+    lift_prior: LiftPrior,
+    num_samples: int = 20000, 
+    seed: int = 42
+) -> List[np.ndarray]:
+    
+    rng = np.random.default_rng(seed=seed)
     num_variants = len(visitor_counts)
 
     all_samples = []
     for i in range(num_variants):
-        alpha_post = alpha_prior + conversion_counts[i]
-        beta_post = beta_prior + (visitor_counts[i] - conversion_counts[i])
-        samples = beta.rvs(alpha_post, beta_post, size=num_samples)
-        all_samples.append(samples)
-    
-    samples_matrix = np.array(all_samples)
-    samples_control = samples_matrix[0]
-    
+        alpha_post = beta_prior.alpha + conversion_counts[i]
+        beta_post  = beta_prior.beta  + (visitor_counts[i] - conversion_counts[i])
+        all_samples.append(rng.beta(alpha_post, beta_post, size=num_samples))
+
+    samples_matrix  = np.array(all_samples)
+    control_samples = samples_matrix[0]
+
     uplift_distributions = []
     for i in range(1, num_variants):
-        samples_challenger = samples_matrix[i]
+        challenger_samples = samples_matrix[i]
+        weights = compute_lift_weights(control_samples, challenger_samples, lift_prior)
+        uplift = (challenger_samples - control_samples) / (control_samples + 1e-9)
 
-        uplift_distribution = (samples_challenger - samples_control) / (samples_control + 1e-9)
-        
-        uplift_distributions.append(uplift_distribution)
-        
+        # Resample using importance weights so the returned distribution already reflects the prior
+        resampled_indices = rng.choice(num_samples, size=num_samples, p=weights)
+        uplift_distributions.append(uplift[resampled_indices])
+
     return uplift_distributions
-
-def plot_uplift_histograms(uplift_distributions, observed_uplifts):
+    
+def plot_uplift_histograms(
+    uplift_distributions, 
+    observed_uplifts
+):
     num_challengers = len(uplift_distributions)
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -504,14 +590,14 @@ def plot_uplift_histograms(uplift_distributions, observed_uplifts):
         range_min, range_max = mean_diff - 3.5 * std_diff, mean_diff + 3.5 * std_diff
         ax.set_xlim(range_min, range_max)
 
-        # 2. FIXED TICK FORMATTING
+        # 2. TICK FORMATTING
         # We avoid the complex 'renderer' logic which causes VSCode errors
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f'{x:.2f}%'))
         plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
 
         line_label = f'Observed Uplift ({challenger_label} vs {control_label}): {observed_uplift:.2f}%'
         
-        # 3. FIXED AXVLINE (ensure x is a single float)
+        # 3. AXVLINE (ensure x is a single float)
         line_observed_uplift = ax.axvline(x=observed_uplift, color='red', linestyle='--', linewidth=2, label=line_label)
         
         patch_a = mpatches.Patch(color='lightcoral', label=f'{control_label} is better')
@@ -523,7 +609,6 @@ def plot_uplift_histograms(uplift_distributions, observed_uplifts):
         ax.legend(handles=[line_observed_uplift, patch_a, patch_b])
         ax.grid(True, linestyle='--', alpha=0.6)
 
-    # Use a tuple for rect to satisfy the type checker
     fig.tight_layout(pad=3.0, rect=(0, 0, 1, 1)) 
     st.pyplot(fig)
     plt.close(fig)
@@ -565,70 +650,102 @@ def plot_winner_probabilities_chart(probabilities_to_be_best):
     st.pyplot(fig)
     plt.close(fig)
 
+def sample_aov(
+    mean_aov: float, 
+    cv: float, 
+    n_samples: int, 
+    rng: np.random.Generator
+) -> np.ndarray:
+    """
+    Draw AOV samples from a log-normal distribution with the given mean
+    and coefficient of variation (CV = std / mean).
+
+    The parameterisation preserves E[AOV] = mean_aov exactly, so predictions
+    are not inflated or deflated — only variance is added.
+
+    Typical CV for e-commerce AOV: 0.5 (stable catalogue) to 1.5 (wide price range).
+    """
+    sigma2 = np.log1p(cv ** 2)
+    mu     = np.log(mean_aov) - sigma2 / 2
+    return rng.lognormal(mean=mu, sigma=np.sqrt(sigma2), size=n_samples)
+    
 def perform_multi_variant_risk_assessment(
     visitor_counts, 
     conversion_counts, 
-    aovs,
+    aovs, 
     probabilities_to_be_best,
-    runtime_days,
-    alpha_prior=1.0, 
-    beta_prior=1.0, 
-    projection_period=183, 
-    seed=42
-):
+    runtime_days, 
+    beta_prior: BetaPrior, 
+    lift_prior: LiftPrior,
+    aov_cv: float = 0.5, 
+    projection_period: int = 183, 
+    seed: int = 42,
+) -> DataFrame:
 
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
     num_variants = len(visitor_counts)
     if runtime_days == 0:
         return pd.DataFrame()
 
     n_simulations = 20000
+    cr_samples = []
     all_daily_conversion_samples = []
+
     for i in range(num_variants):
-        alpha_post = alpha_prior + conversion_counts[i]
-        beta_post = beta_prior + (visitor_counts[i] - conversion_counts[i])
-        
-        samples_cr = beta.rvs(alpha_post, beta_post, size=n_simulations)
-        
-        daily_samples = (samples_cr * visitor_counts[i]) / runtime_days
-        all_daily_conversion_samples.append(daily_samples)
+        alpha_post = beta_prior.alpha + conversion_counts[i]
+        beta_post  = beta_prior.beta  + (visitor_counts[i] - conversion_counts[i])
+        samples_cr = rng.beta(alpha_post, beta_post, size=n_simulations)
+        cr_samples.append(samples_cr)
+        all_daily_conversion_samples.append((samples_cr * visitor_counts[i]) / runtime_days)
 
     control_samples = all_daily_conversion_samples[0]
-    control_aov = aovs[0]
-    
+    control_cr = cr_samples[0]  # was undefined
+
     results = []
     for i in range(1, num_variants):
         challenger_samples = all_daily_conversion_samples[i]
-        challenger_aov = aovs[i]
+        challenger_cr = cr_samples[i]
+
+        weights = compute_lift_weights(control_cr, challenger_cr, lift_prior)
+
+        sampled_control_aov = sample_aov(aovs[0], aov_cv, n_simulations, rng)
+        sampled_challenger_aov = sample_aov(aovs[i], aov_cv, n_simulations, rng)
+
         difference_samples = challenger_samples - control_samples
-        
-        # --- Calculate potential additional revenue (Uplift) ---
-        positive_diffs = difference_samples[difference_samples > 0]
-        expected_daily_gain = np.mean(positive_diffs) if len(positive_diffs) > 0 else 0
-        prob_challenger_is_better = (difference_samples > 0).mean()
-        prob_control_is_better = (difference_samples < 0).mean()
-        expected_monetary_uplift = expected_daily_gain * challenger_aov * projection_period * prob_challenger_is_better
-        
-        negative_diffs = difference_samples[difference_samples < 0]
-        expected_daily_loss = np.mean(negative_diffs) if len(negative_diffs) > 0 else 0 # Negative number
-        # expected_monetary_risk = expected_daily_loss * control_aov * projection_period # * prob_control_is_better is included in the mean
-        expected_monetary_risk = expected_daily_loss * control_aov * projection_period * prob_control_is_better
+        positive_mask = difference_samples > 0
+        negative_mask = difference_samples < 0
+
+        prob_challenger_is_better = np.average(positive_mask, weights=weights)
+        prob_control_is_better = np.average(negative_mask, weights=weights)
+
+        expected_daily_gain = (
+            np.average(difference_samples * sampled_challenger_aov, weights=weights * positive_mask)
+            if positive_mask.any() else 0
+        )
+        expected_daily_loss = (
+            np.average(difference_samples * sampled_control_aov, weights=weights * negative_mask)
+            if negative_mask.any() else 0
+        )
+
+        expected_monetary_uplift = expected_daily_gain * projection_period * prob_challenger_is_better
+        expected_monetary_risk = expected_daily_loss * projection_period * prob_control_is_better
         total_contribution = expected_monetary_uplift + expected_monetary_risk
 
         results.append({
             "Variant": string.ascii_uppercase[i],
-            "Chance to Beat Control": round((prob_challenger_is_better * 100), 2),
-            "Chance to be Best Overall": round((probabilities_to_be_best[i] * 100), 2),
+            "Chance to Beat Control": round(prob_challenger_is_better * 100, 2),
+            "Chance to be Best Overall": round(probabilities_to_be_best[i] * 100, 2),
             "Expected Monetary Uplift": round(expected_monetary_uplift, 2),
             "Expected Monetary Risk": round(expected_monetary_risk, 2),
-            "Expected Total Contribution": round(total_contribution, 2)
+            "Expected Total Contribution": round(total_contribution, 2),
         })
 
     if not results:
-        return pd.DataFrame(columns=["Variant", "Chance to Beat Control", "Chance to be Best Overall", "Expected Monetary Uplift", "Expected Monetary Risk", "Expected Total Contribution"])
-
-    df = pd.DataFrame(results)
-    return df
+        return pd.DataFrame(columns=[
+            "Variant", "Chance to Beat Control", "Chance to be Best Overall",
+            "Expected Monetary Uplift", "Expected Monetary Risk", "Expected Total Contribution"
+        ])
+    return pd.DataFrame(results)
 
 def display_results_per_variant(
     probabilities_to_be_best, 
@@ -676,10 +793,12 @@ def display_results_per_variant(
         if df is not None:
             st.write("#### Business Risk Assessment")
             st.write("""
-                     The table below shows the potential contribution to the revenue over a period of 6 months, with the AOVs as constants.
-                     Please note: on smaller data sets of < 1000 conversions, the simulation might find more extreme values for a variant.
-                     This could lead to inflated contributions; interpret with care. This table is purely a measurement for potential impact - no guarantee!
-                     """)
+                The table below shows the potential contribution to revenue over 6 months.
+                AOV is modelled as a log-normal variable around your input values, adding
+                realistic spread without inflating or deflating the point estimates.
+                On smaller datasets of < 1000 conversions, interpret with care.
+                This table is purely a measurement of potential impact - no guarantee!
+            """)
             st.write("")
             st.dataframe(df)
     else:
@@ -688,7 +807,11 @@ def display_results_per_variant(
 
 
 # -- Frequentist helper functions --
-def calculate_cuped_reduction_factor(df, period_1_col, period_2_col):
+def calculate_cuped_reduction_factor(
+    df, 
+    period_1_col, 
+    period_2_col
+) -> Tuple[float, float]:
     """
     Calculates the reduction factor based on historical user consistency.
     period_1_col: e.g., 'purchases_jan'
@@ -707,7 +830,7 @@ def calculate_cuped_reduction_factor(df, period_1_col, period_2_col):
         return 1.0, 0.0
 
 # Simple visual representation of a cuped template
-def get_cuped_template():
+def get_cuped_template() -> str:
     # Create a simple dummy dataframe
     template_df = pd.DataFrame({
         "user_id": ["user_1", "user_2", "user_3", "user_4"],
@@ -720,7 +843,10 @@ def get_cuped_template():
     template_df.to_csv(buffer, index=False)
     return buffer.getvalue()
 
-def calculate_time_savings(reduction_factor, days_running):
+def calculate_time_savings(
+    reduction_factor, 
+    days_running
+) -> float:
     """
     Estimates how much longer the test would have needed to run
     to achieve the same precision without CUPED.
@@ -735,7 +861,10 @@ def calculate_time_savings(reduction_factor, days_running):
     
     return round(days_saved, 1)
 
-def plot_cuped_comparison(results, visitor_counts):
+def plot_cuped_comparison(
+    results, 
+    visitor_counts
+) -> Figure:
     fig = go.Figure()
     
     # Generate a range of x-values (conversion rates) for the plot
@@ -780,20 +909,7 @@ def plot_cuped_comparison(results, visitor_counts):
     
     return fig
 
-#def check_cuped_validity(df, col1, col2):
-#    total_users = len(df)
-    # Count users who converted in at least one period
-#    active_converters = df[(df[col1] > 0) | (df[col2] > 0)]
-    
-#    if total_users < 100:
-#        return False, "Sample size too small (<100 users) for reliable correlation."
-    
-#    if len(active_converters) / total_users < 0.01:
-#        return False, "Very low conversion overlap. CUPED might provide noisy results."
-    
-#    return True, "Data quality looks good."
-
-def check_cuped_validity(df, col1, col2):
+def check_cuped_validity(df, col1, col2) -> Tuple[bool, str, int]:
     # Drop rows where either period is missing to find the 'Returning User' count
     overlap_df = df.dropna(subset=[col1, col2])
     overlap_count = len(overlap_df)
@@ -808,7 +924,11 @@ def check_cuped_validity(df, col1, col2):
         
     return True, "Data quality looks good.", overlap_count
     
-def display_ci_chart(results, current_variant_idx, alphabet):
+def display_ci_chart(
+    results, 
+    current_variant_idx, 
+    alphabet
+) -> Figure:
     # Prepare data for Control (0) and the current Variant (i)
     indices = [0, current_variant_idx]
     names = [f"({alphabet[0]}) Control", f"({alphabet[current_variant_idx]}) Challenger"]
@@ -840,7 +960,13 @@ def display_ci_chart(results, current_variant_idx, alphabet):
     chart = (error_bars + points).properties(width='container', height=150)
     return chart
 
-def calculate_frequentist_statistics(visitor_counts, conversion_counts, confidence_level, tail, reduction_factor=1.0):
+def calculate_frequentist_statistics(
+    visitor_counts, 
+    conversion_counts, 
+    confidence_level, 
+    tail, 
+    reduction_factor=1.0
+) -> Dict[str, Any]:
     # --- Input Validation & Setup ---
     if sum(visitor_counts) == 0 or any(v < 0 for v in visitor_counts):
         raise ValueError("Visitor counts must be positive and sum to a non-zero value.")
@@ -1280,8 +1406,9 @@ def run():
             visitor_counts, 
             conversion_counts, 
             aovs, 
-            alpha_prior, 
-            beta_prior,
+            aov_cv,
+            beta_prior, 
+            lift_prior, 
             probability_winner, 
             runtime_days
         ) = get_bayesian_inputs()
@@ -1292,6 +1419,7 @@ def run():
                 st.write("---")
                 try:
                     # --- Calculations ---
+
                     cr_control = conversion_counts[0] / visitor_counts[0] if visitor_counts[0] > 0 else 0
                     observed_uplifts = [
                         ((conversion_counts[i] / visitor_counts[i]) - cr_control) / cr_control if cr_control > 0 and visitor_counts[i] > 0 else 0.0
@@ -1299,15 +1427,26 @@ def run():
                     ]
 
                     probabilities_to_be_best, _ = calculate_probabilities(
-                        visitor_counts, conversion_counts, alpha_prior, beta_prior
+                        visitor_counts, 
+                        conversion_counts, 
+                        beta_prior=beta_prior,
+                        lift_prior=lift_prior,
                     )
                     uplift_distributions = simulate_uplift_distributions(
-                        visitor_counts, conversion_counts, alpha_prior, beta_prior
+                        visitor_counts, 
+                        conversion_counts, 
+                        beta_prior=beta_prior,
+                        lift_prior=lift_prior
                     )
                     df_business = perform_multi_variant_risk_assessment(
-                        visitor_counts, conversion_counts, aovs,
-                        probabilities_to_be_best, runtime_days,
-                        alpha_prior, beta_prior
+                        visitor_counts, 
+                        conversion_counts, 
+                        aovs,
+                        probabilities_to_be_best, 
+                        runtime_days,
+                        beta_prior=beta_prior, 
+                        lift_prior=lift_prior,
+                        aov_cv=aov_cv
                     )
 
                     # --- Visualizations and Results ---
