@@ -200,30 +200,31 @@ def run_gamma_posthoc(df, kpi, group_col, control_label):
         # Filter data for pairwise comparison
         pair_df = df[df[group_col].isin([control_label, variant])]
         
-        # 1. Fit Null Model (Single mean for both)
-        # Using simple MLE for Gamma means
-        null_mean = pair_df[kpi].mean()
-        null_log_lik = np.sum(stats.gamma.logpdf(pair_df[kpi], a=1, scale=null_mean)) 
+        # 1. Fit Null Model (Single Gamma for both groups combined)
+        k_null, theta_null, null_log_lik = fit_gamma(pair_df[kpi].values)
         
-        # 2. Fit Alternative Model (Separate means)
-        ctrl_data = pair_df[pair_df[group_col] == control_label][kpi]
-        var_data = pair_df[pair_df[group_col] == variant][kpi]
+        # 2. Fit Alternative Model (Separate Gammas for control and variant)
+        ctrl_data = pair_df[pair_df[group_col] == control_label][kpi].values
+        var_data = pair_df[pair_df[group_col] == variant][kpi].values
         
-        alt_log_lik = (np.sum(stats.gamma.logpdf(ctrl_data, a=1, scale=ctrl_data.mean())) + 
-                       np.sum(stats.gamma.logpdf(var_data, a=1, scale=var_data.mean())))
+        k_ctrl, theta_ctrl, ll_ctrl = fit_gamma(ctrl_data)
+        k_var, theta_var, ll_var = fit_gamma(var_data)
+        
+        alt_log_lik = ll_ctrl + ll_var
         
         # 3. Likelihood Ratio Test
+        # df=2 because Alt Model has 4 parameters and Null Model has 2 parameters.
         lrt_stat = 2 * (alt_log_lik - null_log_lik)
-        p_val = stats.chi2.sf(lrt_stat, df=1)
+        p_val = stats.chi2.sf(lrt_stat, df=2) 
         
         # 4. Adjusted P-Value
         adj_p = min(p_val * num_comparisons, 1.0)
         
         posthoc_data.append({
             "Comparison": f"{variant} vs {control_label}",
-            "LRT Stat": round(lrt_stat, 4),
-            "p-value": round(p_val, 4),
-            "p-adj (Bonferroni)": round(adj_p, 4),
+            "LRT Stat": np.round(lrt_stat, 4),
+            "p-value": np.round(p_val, 4),
+            "p-adj (Bonferroni)": np.round(adj_p, 4),
             "Significant": "✅" if adj_p < 0.05 else "❌"
         })
     
@@ -239,11 +240,12 @@ def detect_outliers(df, kpi, outlier_stdev, large_file_threshold=10000):
             for variant in df['experience_variant_label'].unique():
                 variant_data = df[df['experience_variant_label'] == variant][kpi].dropna()
                 if not variant_data.empty:
-                    Q1 = variant_data.quantile(0.25)
-                    Q3 = variant_data.quantile(0.75)
-                    IQR = Q3 - Q1
-                    lower_bound = Q1 - outlier_stdev * IQR # or - 1.5 as standard convention
-                    upper_bound = Q3 + outlier_stdev * IQR # or + 1.5 as standard convention
+                    # Calculate actual standard deviations instead of IQR
+                    mean_val = variant_data.mean()
+                    std_val = variant_data.std()
+                    lower_bound = mean_val - (outlier_stdev * std_val)
+                    upper_bound = mean_val + (outlier_stdev * std_val)
+                    
                     variant_outliers = (variant_data < lower_bound) | (variant_data > upper_bound)
                     outliers_mask[variant_data.index] = variant_outliers
             return outliers_mask, None, large_file_threshold
@@ -267,7 +269,7 @@ def detect_outliers(df, kpi, outlier_stdev, large_file_threshold=10000):
 
     except Exception as e:
         st.error(f"Error during outlier detection: {e}")
-        return pd.Series([False] * len(df)), None
+        return pd.Series([False] * len(df)), None, large_file_threshold
 
 # Winsorize and IQR filter combined
 
@@ -606,6 +608,12 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
 
     st.write("---")
 
+@st.cache_data
+def load_and_preprocess_cached(file_contents):
+    df = pd.read_csv(file_contents)
+    df, errors = preprocess_data(df)
+    return df, errors
+
 # Main Streamlit app
 def run():
     st.title("Continuous Metric Analysis")
@@ -632,8 +640,9 @@ def run():
 
     uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
     if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        df, errors = preprocess_data(df)
+        # Pass the uploaded file to the cached function
+        df, errors = load_and_preprocess_cached(uploaded_file)
+        
         if errors:
             for error in errors:
                 st.error(error)
@@ -737,12 +746,11 @@ def run():
                 st.warning(r"""
                     **Important: Log Transformation Detected**
                     
-                    By selecting Log Normalization, the statistical tests will be performed on the 
-                    **log-scaled values**. 
+                    By selecting Log Transformation, the statistical tests will be performed on the 
+                    **log-scaled values** (using log1p). 
                     
                     * **Interpretation:** You are now evaluating **proportional (rate-based) changes** rather than absolute differences. 
-                    * **Requirement:** Ensure your KPI contains only **strictly positive values (> 0)**, 
-                        as $log(0)$ or $log(negative)$ is undefined.
+                    * **Requirement:** Ensure your KPI does not contain negative values. Zeros are safely handled.
                     * **Back-transformation:** The reported means will represent the **Geometric Mean** of your data, which is less sensitive to extreme right-skewed outliers.
                 """)
             elif outlier_handling == 'Removal':
@@ -767,41 +775,42 @@ def run():
             ax_box.set_ylim(processed_min, processed_max)
             st.pyplot(fig_box)
             plt.clf()
+            
+            if analysis_approach != "Gamma GLM (Best for Revenue/Items)":
+                st.write("### Refitted QQ Plot")
+                influence = model_after.get_influence()
+                std_residuals = pd.Series(influence.resid_studentized_internal)
+                plot_data = std_residuals
+                caption_text = ""
 
-            st.write("### Refitted QQ Plot")
-            influence = model_after.get_influence()
-            std_residuals = pd.Series(influence.resid_studentized_internal)
-            plot_data = std_residuals
-            caption_text = ""
+                if len(std_residuals) > 5000:
+                    plot_data = std_residuals.sample(5000, random_state=42)  # Sample to avoid performance issues
+                    caption_text = f"Note: Due to a large dataset, only a 5000 points (out of {len(std_residuals):,}) are plotted for efficiency."
 
-            if len(std_residuals) > 5000:
-                plot_data = std_residuals.sample(5000, random_state=42)  # Sample to avoid performance issues
-                caption_text = f"Note: Due to a large dataset, only a 5000 points (out of {len(std_residuals):,}) are plotted for efficiency."
+                fig_qq = plt.figure()
+                ax_qq = fig_qq.add_subplot(111)
 
-            fig_qq = plt.figure()
-            ax_qq = fig_qq.add_subplot(111)
+                sm.qqplot(plot_data, line='45', ax=ax_qq, alpha=0.2, markersize=4, marker='o')
+                plt.title("QQ Plot of Standardized Residuals")
+                plt.ylabel("Standardized Residuals (Z-Score)")
+                plt.xlabel("Theoretical Quantiles")
 
-            sm.qqplot(plot_data, line='45', ax=ax_qq, alpha=0.2, markersize=4, marker='o')
-            plt.title("QQ Plot of Standardized Residuals")
-            plt.ylabel("Standardized Residuals (Z-Score)")
-            plt.xlabel("Theoretical Quantiles")
+                st.pyplot(fig_qq)
+                if caption_text:
+                    st.caption(caption_text)
 
-            st.pyplot(fig_qq)
-            if caption_text:
-                st.caption(caption_text)
+                plt.clf()
 
-            plt.clf()
-
-            st.write("### Refitted Data Histogram with KDE")
-            resid_std = model_after.resid.std()
-            resid_min = -3.5 * resid_std
-            resid_max = 3.5 * resid_std
-            fig_hist, ax_hist = plt.subplots()
-            sns.histplot(model_after.resid, kde=True, bins=30, ax=ax_hist) # Use residuals from the new model
-            ax_hist.set_xlim(resid_min, resid_max)
-            plt.title("Histogram of Residuals with KDE")
-            st.pyplot(fig_hist)
-            plt.clf()
+                st.write("### Refitted Data Histogram with KDE")
+                resid_std = model_after.resid.std()
+                resid_min = -3.5 * resid_std
+                resid_max = 3.5 * resid_std
+                fig_hist, ax_hist = plt.subplots()
+                sns.histplot(model_after.resid, kde=True, bins=30, ax=ax_hist) # Use residuals from the new model
+                ax_hist.set_xlim(resid_min, resid_max)
+                plt.title("Histogram of Residuals with KDE")
+                st.pyplot(fig_hist)
+                plt.clf()
 
             perform_stat_tests_and_conclusions(processed_df, kpi, model_after, analysis_approach)
             

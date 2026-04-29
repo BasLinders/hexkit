@@ -14,10 +14,11 @@ import matplotlib.colors as mcolors
 from matplotlib import colormaps
 from matplotlib.figure import Figure
 import plotly.graph_objects as go
+import plotly.graph_objects as go
 from scipy.stats import beta, norm, chisquare
 import math
 from dataclasses import dataclass
-from typing import Literal, List, Tuple, Dict
+from typing import Literal, List, Tuple, Dict, Any, cast
 
 
 st.set_page_config(
@@ -30,8 +31,8 @@ def initialize_session_state():
     num_variants = st.session_state.num_variants
     st.session_state.setdefault("visitor_counts", [0] * num_variants)
     st.session_state.setdefault("conversion_counts", [0] * num_variants)
-    st.session_state.setdefault("aovs", [None] * num_variants),
-    st.session_state.setdefault("aov_cv", 0.5),
+    st.session_state.setdefault("aovs", [None] * num_variants)
+    st.session_state.setdefault("aov_cv", 0.5)
     st.session_state.setdefault("confidence_level", 95)
     st.session_state.setdefault("test_duration", 7)
     st.session_state.setdefault("tail", 'Greater')
@@ -93,7 +94,7 @@ def display_dynamic_documentation(analysis_method):
             """)
 
         with st.expander("Bayesian: Interpretation"):
-            st.markdown("""
+            st.markdown(r"""
             * **Chance to Beat Control:** The probability that the Variant is superior to the Control. A value $>95\%$ is a strong winner.
             * **Expected Total Contribution:** The net expected monetary gain over 6 months. This accounts for both the upside and the downside risk.
             * **Probability Density Graph:** Visualizes the uncertainty. Thinner, taller peaks indicate higher certainty in the conversion rate.
@@ -200,7 +201,7 @@ def get_bayesian_inputs():
                 help="Your best guess at the relative lift before seeing results. Use 0 if you have no directional expectation."
             )
         with col2:
-            skepticism = st.selectbox(
+            raw_skepticism = st.selectbox(
                 "Skepticism",
                 ["skeptical", "moderate", "uninformative"],
                 index=0,
@@ -208,10 +209,12 @@ def get_bayesian_inputs():
             )
     
         beta_prior = get_beta_priors()
-        lift_prior = get_lift_prior(expected_lift_pct=expected_lift_pct, skepticism=skepticism)
+
+        valid_scepticism = cast(Literal["skeptical", "moderate", "uninformative"], raw_skepticism)
+        lift_prior = get_lift_prior(expected_lift_pct=expected_lift_pct, skepticism=valid_scepticism)
     
         st.caption(
-            f"A **{skepticism}** prior is applied with an expected lift of **{expected_lift_pct:+.1f}%**. "
+            f"A **{valid_scepticism}** prior is applied with an expected lift of **{expected_lift_pct:+.1f}%**. "
             f"At your typical sample sizes, this will only meaningfully affect results when the data is ambiguous."
         )
     else:
@@ -418,6 +421,22 @@ def validate_inputs(
 
 # -- Bayesian helper functions --
 
+@dataclass(frozen=True)
+class BetaPrior:
+    alpha: float
+    beta: float
+    
+@dataclass(frozen=True)
+class LiftPrior:
+    mean_log_lift: float
+    std_log_lift: float
+
+_LIFT_PRIOR_STD: dict[str, float] = {
+    "skeptical": 0.10,
+    "moderate": 0.25,
+    "uninformative": 1.00,
+}
+
 def calculate_probabilities(
     visitor_counts,
     conversion_counts,
@@ -425,7 +444,7 @@ def calculate_probabilities(
     lift_prior: LiftPrior,
     num_samples: int = 10000,
     seed: int = 42,
-) -> Tuple[np.ndarray, List[List[float]]]:
+) -> Tuple[List[float], np.ndarray]:
     rng = np.random.default_rng(seed=seed)
 
     num_variants = len(visitor_counts)
@@ -460,22 +479,6 @@ def calculate_probabilities(
     ]
 
     return probabilities_to_be_best, samples_matrix
-
-@dataclass(frozen=True)
-class BetaPrior:
-    alpha: float
-    beta: float
-    
-@dataclass(frozen=True)
-class LiftPrior:
-    mean_log_lift: float
-    std_log_lift: float
-
-_LIFT_PRIOR_STD: dict[str, float] = {
-    "skeptical": 0.10,
-    "moderate": 0.25,
-    "uninformative": 1.00,
-}
 
 def get_beta_priors() -> BetaPrior:
     """
@@ -680,7 +683,7 @@ def perform_multi_variant_risk_assessment(
     aov_cv: float = 0.5, 
     projection_period: int = 183, 
     seed: int = 42,
-) -> DataFrame:
+) -> pd.DataFrame:
 
     rng = np.random.default_rng(seed)
     num_variants = len(visitor_counts)
@@ -864,7 +867,7 @@ def calculate_time_savings(
 def plot_cuped_comparison(
     results, 
     visitor_counts
-) -> Figure:
+) -> go.Figure:
     fig = go.Figure()
     
     # Generate a range of x-values (conversion rates) for the plot
@@ -928,7 +931,7 @@ def display_ci_chart(
     results, 
     current_variant_idx, 
     alphabet
-) -> Figure:
+) -> alt.LayerChart:
     # Prepare data for Control (0) and the current Variant (i)
     indices = [0, current_variant_idx]
     names = [f"({alphabet[0]}) Control", f"({alphabet[current_variant_idx]}) Challenger"]
