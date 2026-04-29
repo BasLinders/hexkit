@@ -14,7 +14,6 @@ import matplotlib.colors as mcolors
 from matplotlib import colormaps
 from matplotlib.figure import Figure
 import plotly.graph_objects as go
-import plotly.graph_objects as go
 from scipy.stats import beta, norm, chisquare
 import math
 from dataclasses import dataclass
