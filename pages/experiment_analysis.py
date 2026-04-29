@@ -799,7 +799,6 @@ def display_results_per_variant(
                 AOV is modelled as a log-normal variable around your input values, adding
                 realistic spread without inflating or deflating the point estimates.
                 On smaller datasets of < 1000 conversions, interpret with care.
-                This table is purely a measurement of potential impact - no guarantee!
             """)
             with st.expander("How is the business case calculated?"):
                 st.markdown(r"""
@@ -840,7 +839,7 @@ def display_results_per_variant(
                     - On datasets with fewer than 1,000 conversions, the simulation may surface more extreme values.
                     Treat projections on small samples as directional, not precise.
 
-                    _This table is a measurement of potential impact only; not a guarantee of future revenue.
+                    _This table is a measurement of potential impact only; not a guarantee of future revenue._
                 """)
             st.dataframe(df)
     else:
