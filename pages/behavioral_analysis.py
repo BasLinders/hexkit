@@ -11,7 +11,8 @@ import matplotlib.pyplot as plt
 # -------------------------------------------------------------------------
 st.set_page_config(
     page_title="Behavioral Metric Analysis",
-    page_icon="🔢"
+    page_icon="🔢",
+    layout="wide",
 )
 
 # -------------------------------------------------------------------------
@@ -156,8 +157,12 @@ def perform_welch_test(df, kpi):
     
     # 3. Calculation
     # equal_var=False triggers Welch's t-test
-    t_stat, p_val = stats.ttest_ind(data_b, data_a, equal_var=False)
-    
+    test_result = stats.ttest_ind(data_b, data_a, equal_var=False)
+
+    # 2. Extract exactly what you need via attributes
+    t_stat = test_result.statistic # type: ignore
+    p_val = test_result.pvalue # type: ignore
+
     # Calculate Means & Lift
     mean_a = data_a.mean()
     mean_b = data_b.mean()
@@ -178,7 +183,7 @@ def perform_welch_test(df, kpi):
     st.subheader("2. Statistical Conclusion")
     
     # Interpret P-Value
-    is_sig = p_val < 0.05
+    is_sig = p_val < 0.05 # type: ignore
     
     res_col1, res_col2 = st.columns([1, 2])
     

@@ -9,6 +9,7 @@ from typing import List
 st.set_page_config(
     page_title="Pre-test analysis",
     page_icon="🔢",
+    layout="wide",
 )
 
 # --- USER INPUT ---
@@ -212,20 +213,22 @@ def display_mde_table(
             xaxis=dict(
                 title="Traffic vs. Baseline",
                 side="bottom",
+                type="category",
                 tickfont=dict(size=12),
+                automargin=True,
             ),
             yaxis=dict(
                 title="",
                 tickfont=dict(size=12),
                 autorange="reversed", # Week 1 at top
             ),
-            margin=dict(l=80, r=40, t=40, b=60),
+            margin=dict(l=80, r=60, t=40, b=80),
             height=340,
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
         )
  
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
  
         st.caption(
             "Traffic multipliers apply uniformly across all days in a given week. "
@@ -648,7 +651,7 @@ def run() -> None:
                             )
 
                             # Render
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, width="stretch")
                             
                             # Run Calculation
                             results = perform_mde_calculation_forecast(

@@ -9,6 +9,7 @@ import math
 st.set_page_config(
     page_title="SRM calculator",
     page_icon="🔢",
+    layout="wide",
 )
 
 def calculate_srm(visitor_counts, expected_proportions):
@@ -71,7 +72,7 @@ def render_results(results, visitor_counts, num_variants):
         xOffset='Metric:N' # Creates the "grouped" bar effect
     ).properties(height=400)
 
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
     if results["is_mismatch"]:
         st.error(f"SRM Detected! P-value: {p_value:.4f}")

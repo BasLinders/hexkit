@@ -132,7 +132,7 @@ def plot_simulation_results(simulation_df, n_experiments_max, intersection_exper
 # --- Streamlit App ---
 
 def run():
-    st.set_page_config(page_title="Annual Compound Growth Estimation", page_icon="🔢")
+    st.set_page_config(page_title="Annual Compound Growth Estimation", page_icon="🔢", layout="wide")
 
     # Initialize session state
     st.session_state.setdefault("visitors_base", 0)
@@ -193,7 +193,7 @@ def run():
         variability_level = st.selectbox(
             "Uplift Variability Level",
             options=list(UPLIFT_SCALING_FACTORS.keys()),
-            index=list(UPLIFT_SCALING_FACTORS.keys()).index(st.session_state.get("variability_level")),
+            index=list(UPLIFT_SCALING_FACTORS.keys()).index(st.session_state.get("variability_level", DEFAULT_VARIABILITY)),
             help="""Controls the width of the confidence intervals.
                     Low variability = narrower intervals (more consistent uplift).
                     High variability = wider intervals (more uncertain uplift)."""

@@ -181,7 +181,7 @@ def show_visualization(chart_df, upper_bound, lower_bound):
     chart = (success_zone + futility_zone + upper_line + lower_line + line).properties(height=400).interactive()
 
     st.markdown("### Test Trajectory")
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
 # --- ANALYSIS ---
 
