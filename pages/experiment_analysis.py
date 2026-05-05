@@ -23,6 +23,7 @@ from typing import Literal, List, Tuple, Dict, Any, cast
 st.set_page_config(
     page_title="Experiment Analysis",
     page_icon="🔢",
+    layout="wide",
 )
 
 def initialize_session_state():

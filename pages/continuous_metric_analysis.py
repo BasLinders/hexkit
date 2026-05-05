@@ -17,6 +17,7 @@ import streamlit as st
 st.set_page_config(
     page_title="Continuous metric analysis",
     page_icon="🔢",
+    layout="wide",
 )
 
 # Documentation

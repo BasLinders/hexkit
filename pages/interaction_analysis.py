@@ -12,7 +12,7 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="Interaction Analysis", page_icon="🔢")
+st.set_page_config(page_title="Interaction Analysis", page_icon="🔢", layout="wide")
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ class InteractionEngine:
 
         # 2. Build Exogenous Design Matrix via patsy
         formula_rhs = " * ".join([f"C({col})" for col in test_cols])
-        exog = patsy.dmatrix(f"~ {formula_rhs}", data=df, return_type='dataframe')
+        exog = patsy.dmatrix(f"~ {formula_rhs}", data=df, return_type='dataframe') # type: ignore
 
         try:
             model = sm.GLM(
@@ -263,7 +263,7 @@ def user_input() -> Tuple[pd.DataFrame, List[str]]:
         st.session_state["input_df"],
         key="_data_editor",
         num_rows="fixed",
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     
@@ -321,7 +321,7 @@ def render_model_summary(model) -> Dict[str, str]:
     name_map = dict(zip(raw_index, summary_df.index))
 
     st.write("### Model Summary")
-    st.dataframe(summary_df.astype(float).round(4), use_container_width=True)
+    st.dataframe(summary_df.astype(float).round(4), width="stretch")
 
     # --- Interaction analysis -----------------------------------------------
     p_values = model.pvalues
@@ -430,7 +430,7 @@ def render_interaction_table(model, name_map: Dict[str, str]) -> None:
             }
         )
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 # ---------------------------------------------------------------------------
