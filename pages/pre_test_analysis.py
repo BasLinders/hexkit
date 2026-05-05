@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from prophet import Prophet
+from typing import List
 
 st.set_page_config(
     page_title="Pre-test analysis",
@@ -13,7 +14,7 @@ st.set_page_config(
 # --- USER INPUT ---
 
 # User input for both MDE and sample size calculation
-def get_user_input():
+def get_user_input() -> None:
     st.write("### Baseline Data")
     st.write("Enter weekly visitors, weekly conversions and test parameters.")
 
@@ -42,7 +43,11 @@ def get_user_input():
 # --- HELPER FUNCTIONS ---
 
 # Holm-Bonferroni correction for MDE calculation
-def holm_bonferroni(num_variants, alpha, tails):
+def holm_bonferroni(
+        num_variants: int, 
+        alpha: float, 
+        tails: str
+        ) -> float:
     adjusted_alpha = alpha / np.arange(num_variants, 0, -1)
     if tails == 'Two-sided':
         z_alpha = norm.ppf(1 - adjusted_alpha / 2)
@@ -50,7 +55,19 @@ def holm_bonferroni(num_variants, alpha, tails):
         z_alpha = norm.ppf(1 - adjusted_alpha)
     return np.max(z_alpha)
 
-def perform_mde_calculation(num_variants, baseline_visitors, baseline_conversions, risk, trust, tails):
+def perform_mde_calculation(
+        num_variants: int, 
+        baseline_visitors: int, 
+        baseline_conversions: int, 
+        risk: float, 
+        trust: float, 
+        tails: str, 
+        traffic_multiplier: float=1.0
+        ) -> List[List[float | int]]:
+    """
+    Core MDE calculation. Accepts an optional traffic_multiplier to model
+    spikes or drops in visitor volume (e.g. 0.7 = -30%, 1.3 = +30%).
+    """
 
     alpha = 1 - (risk / 100)
     power = trust / 100
@@ -69,7 +86,7 @@ def perform_mde_calculation(num_variants, baseline_visitors, baseline_conversion
 
     # Weekly increments
     weeks = range(1, 7)  # For 6 weeks
-    weekly_visitors = int(np.ceil(baseline_visitors / num_variants))
+    weekly_visitors = int(np.ceil(baseline_visitors * traffic_multiplier / num_variants))
 
     # Prepare list to store results
     results = []
@@ -86,29 +103,147 @@ def perform_mde_calculation(num_variants, baseline_visitors, baseline_conversion
 
     return results
 
-def display_mde_table(num_variants, baseline_visitors, baseline_conversions, risk, trust, tails):
-    results = perform_mde_calculation(num_variants, baseline_visitors, baseline_conversions, risk, trust, tails)
-    
-    # Display results in a DataFrame
-    df = pd.DataFrame(results, columns=['Week', 'Visitors / Variant', 'Relative MDE (%)'])
-    df['Relative MDE (%)'] = df['Relative MDE (%)'].map(lambda x: f"{x:.2f}%" if pd.notnull(x) else "N/A")
+def _mde_color_scale() -> List[List[float | str]]:
+    """Returns a Plotly colorscale: green → yellow → red mapped to MDE 0–20%+."""
+    return [
+        [0.0,  "rgb(56, 161, 105)"], # green (<5%)
+        [0.25, "rgb(154, 205, 90)"], # yellow-green
+        [0.5,  "rgb(236, 201, 75)"], # yellow (~10%)
+        [0.75, "rgb(237, 137, 54)"], # orange
+        [1.0,  "rgb(229, 62, 62)"], # red (>20%)
+    ]
 
-    # Display the DataFrame
+def display_mde_table(
+        num_variants: int, 
+        baseline_visitors: int, 
+        baseline_conversions: int, 
+        risk: float, 
+        trust: float, 
+        tails: str
+        ) -> None:
     st.write("## MDE Calculation Results")
     st.write("""
-        This table displays the minimum effect size detectable each week. An MDE of <5% is usually testworthy; 5-10% is debatable.
+        This table displays the minimum effect size detectable each week. An MDE of <5% is usually testworthy; 5–10% is debatable.
         For larger MDEs, consider whether the effect size can be achieved.
     """)
     if num_variants > 2:
-        st.write("")
-        st.write(f"*Note: The {holm_bonferroni.__name__ if 'holm_bonferroni' in globals() else 'configured multiple comparison correction'} correction was applied ({num_variants - 1} comparisons) affecting the required significance level.*")
-    st.write(df.to_html(index=False), unsafe_allow_html=True)
+        st.write(f"*Note: The Holm-Bonferroni correction was applied ({num_variants - 1} comparisons) affecting the required significance level.*")
+ 
+    tab_standard, tab_sensitivity = st.tabs(["Standard MDE Table", "Sensitivity Matrix"])
+ 
+    # --- Tab 1: Standard table ---
+    with tab_standard:
+        results = perform_mde_calculation(
+            num_variants, baseline_visitors, baseline_conversions, risk, trust, tails
+        )
+        df = pd.DataFrame(results, columns=['Week', 'Visitors / Variant', 'Relative MDE (%)'])
+        df['Relative MDE (%)'] = df['Relative MDE (%)'].map(lambda x: f"{x:.2f}%" if pd.notnull(x) else "N/A")
+        st.write(df.to_html(index=False), unsafe_allow_html=True)
+ 
+    # --- Tab 2: Sensitivity matrix ---
+    with tab_sensitivity:
+        st.write("""
+            **How would traffic spikes or drops affect your MDE?**  
+            Each cell shows the Relative MDE (%) for a given week and traffic scenario.
+            Hover over a cell for exact values. Colors: 🟢 < 5% · 🟡 5–10% · 🔴 > 10%.
+        """)
+ 
+        # Define traffic multiplier scenarios
+        multipliers = [0.50, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.50]
+        scenario_labels = [f"{int((m - 1) * 100):+d}%" if m != 1.00 else "Baseline" for m in multipliers]
+        weeks = list(range(1, 7))
+ 
+        # Build MDE matrix (rows = weeks, cols = scenarios)
+        mde_matrix = []
+        for week_idx, week in enumerate(weeks):
+            row = []
+            for m in multipliers:
+                res = perform_mde_calculation(
+                    num_variants, baseline_visitors, baseline_conversions, risk, trust, tails,
+                    traffic_multiplier=m
+                )
+                mde_val = res[week_idx][2] # relative MDE for this week
+                row.append(round(mde_val, 2))
+            mde_matrix.append(row)
+ 
+        z = np.array(mde_matrix)
+        text_labels = [[f"{v:.1f}%" for v in row] for row in mde_matrix]
+        y_labels = [f"Week {w}" for w in weeks]
+ 
+        # Cap colorscale at 20% so cells above 20% are all deep red
+        z_capped = np.clip(z, 0, 20)
+ 
+        fig = go.Figure(data=go.Heatmap(
+            z=z_capped,
+            x=scenario_labels,
+            y=y_labels,
+            text=text_labels,
+            texttemplate="%{text}",
+            textfont={"size": 13, "color": "white"},
+            colorscale=_mde_color_scale(),
+            zmin=0,
+            zmax=20,
+            showscale=True,
+            colorbar=dict(
+                title="MDE (%)",
+                tickvals=[0, 5, 10, 15, 20],
+                ticktext=["0%", "5%", "10%", "15%", "≥20%"],
+            ),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Traffic scenario: <b>%{x}</b><br>"
+                "Relative MDE: <b>%{text}</b><extra></extra>"
+            ),
+        ))
+ 
+        # Highlight baseline column with a border effect via shape
+        baseline_col_idx = scenario_labels.index("Baseline")
+        fig.add_shape(
+            type="rect",
+            x0=baseline_col_idx - 0.5,
+            x1=baseline_col_idx + 0.5,
+            y0=-0.5,
+            y1=len(weeks) - 0.5,
+            line=dict(color="white", width=2.5),
+            fillcolor="rgba(0,0,0,0)",
+        )
+ 
+        fig.update_layout(
+            xaxis=dict(
+                title="Traffic vs. Baseline",
+                side="bottom",
+                tickfont=dict(size=12),
+            ),
+            yaxis=dict(
+                title="",
+                tickfont=dict(size=12),
+                autorange="reversed", # Week 1 at top
+            ),
+            margin=dict(l=80, r=40, t=40, b=60),
+            height=340,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+ 
+        st.plotly_chart(fig, use_container_width=True)
+ 
+        st.caption(
+            "Traffic multipliers apply uniformly across all days in a given week. "
+            "For week-by-week seasonality modelling, use the **Seasonal (Prophet Forecast)** mode."
+        )
 
-def calculate_sample_size(num_variants, baseline_visitors, baseline_conversions, mde, risk, trust, tails):
+def calculate_sample_size(
+        num_variants: int, 
+        baseline_visitors: int, 
+        baseline_conversions: int, 
+        mde: float, 
+        risk: float, 
+        trust: float, 
+        tails: str
+        ) -> None:
 
     # --- Input Validation and Parameter Conversion ---
 
-    # Basic validation (although more comprehensive validation should ideally happen in `run`)
     if baseline_visitors <= 0:
         st.error("Baseline visitors must be greater than 0.")
         return # Stop calculation
@@ -124,9 +259,9 @@ def calculate_sample_size(num_variants, baseline_visitors, baseline_conversions,
 
     try:
         mde_relative = mde / 100
-        alpha = 1 - (risk / 100)  # Significance level
-        power = trust / 100       # Statistical power
-        beta = 1 - power          # Type II error rate
+        alpha = 1 - (risk / 100) # Significance level
+        power = trust / 100 # Statistical power
+        beta = 1 - power # Type II error rate
 
         # Baseline conversion rate
         p = baseline_conversions / baseline_visitors
@@ -137,7 +272,7 @@ def calculate_sample_size(num_variants, baseline_visitors, baseline_conversions,
 
         # Expected conversion rates
         p1 = p
-        p2 = p + mde_absolute  # Treatment group rate
+        p2 = p + mde_absolute # Treatment group rate
 
         if p2 > 1.0:
             st.warning(f"The calculated treatment conversion rate ({p2:.2%}) exceeds 100% based on the baseline rate ({p:.2%}) and MDE ({mde}%). Please check your inputs.")
@@ -155,6 +290,10 @@ def calculate_sample_size(num_variants, baseline_visitors, baseline_conversions,
     st.write(f"Calculating required sample size for a desired relative MDE of **{mde}%**.")
 
     # --- Z-Score Calculation ---
+
+    num_comparisons = 0
+    correction_applied = False
+
     try:
         # Adjust alpha for multiple comparisons if necessary
         if num_variants > 2:
@@ -216,7 +355,11 @@ def calculate_sample_size(num_variants, baseline_visitors, baseline_conversions,
         return
 
     # --- Runtime Estimation ---
-    def estimate_runtime(ss_per_group, visitors_per_week, n_variants):
+    def estimate_runtime(
+            ss_per_group: float, 
+            visitors_per_week: int, 
+            n_variants: int
+            ) -> str | int:
         try:
             if visitors_per_week <= 0 or n_variants <= 0:
                 return "infinite (zero baseline visitors or variants)"
@@ -245,50 +388,62 @@ def calculate_sample_size(num_variants, baseline_visitors, baseline_conversions,
 
 # Forecasting with Prophet
 @st.cache_data(show_spinner=False)
-def run_prophet_forecast(df, periods=42, confidence_level=0.95):
-    """
-    Ingests a dataframe with columns ['ds', 'visitors', 'conversions']. Returns a dataframe of forecasted daily values for the next 'periods'days.
-    """
-    
-    # Forecast Visitors
+def run_prophet_forecast(
+    df: pd.DataFrame, 
+    periods: int = 42, 
+    interval_width: float = 0.95
+    ) -> pd.DataFrame:
+
     df_vis = df[['ds', 'visitors']].rename(columns={'visitors': 'y'})
-    m_vis = Prophet(yearly_seasonality=True, weekly_seasonality=True, interval_width=confidence_level)
+    m_vis = Prophet(yearly_seasonality=True, weekly_seasonality=True, interval_width=interval_width) # type: ignore[arg-type]
     m_vis.fit(df_vis)
     future_vis = m_vis.make_future_dataframe(periods=periods)
     forecast_vis = m_vis.predict(future_vis)
-
-    # Forecast Conversions
+ 
     df_conv = df[['ds', 'conversions']].rename(columns={'conversions': 'y'})
-    m_conv = Prophet(yearly_seasonality=True, weekly_seasonality=True, interval_width=confidence_level)
+    m_conv = Prophet(yearly_seasonality=True, weekly_seasonality=True, interval_width=interval_width) # type: ignore[arg-type]
     m_conv.fit(df_conv)
     future_conv = m_conv.make_future_dataframe(periods=periods)
     forecast_conv = m_conv.predict(future_conv)
-
-    # Filter for future data only
+ 
     last_date = df['ds'].max()
-    
-    # Keep yhat_lower and yhat_upper
-    cols_to_keep = ['ds', 'yhat', 'yhat_lower', 'yhat_upper']
-    
+    cols_to_keep = [
+        'ds', 
+        'yhat', 
+        'yhat_lower', 
+        'yhat_upper'
+    ]
+ 
     future_vis = forecast_vis[forecast_vis['ds'] > last_date][cols_to_keep].rename(
-        columns={'yhat': 'pred_visitors', 'yhat_lower': 'vis_lower', 'yhat_upper': 'vis_upper'}
+        columns={
+            'yhat': 'pred_visitors', 
+            'yhat_lower': 'vis_lower', 
+            'yhat_upper': 'vis_upper'
+        }
     )
-    
     future_conv = forecast_conv[forecast_conv['ds'] > last_date][cols_to_keep].rename(
-        columns={'yhat': 'pred_conversions', 'yhat_lower': 'conv_lower', 'yhat_upper': 'conv_upper'}
+        columns={
+            'yhat': 'pred_conversions', 
+            'yhat_lower': 'conv_lower', 
+            'yhat_upper': 'conv_upper'
+        }
     )
-    
-    # Merge
+ 
     forecast_final = pd.merge(future_vis, future_conv, on='ds')
-    
-    # Clip negative predictions to 0
+ 
     cols_to_clip = ['pred_visitors', 'vis_lower', 'vis_upper', 'pred_conversions', 'conv_lower', 'conv_upper']
     for col in cols_to_clip:
         forecast_final[col] = forecast_final[col].clip(lower=0)
-    
+ 
     return forecast_final
 
-def perform_mde_calculation_forecast(forecast_df, num_variants, risk, trust, tails):
+def perform_mde_calculation_forecast(
+        forecast_df: pd.DataFrame, 
+        num_variants: int, 
+        risk: float, 
+        trust: float, 
+        tails: str
+         ) -> List[List[float | int | str]]:
     """
     Calculates MDE based on accumulating forecasted data rather than static averages.
     """
@@ -336,7 +491,7 @@ def perform_mde_calculation_forecast(forecast_df, num_variants, risk, trust, tai
         
     return results
 
-def run():
+def run() -> None:
     st.title("Pre-test analysis")
     """
     This calculator helps you plan for the runtime of your experiment.
@@ -442,12 +597,12 @@ def run():
                     st.error("CSV must contain columns: 'date' (or 'ds'), 'visitors', 'conversions'")
                 else:
                     df['ds'] = pd.to_datetime(df['ds'], dayfirst=True)
-                    forecast_confidence = 1 - (risk_s / 100)
+                    forecast_confidence = risk_s / 100
                     
                     if st.button("Generate Forecast & Analysis", type="primary"):
                         with st.spinner("Running Prophet Forecast..."):
                             # Run Forecast
-                            forecast_data = run_prophet_forecast(df, periods=42, interval_width=forecast_confidence)
+                            forecast_data = run_prophet_forecast(df, periods=42, interval_width=forecast_confidence) # type: ignore[call-arg]
                             
                             # Display Forecast Plot
                             st.write("### Traffic Forecast (Next 6 Weeks)")
