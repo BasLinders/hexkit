@@ -1,5 +1,6 @@
 import streamlit as st
 from scipy.stats import norm
+from statsmodels.stats.power import NormalIndPower
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -30,7 +31,7 @@ def get_user_input() -> None:
     with col2:
         st.number_input("Desired confidence level (e.g., 90%):", min_value=0, max_value=100, step=1, value=st.session_state.get("risk", 95), key="risk")
         st.number_input("Minimum trustworthiness (Power) (e.g., 80%):", min_value=0, max_value=100, step=1, value=st.session_state.get("trust", 80), key="trust")
-        if st.session_state.get("calculation_mode") == "Calculate Sample Size based on MDE":
+        if st.session_state.get("calculation_mode") == "Calculate Sample Size based on MDE" or st.session_state.get("calculation_mode") == "Calculate Power for Desired Lift":
             st.number_input("What MDE are you aiming for?", min_value=1, max_value=100, step=1, value=st.session_state.get("mde", 5), key="mde")
     st.radio(
         "Hypothesis type ('One-sided' or 'Two-sided'): ",
@@ -494,6 +495,60 @@ def perform_mde_calculation_forecast(
         
     return results
 
+def calculate_cohens_h(rate_a, rate_b, absolute=True):
+    """
+    Calculates Cohen's h for the effect size between two proportions.
+    """
+    # Safeguard: Rates cannot exceed 100% or be negative for the arcsine transformation
+    rate_a = np.clip(rate_a, 0.0, 1.0)
+    rate_b = np.clip(rate_b, 0.0, 1.0)
+
+    # Apply the arcsine transformation to both proportions
+    phi_a = 2 * np.arcsin(np.sqrt(rate_a))
+    phi_b = 2 * np.arcsin(np.sqrt(rate_b))
+    
+    # Find the difference
+    h = phi_b - phi_a
+    
+    # Return the absolute value (magnitude) or the directional value
+    cohens_h = abs(h) if absolute else h
+    
+    return cohens_h
+
+def calculate_power(
+    risk_level: float, 
+    expected_lift_pct: float,
+    tails: str, 
+    visitors_per_week: int, 
+    conversions_per_week: int,
+    weeks_to_run: int
+) -> tuple[float, float, float]:
+
+    rate_a = conversions_per_week / visitors_per_week
+    rate_b = rate_a * (1 + (expected_lift_pct / 100.0))
+    
+    alpha = 1.0 - (risk_level / 100.0)
+    alternative = 'two-sided' if tails == 'Two-sided' else 'larger'
+    
+    # Calculate total traffic per variant over the duration
+    n_a = visitors_per_week * weeks_to_run
+    
+    # Calculate Effect Size & Power
+    effect_size_h = calculate_cohens_h(rate_a, rate_b)
+    power_analysis = NormalIndPower()
+    
+    power = power_analysis.solve_power(
+        effect_size=effect_size_h, 
+        nobs1=n_a, 
+        ratio=1.0,
+        alpha=alpha, 
+        alternative=alternative
+    )
+    
+    target_power = st.session_state.get("trust", 80) / 100.0
+    
+    return power, target_power, rate_b
+
 def run() -> None:
     st.title("Pre-test analysis")
     """
@@ -514,8 +569,13 @@ def run() -> None:
         * **Best for:** Specific improvement goals.
         * *Scenario:* "We need to detect a 5% lift to justify this feature. How long will that take?"
         * *Output:* The total sample size required and the estimated runtime in days (based on average traffic).
+        
+        **3. Power Calculation for Desired Lift**
+        * **Best for:** Reality checks and resource allocation.
+        * *Scenario:* "Product expects a specific 5% lift, and we only have 4 weeks to run the test. What are the actual odds we detect it?"
+        * *Output:* The statistical power (probability of successfully detecting the expected lift) and a clear pass/fail against your minimum trustworthiness threshold.
 
-        **3. Seasonal Forecasting (Prophet)**
+        **4. Seasonal Forecasting (Prophet)**
         * **Best for:** Volatile, high-traffic, or event-driven sites.
         * *Scenario:* "Our traffic spikes on weekends or is approaching a holiday (e.g., Black Friday)."
         * *Why:* Standard calculators assume flat traffic. This method uses your historical data to **forecast** future daily traffic, preventing you from under-powering your test during traffic dips.
@@ -524,8 +584,8 @@ def run() -> None:
     # Selectbox for choosing the calculation mode
     calculation_mode = st.selectbox(
         "Select Calculation Mode:",
-        ("Calculate MDE based on Runtime", "Calculate Sample Size based on MDE", "Seasonal (Prophet Forecast)"),
-        help="For stable traffic / conversions, choose either MDE or sample size calculation. If traffic and conversion is seasonal (or highly volatile), choose Seasonal.",
+        ("Calculate MDE based on Runtime", "Calculate Sample Size based on MDE", "Calculate Power for Desired Lift", "Seasonal (Prophet Forecast)"),
+        help="For stable traffic / conversions, choose either MDE or sample size calculation. If traffic and conversion is seasonal (or highly volatile), choose Seasonal. To validate whether an expected uplift is enough to detect a trustworthy effect, choose 'calculate power'.",
         key="calculation_mode"
     )
 
@@ -570,6 +630,42 @@ def run() -> None:
                                       st.session_state.get("risk", 95),
                                       st.session_state.get("trust", 80),
                                       st.session_state.get("tails", 'One-sided'))
+    elif calculation_mode == "Calculate Power for Desired Lift":
+        get_user_input()
+        visitors_per_week = st.session_state.get("baseline_visitors", 0)
+        conversions_per_week = st.session_state.get("baseline_conversions", 0)
+        risk_level = st.session_state.get("risk", 95)
+        expected_lift_pct = st.session_state.get("mde", 5)
+        tails = st.session_state.get("tails", "One-sided")
+
+        weeks_to_run = st.slider("Test Duration (Weeks)", min_value=1, max_value=8, value=4)
+    
+        # Solve for Power
+        if visitors_per_week > 0 and conversions_per_week > 0 and conversions_per_week <= visitors_per_week:
+            power, target_power, rate_b = calculate_power(
+                risk_level, 
+                expected_lift_pct,
+                tails, 
+                visitors_per_week, 
+                conversions_per_week,
+                weeks_to_run
+            )
+
+            if rate_b > 1.0:
+                st.warning(f"Note: An expected lift of {expected_lift_pct}% pushes your variant's conversion rate over 100%. The calculator has capped the expected rate at 100%.")
+
+            # Display Results
+            st.divider()
+            st.write(f"### Results for {weeks_to_run}-Week Test")
+            st.metric(label=f"Statistical Power (Probability of detecting a {expected_lift_pct}% lift)", value=f"{power:.1%}")
+            
+            if power < target_power:
+                st.warning(f"⚠️ **Underpowered.** Your power is below your minimum threshold of {target_power:.1%}. You need to run the test longer or accept a higher expected lift.")
+            else:
+                st.success(f"✅ **Adequately Powered.** Your test meets your {target_power:.1%} trustworthiness requirement.")
+        else:
+            st.info("Please enter valid baseline visitors and conversions to calculate power. Visitors must be > 0, and conversions must be >= 0 and <= visitors.")
+        
     else:
         st.write("### Upload Historical Data")
         st.info("Upload a CSV with columns: `date` (YYYY-MM-DD), `visitors` (count), `conversions` (count). Ideally 1-2 years of data (not more!).")
