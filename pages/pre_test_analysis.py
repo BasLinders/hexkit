@@ -641,42 +641,42 @@ def run() -> None:
                                       st.session_state.get("tails", 'One-sided'))
     elif calculation_mode == "Calculate Power for Desired Lift":
         get_user_input()
-        num_variants = st.session_state.get("num_variants", 2)
-        visitors_per_week = st.session_state.get("baseline_visitors", 0)
-        conversions_per_week = st.session_state.get("baseline_conversions", 0)
-        risk_level = st.session_state.get("risk", 95)
-        expected_lift_pct = st.session_state.get("mde", 5)
-        tails = st.session_state.get("tails", "One-sided")
-
-        weeks_to_run = st.slider("Test Duration (Weeks)", min_value=1, max_value=8, value=4)
+        if st.button("Calculate Sample Size", type="primary"):
+            num_variants = st.session_state.get("num_variants", 2)
+            visitors_per_week = st.session_state.get("baseline_visitors", 0)
+            conversions_per_week = st.session_state.get("baseline_conversions", 0)
+            risk_level = st.session_state.get("risk", 95)
+            expected_lift_pct = st.session_state.get("mde", 5)
+            tails = st.session_state.get("tails", "One-sided")
     
-        # Solve for Power
-        if visitors_per_week > 0 and conversions_per_week > 0 and conversions_per_week <= visitors_per_week:
-            power, target_power, rate_b = calculate_power(
-                risk_level, 
-                expected_lift_pct,
-                tails, 
-                visitors_per_week, 
-                conversions_per_week,
-                weeks_to_run,
-                num_variants
-            )
-
-            if rate_b > 1.0:
-                st.warning(f"Note: An expected lift of {expected_lift_pct}% pushes your variant's conversion rate over 100%. The calculator has capped the expected rate at 100%.")
-
-            # Display Results
-            st.divider()
-            st.write(f"### Results for {weeks_to_run}-Week Test")
-            st.metric(label=f"Statistical Power (Probability of detecting a {expected_lift_pct}% lift)", value=f"{power:.1%}")
-            
-            if power < target_power:
-                st.warning(f"⚠️ **Underpowered.** Your power is below your minimum threshold of {target_power:.1%}. You need to run the test longer or accept a higher expected lift.")
-            else:
-                st.success(f"✅ **Adequately Powered.** Your test meets your {target_power:.1%} trustworthiness requirement.")
-        else:
-            st.info("Please enter valid baseline visitors and conversions to calculate power. Visitors must be > 0, and conversions must be >= 0 and <= visitors.")
+            weeks_to_run = st.slider("Test Duration (Weeks)", min_value=1, max_value=8, value=4)
         
+            # Solve for Power
+            if visitors_per_week > 0 and conversions_per_week > 0 and conversions_per_week <= visitors_per_week:
+                power, target_power, rate_b = calculate_power(
+                    risk_level, 
+                    expected_lift_pct,
+                    tails, 
+                    visitors_per_week, 
+                    conversions_per_week,
+                    weeks_to_run,
+                    num_variants
+                )
+    
+                if rate_b > 1.0:
+                    st.warning(f"Note: An expected lift of {expected_lift_pct}% pushes your variant's conversion rate over 100%. The calculator has capped the expected rate at 100%.")
+    
+                # Display Results
+                st.divider()
+                st.write(f"### Results for {weeks_to_run}-Week Test")
+                st.metric(label=f"Statistical Power (Probability of detecting a {expected_lift_pct}% lift)", value=f"{power:.1%}")
+                
+                if power < target_power:
+                    st.warning(f"⚠️ **Underpowered.** Your power is below your minimum threshold of {target_power:.1%}. You need to run the test longer or accept a higher expected lift.")
+                else:
+                    st.success(f"✅ **Adequately Powered.** Your test meets your {target_power:.1%} trustworthiness requirement.")
+            else:
+                st.info("Please enter valid baseline visitors and conversions to calculate power. Visitors must be > 0, and conversions must be >= 0 and <= visitors.")
     else:
         st.write("### Upload Historical Data")
         st.info("Upload a CSV with columns: `date` (YYYY-MM-DD), `visitors` (count), `conversions` (count). Ideally 1-2 years of data (not more!).")
