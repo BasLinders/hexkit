@@ -42,7 +42,7 @@ def get_user_input() -> None:
         help="Choose 'One-sided' when testing only for improvement (B > A) or decline (B < A); this requires fewer samples and results in a possible lower MDE. Choose 'Two-sided' when testing for any difference (better or worse); this is more comprehensive because it can detect significant effects in either direction, but generally requires more samples and possibly raises the MDE."
     )
     if st.session_state.get("calculation_mode") == "Calculate Power for Desired Lift":
-        weeks_to_run = st.slider("Test Duration (Weeks)", min_value=1, max_value=6, value=4)
+        weeks_to_run = st.slider("Test Duration (Weeks)", min_value=1, max_value=6, value=4, key="weeks_to_run")
 
 # --- HELPER FUNCTIONS ---
 
@@ -650,6 +650,7 @@ def run() -> None:
             risk_level = st.session_state.get("risk", 95)
             expected_lift_pct = st.session_state.get("mde", 5)
             tails = st.session_state.get("tails", "One-sided")
+            weeks_to_run = st.session_state.get("weeks_to_run", 4)
         
             # Solve for Power
             if visitors_per_week > 0 and conversions_per_week > 0 and conversions_per_week <= visitors_per_week:
