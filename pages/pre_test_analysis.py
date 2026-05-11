@@ -521,13 +521,22 @@ def calculate_power(
     tails: str, 
     visitors_per_week: int, 
     conversions_per_week: int,
-    weeks_to_run: int
+    weeks_to_run: int,
+    num_variants: int
 ) -> tuple[float, float, float]:
 
     rate_a = conversions_per_week / visitors_per_week
     rate_b = rate_a * (1 + (expected_lift_pct / 100.0))
     
     alpha = 1.0 - (risk_level / 100.0)
+
+    # --- MULTIPLE COMPARISONS CORRECTION ---
+    num_comparisons = num_variants - 1
+    if num_comparisons > 1:
+        # Standard Bonferroni correction for power planning
+        alpha = alpha / num_comparisons
+    # ---------------------------------------
+    
     alternative = 'two-sided' if tails == 'Two-sided' else 'larger'
     
     # Calculate total traffic per variant over the duration
@@ -632,6 +641,7 @@ def run() -> None:
                                       st.session_state.get("tails", 'One-sided'))
     elif calculation_mode == "Calculate Power for Desired Lift":
         get_user_input()
+        num_variants = st.session_state.get("num_variants", 2)
         visitors_per_week = st.session_state.get("baseline_visitors", 0)
         conversions_per_week = st.session_state.get("baseline_conversions", 0)
         risk_level = st.session_state.get("risk", 95)
@@ -648,7 +658,8 @@ def run() -> None:
                 tails, 
                 visitors_per_week, 
                 conversions_per_week,
-                weeks_to_run
+                weeks_to_run,
+                num_variants
             )
 
             if rate_b > 1.0:
