@@ -499,6 +499,10 @@ def calculate_cohens_h(rate_a, rate_b, absolute=True):
     """
     Calculates Cohen's h for the effect size between two proportions.
     """
+    # Safeguard: Rates cannot exceed 100% or be negative for the arcsine transformation
+    rate_a = np.clip(rate_a, 0.0, 1.0)
+    rate_b = np.clip(rate_b, 0.0, 1.0)
+
     # Apply the arcsine transformation to both proportions
     phi_a = 2 * np.arcsin(np.sqrt(rate_a))
     phi_b = 2 * np.arcsin(np.sqrt(rate_b))
@@ -518,7 +522,7 @@ def calculate_power(
     visitors_per_week: int, 
     conversions_per_week: int,
     weeks_to_run: int
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
 
     rate_a = conversions_per_week / visitors_per_week
     rate_b = rate_a * (1 + (expected_lift_pct / 100.0))
@@ -543,7 +547,7 @@ def calculate_power(
     
     target_power = st.session_state.get("trust", 80) / 100.0
     
-    return power, target_power
+    return power, target_power, rate_b
 
 def run() -> None:
     st.title("Pre-test analysis")
@@ -637,8 +641,8 @@ def run() -> None:
         weeks_to_run = st.slider("Test Duration (Weeks)", min_value=1, max_value=8, value=4)
     
         # Solve for Power
-        if visitors_per_week > 0 and conversions_per_week > 0:
-            power, target_power = calculate_power(
+        if visitors_per_week > 0 and conversions_per_week > 0 and conversions_per_week <= visitors_per_week:
+            power, target_power, rate_b = calculate_power(
                 risk_level, 
                 expected_lift_pct,
                 tails, 
@@ -646,6 +650,10 @@ def run() -> None:
                 conversions_per_week,
                 weeks_to_run
             )
+
+            if rate_b > 1.0:
+                st.warning(f"Note: An expected lift of {expected_lift_pct}% pushes your variant's conversion rate over 100%. The calculator has capped the expected rate at 100%.")
+
             # Display Results
             st.divider()
             st.write(f"### Results for {weeks_to_run}-Week Test")
@@ -656,7 +664,7 @@ def run() -> None:
             else:
                 st.success(f"✅ **Adequately Powered.** Your test meets your {target_power:.1%} trustworthiness requirement.")
         else:
-            st.info("Please enter valid baseline visitors and conversions to calculate power.")
+            st.info("Please enter valid baseline visitors and conversions to calculate power. Visitors must be > 0, and conversions must be >= 0 and <= visitors.")
         
     else:
         st.write("### Upload Historical Data")
