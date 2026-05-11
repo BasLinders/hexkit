@@ -669,7 +669,7 @@ def run() -> None:
     
                 # Display Results
                 st.divider()
-                st.write(f"### Results for {weeks_to_run}-Week Test")
+                st.write(f"### Results for {weeks_to_run}-Week Test with {num_variants} Variants")
                 st.metric(label=f"Statistical Power (Probability of detecting a {expected_lift_pct}% lift)", value=f"{power:.1%}")
                 
                 if power < target_power:
