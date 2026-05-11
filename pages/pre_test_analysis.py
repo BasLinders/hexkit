@@ -641,7 +641,7 @@ def run() -> None:
                                       st.session_state.get("tails", 'One-sided'))
     elif calculation_mode == "Calculate Power for Desired Lift":
         get_user_input()
-        if st.button("Calculate Sample Size", type="primary"):
+        if st.button("Calculate Power", type="primary"):
             num_variants = st.session_state.get("num_variants", 2)
             visitors_per_week = st.session_state.get("baseline_visitors", 0)
             conversions_per_week = st.session_state.get("baseline_conversions", 0)
