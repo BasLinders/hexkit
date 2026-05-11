@@ -641,6 +641,8 @@ def run() -> None:
                                       st.session_state.get("tails", 'One-sided'))
     elif calculation_mode == "Calculate Power for Desired Lift":
         get_user_input()
+        weeks_to_run = st.slider("Test Duration (Weeks)", min_value=1, max_value=6, value=4)
+        
         if st.button("Calculate Power", type="primary"):
             num_variants = st.session_state.get("num_variants", 2)
             visitors_per_week = st.session_state.get("baseline_visitors", 0)
@@ -648,8 +650,6 @@ def run() -> None:
             risk_level = st.session_state.get("risk", 95)
             expected_lift_pct = st.session_state.get("mde", 5)
             tails = st.session_state.get("tails", "One-sided")
-    
-            weeks_to_run = st.slider("Test Duration (Weeks)", min_value=1, max_value=8, value=4)
         
             # Solve for Power
             if visitors_per_week > 0 and conversions_per_week > 0 and conversions_per_week <= visitors_per_week:
