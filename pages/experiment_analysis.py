@@ -373,13 +373,46 @@ def get_frequentist_inputs():
                 st.info(f"**Correlation Found:** {corr:.2f}")
                 st.metric("New Variance Level", f"{(reduction_factor * 100):.1f}%", 
                         delta=f"-{((1 - reduction_factor) * 100):.1f}% Noise", delta_color="normal")
-    
+
+    st.write("---")
+    st.write("### False Positive / Negative Risk")
+    with st.expander("What is this?"):
+        st.markdown(r"""
+        Standard p-values tell you P(data | H0), not P(H0 | data). These metrics flip that using your prior belief that the variant has a real effect.
+
+        | | Significant result | Non-significant result |
+        |---|---|---|
+        | **Greater** | **FPR**: probability the apparent improvement is spurious | **FNDR**: probability a real improvement was missed |
+        | **Less** | **FPR**: probability the apparent harm is spurious | **FNDR**: probability real harm was missed |
+        | **Two-sided** | **FPR**: probability the detected difference (either direction) is spurious | **FNDR**: probability a real difference (either direction) was missed |
+
+        The prior belief setting controls how much weight is given to the hypothesis that a real effect exists before seeing the data:
+        - **Skeptical** (10%): most experiments don't move the needle
+        - **Neutral** (50%): no strong expectation either way
+        - **Optimistic** (90%): strong belief the variant has a real effect
+        """)
+
+    sensitivity_mode = st.selectbox(
+        "Prior belief that the variant has a real effect",
+        ["skeptical", "neutral", "optimistic", "custom"],
+        index=1,
+        help="Skeptical = 10% prior, Neutral = 50%, Optimistic = 90%."
+    )
+    custom_prior = None
+    if sensitivity_mode == "custom":
+        custom_prior = st.number_input(
+            "Custom prior probability P(H1)",
+            min_value=0.0, max_value=1.0, step=0.01, value=0.5
+        )
+        
     return (
         st.session_state.visitor_counts, 
         st.session_state.conversion_counts, 
         st.session_state.confidence_level, 
         reduction_factor,
-        st.session_state.test_duration
+        st.session_state.test_duration,
+        sensitivity_mode,
+        custom_prior
         )
 
 def validate_inputs(
@@ -849,6 +882,7 @@ def display_results_per_variant(
 
 
 # -- Frequentist helper functions --
+
 def calculate_cuped_reduction_factor(
     df, 
     period_1_col, 
@@ -1086,34 +1120,77 @@ def calculate_frequentist_statistics(
     # --- Observed Power Analysis ---
     power_method_used = ""
     observed_powers = []
+
     if all(v > 1000 for v in visitor_counts):
         power_method_used = "Analytical"
-        # Iterate once through the challengers
         for i in range(1, num_variants):
             se_diff = np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
             if se_diff == 0:
                 observed_powers.append(1.0)
                 continue
-            
-            # Calculated conversion rates and SEs include reduction_factor
             z_delta = abs(conversion_rates[i] - conversion_rates[0]) / se_diff
-            
-            # Determine threshold based on tail and Sidak correction
             if tail in ['Greater', 'Less']:
                 z_alpha = norm.ppf(1 - sidak_alpha)
                 power = norm.cdf(z_delta - z_alpha)
-            else: # Two-sided
+            else:
                 z_alpha = norm.ppf(1 - sidak_alpha / 2)
-                # Power for two-sided is the sum of both tails
                 power = norm.cdf(z_delta - z_alpha) + norm.cdf(-z_delta - z_alpha)
-            
             observed_powers.append(power)
+
     else:
         if reduction_factor < 1.0:
             st.warning("CUPED variance reduction is enabled, but observed power calculation via bootstrap is not compatible with CUPED. Falling back to analytical method without CUPED adjustment for power estimation.")
             power_method_used = "Analytical"
+            for i in range(1, num_variants):
+                se_diff = np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
+                if se_diff == 0:
+                    observed_powers.append(1.0)
+                    continue
+                z_delta = abs(conversion_rates[i] - conversion_rates[0]) / se_diff
+                if tail in ['Greater', 'Less']:
+                    z_alpha = norm.ppf(1 - sidak_alpha)
+                    power = norm.cdf(z_delta - z_alpha)
+                else:
+                    z_alpha = norm.ppf(1 - sidak_alpha / 2)
+                    power = norm.cdf(z_delta - z_alpha) + norm.cdf(-z_delta - z_alpha)
+                observed_powers.append(power)
+
         else:
             power_method_used = "Bootstrap"
+
+            def bootstrap_sample(data_control, data_variant, alpha, tail):
+                sample_control = np.random.choice(data_control, size=len(data_control), replace=True)
+                sample_variant = np.random.choice(data_variant, size=len(data_variant), replace=True)
+                pooled_p = (np.sum(sample_control) + np.sum(sample_variant)) / (len(sample_control) + len(sample_variant))
+                se = np.sqrt(pooled_p * (1 - pooled_p) * (1 / len(sample_control) + 1 / len(sample_variant)))
+                z_stat = 0 if se == 0 else (np.mean(sample_variant) - np.mean(sample_control)) / se
+                if tail == 'Greater':
+                    return (1 - norm.cdf(z_stat)) < alpha
+                elif tail == 'Less':
+                    return norm.cdf(z_stat) < alpha
+                else:
+                    return (2 * (1 - norm.cdf(abs(z_stat)))) < alpha
+
+            def bootstrap_power(data_control, data_variant, alpha, tail, n_bootstraps=10000):
+                significant_count = 0
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    futures = [
+                        executor.submit(bootstrap_sample, data_control, data_variant, alpha, tail)
+                        for _ in range(n_bootstraps)
+                    ]
+                    for future in concurrent.futures.as_completed(futures):
+                        if future.result():
+                            significant_count += 1
+                return significant_count / n_bootstraps
+
+            data_controls = [
+                np.concatenate([np.ones(c), np.zeros(v - c)])
+                for c, v in zip(conversion_counts, visitor_counts)
+            ]
+            observed_powers = [
+                bootstrap_power(data_controls[0], data_controls[i], alpha, tail)
+                for i in range(1, num_variants)
+            ]
             
         def bootstrap_sample(data_control, data_variant, alpha, tail):
 
@@ -1302,6 +1379,31 @@ def plot_conversion_distributions(results):
     st.pyplot(fig)
     plt.close(fig)
 
+def resolve_prior(sensitivity_mode='neutral', custom_prior=None):
+    priors = {'skeptical': 0.1, 'neutral': 0.5, 'optimistic': 0.9}
+    if sensitivity_mode == 'custom':
+        if custom_prior is None:
+            raise ValueError("custom_prior must be provided when sensitivity_mode is 'custom'.")
+        if not (0.0 <= custom_prior <= 1.0):
+            raise ValueError(f"custom_prior must be between 0 and 1, got {custom_prior}.")
+        return custom_prior
+    if sensitivity_mode not in priors:
+        raise ValueError(f"Unknown sensitivity_mode '{sensitivity_mode}'.")
+    return priors[sensitivity_mode]
+
+def calculate_fpr(alpha, power, prior):
+    p1, p0 = prior, 1 - prior
+    numerator = alpha * p0
+    denominator = (alpha * p0) + (power * p1)
+    return numerator / denominator if denominator else 0.0
+
+def calculate_fndr(alpha, power, prior):
+    p1, p0 = prior, 1 - prior
+    beta = 1 - power
+    specificity = 1 - alpha
+    numerator = beta * p1
+    denominator = (beta * p1) + (specificity * p0)
+    return numerator / denominator if denominator else 0.0
 
 def display_frequentist_summary(
     results, 
@@ -1309,7 +1411,8 @@ def display_frequentist_summary(
     conversion_counts,
     non_inferiority_margin=0.01,
     confidence_noninf=95,
-    reduction_factor=1.0
+    reduction_factor=1.0,
+    prior=0.5
 ):
 
     if not results:
@@ -1373,7 +1476,7 @@ def display_frequentist_summary(
                 value=f"{observed_diff*100:+.2f}%", # The '+' forces a +/- sign
                 help=f"The {results['confidence_level']}% confidence interval for the uplift is from {ci_difference[0]*100:+.2f}% to {ci_difference[1]*100:+.2f}%."
             )
-
+            
         st.write("#### Confidence Interval Comparison")
         fig = display_ci_chart(results, i, alphabet)
         st.altair_chart(fig, width='stretch')
@@ -1419,7 +1522,56 @@ def display_frequentist_summary(
             else: # Voor 'less' tail
                 st.info(f"There is no strong evidence of a difference, and the effect size remains uncertain.")
 
+        # --- FPR / FNDR block ---
+        st.write("#### False Positive / Negative Risk")
+        power = observed_powers[challenger_index_in_lists]
+        fpr_alpha = results['sidak_alpha']
+
+        # Direction-aware labels and help text
+        if tail == 'Greater':
+            fpr_label = "False Positive Risk"
+            fpr_help = "Probability this apparent improvement is a false positive, given your prior."
+            fpr_warning_suffix = "Consider replication before acting."
+            fndr_label = "False Negative Discovery Rate"
+            fndr_help = "Probability a real improvement was missed, given your prior and observed power."
+            fndr_warning_suffix = "Power may be insufficient to detect a real improvement."
+            fndr_success = "False Negative Risk is low: If a real improvement exists, this test was likely sensitive enough to find it."
+
+        elif tail == 'Less':
+            fpr_label = "False Positive Risk (Harm Detection)"
+            fpr_help = "Probability this apparent harm is a false positive, given your prior."
+            fpr_warning_suffix = "Review before concluding the variant is worse."
+            fndr_label = "False Negative Discovery Rate (Missed Harm)"
+            fndr_help = "Probability real harm was missed, given your prior and observed power."
+            fndr_warning_suffix = "Power may be insufficient to detect real harm."
+            fndr_success = "False Negative Risk is low: If the variant truly underperforms, this test was likely sensitive enough to detect it."
+
+        else:  # Two-sided
+            fpr_label = "False Positive Risk"
+            fpr_help = "Probability this detected difference (in either direction) is a false positive, given your prior."
+            fpr_warning_suffix = "Direction is uncertain: Treat with caution before acting."
+            fndr_label = "False Negative Discovery Rate"
+            fndr_help = "Probability a real difference in either direction was missed, given your prior and observed power."
+            fndr_warning_suffix = "Power may be insufficient to detect a real difference in either direction."
+            fndr_success = "False Negative Risk is low: If a real difference exists in either direction, this test was likely sensitive enough to find it."
+
+        if is_significant[challenger_index_in_lists]:
+            fpr = calculate_fpr(alpha=fpr_alpha, power=power, prior=prior)
+            st.metric(label=fpr_label, value=f"{fpr:.1%}", help=fpr_help)
+            if fpr > 0.20:
+                st.warning(f"With a {prior:.0%} prior, there's a {fpr:.1%} chance this result is a false positive. {fpr_warning_suffix}")
+            else:
+                st.success(f"False Positive Risk is low at {fpr:.1%}.")
+        else:
+            fndr = calculate_fndr(alpha=fpr_alpha, power=power, prior=prior)
+            st.metric(label=fndr_label, value=f"{fndr:.1%}", help=fndr_help)
+            if fndr > 0.20:
+                st.warning(f"With a {prior:.0%} prior, there's a {fndr:.1%} chance a real effect was missed. {fndr_warning_suffix}")
+            else:
+                st.success(fndr_success)
+
 # Main logic
+
 def run():
     st.title("Experiment Analysis")
     st.markdown("""
@@ -1510,7 +1662,7 @@ def run():
     elif analysis_method == "Frequentist Analysis":
         st.header("Frequentist Analysis Inputs")
         
-        visitor_counts, conversion_counts, confidence_level, reduction_factor, test_duration = get_frequentist_inputs()
+        visitor_counts, conversion_counts, confidence_level, reduction_factor, test_duration, sensitivity_mode, custom_prior = get_frequentist_inputs()
 
         st.write("---")
         
@@ -1529,6 +1681,7 @@ def run():
         st.write("")
         if st.button("Calculate Frequentist Results", type="primary"):
             if validate_inputs(visitor_counts, conversion_counts):
+                prior = resolve_prior(sensitivity_mode, custom_prior)
                 st.write("---")
                 try:
                     # --- Calculations ---
@@ -1537,7 +1690,8 @@ def run():
                             visitor_counts,
                             conversion_counts,
                             confidence_level,
-                            st.session_state.tail
+                            st.session_state.tail,
+                            reduction_factor=reduction_factor
                         )
                         
                         if test_results['reduction_factor'] < 1.0:
@@ -1566,7 +1720,8 @@ def run():
                                 visitor_counts,
                                 conversion_counts,
                                 non_inferiority_margin=non_inferiority_margin,
-                                reduction_factor=reduction_factor
+                                reduction_factor=reduction_factor,
+                                prior=prior
                             )
                 except Exception as e:
                     st.error(f"An error occurred during calculation: {e}")
