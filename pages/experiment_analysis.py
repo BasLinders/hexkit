@@ -378,10 +378,18 @@ def get_frequentist_inputs():
     st.write("### False Positive / Negative Risk")
     with st.expander("What is this?"):
         st.markdown(r"""
-        Standard p-values tell you P(data | H0), not P(H0 | data). These metrics flip that:
-        - **FPR**: given a *significant* result, the probability it's actually a false positive.
-        - **FNDR**: given a *null* result, the probability a real effect was missed.
-        Both depend on your prior belief that the variant has a real effect.
+        Standard p-values tell you P(data | H0), not P(H0 | data). These metrics flip that using your prior belief that the variant has a real effect.
+
+        | | Significant result | Non-significant result |
+        |---|---|---|
+        | **Greater** | **FPR**: probability the apparent improvement is spurious | **FNDR**: probability a real improvement was missed |
+        | **Less** | **FPR**: probability the apparent harm is spurious | **FNDR**: probability real harm was missed |
+        | **Two-sided** | **FPR**: probability the detected difference (either direction) is spurious | **FNDR**: probability a real difference (either direction) was missed |
+
+        The prior belief setting controls how much weight is given to the hypothesis that a real effect exists before seeing the data:
+        - **Skeptical** (10%): most experiments don't move the needle
+        - **Neutral** (50%): no strong expectation either way
+        - **Optimistic** (90%): strong belief the variant has a real effect
         """)
 
     sensitivity_mode = st.selectbox(
@@ -1517,30 +1525,50 @@ def display_frequentist_summary(
         # --- FPR / FNDR block ---
         st.write("#### False Positive / Negative Risk")
         power = observed_powers[challenger_index_in_lists]
-        alpha = results['sidak_alpha']
+        fpr_alpha = results['sidak_alpha']
+
+        # Direction-aware labels and help text
+        if tail == 'Greater':
+            fpr_label = "False Positive Risk"
+            fpr_help = "Probability this apparent improvement is a false positive, given your prior."
+            fpr_warning_suffix = "Consider replication before acting."
+            fndr_label = "False Negative Discovery Rate"
+            fndr_help = "Probability a real improvement was missed, given your prior and observed power."
+            fndr_warning_suffix = "Power may be insufficient to detect a real improvement."
+            fndr_success = "False Negative Risk is low: If a real improvement exists, this test was likely sensitive enough to find it."
+
+        elif tail == 'Less':
+            fpr_label = "False Positive Risk (Harm Detection)"
+            fpr_help = "Probability this apparent harm is a false positive, given your prior."
+            fpr_warning_suffix = "Review before concluding the variant is worse."
+            fndr_label = "False Negative Discovery Rate (Missed Harm)"
+            fndr_help = "Probability real harm was missed, given your prior and observed power."
+            fndr_warning_suffix = "Power may be insufficient to detect real harm."
+            fndr_success = "False Negative Risk is low: If the variant truly underperforms, this test was likely sensitive enough to detect it."
+
+        else:  # Two-sided
+            fpr_label = "False Positive Risk"
+            fpr_help = "Probability this detected difference (in either direction) is a false positive, given your prior."
+            fpr_warning_suffix = "Direction is uncertain: Treat with caution before acting."
+            fndr_label = "False Negative Discovery Rate"
+            fndr_help = "Probability a real difference in either direction was missed, given your prior and observed power."
+            fndr_warning_suffix = "Power may be insufficient to detect a real difference in either direction."
+            fndr_success = "False Negative Risk is low: If a real difference exists in either direction, this test was likely sensitive enough to find it."
 
         if is_significant[challenger_index_in_lists]:
-            fpr = calculate_fpr(alpha=alpha, power=power, prior=prior)
-            st.metric(
-                label="False Positive Risk",
-                value=f"{fpr:.1%}",
-                help="Probability that this significant result is actually a false positive, given your prior."
-            )
+            fpr = calculate_fpr(alpha=fpr_alpha, power=power, prior=prior)
+            st.metric(label=fpr_label, value=f"{fpr:.1%}", help=fpr_help)
             if fpr > 0.20:
-                st.warning(f"With a {prior:.0%} prior, there's a {fpr:.1%} chance this result is a false positive. Consider replication before acting.")
+                st.warning(f"With a {prior:.0%} prior, there's a {fpr:.1%} chance this result is a false positive. {fpr_warning_suffix}")
             else:
                 st.success(f"False Positive Risk is low at {fpr:.1%}.")
         else:
-            fndr = calculate_fndr(alpha=alpha, power=power, prior=prior)
-            st.metric(
-                label="False Negative Discovery Rate",
-                value=f"{fndr:.1%}",
-                help="Probability that a real effect was missed, given your prior and observed power."
-            )
+            fndr = calculate_fndr(alpha=fpr_alpha, power=power, prior=prior)
+            st.metric(label=fndr_label, value=f"{fndr:.1%}", help=fndr_help)
             if fndr > 0.20:
-                st.warning(f"With a {prior:.0%} prior, there's a {fndr:.1%} chance a real effect was missed. Power may be insufficient.")
+                st.warning(f"With a {prior:.0%} prior, there's a {fndr:.1%} chance a real effect was missed. {fndr_warning_suffix}")
             else:
-                st.success(f"False Negative Risk is low at {fndr:.1%}.")
+                st.success(fndr_success)
 
 # Main logic
 
