@@ -382,9 +382,9 @@ def get_frequentist_inputs():
 
         | | Significant result | Non-significant result |
         |---|---|---|
-        | **Greater** | **FPR**: probability the apparent improvement is spurious | **FNDR**: probability a real improvement was missed |
-        | **Less** | **FPR**: probability the apparent harm is spurious | **FNDR**: probability real harm was missed |
-        | **Two-sided** | **FPR**: probability the detected difference (either direction) is spurious | **FNDR**: probability a real difference (either direction) was missed |
+        | **Greater** | **FPR**: probability the apparent improvement is false | **FNDR**: probability a real improvement was missed |
+        | **Less** | **FPR**: probability the apparent harm is false | **FNDR**: probability real harm was missed |
+        | **Two-sided** | **FPR**: probability the detected difference (either direction) is false | **FNDR**: probability a real difference (either direction) was missed |
 
         The prior belief setting controls how much weight is given to the hypothesis that a real effect exists before seeing the data:
         - **Skeptical** (10%): most experiments don't move the needle
