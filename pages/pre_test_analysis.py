@@ -563,9 +563,8 @@ def calculate_power(
 def run() -> None:
     st.title("Pre-test analysis")
     """
-    This calculator helps you plan for the runtime of your experiment.
+    This tool helps you plan for the runtime of your experiment.
 
-    Enter the values below to start.
     """
     with st.expander("How to plan your tests", expanded=False):
         st.markdown("""
