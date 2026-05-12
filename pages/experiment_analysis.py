@@ -1511,39 +1511,39 @@ def display_frequentist_summary(
                     st.success(f"Although not a winner, the non-inferiority test suggests that {alphabet[i]} is **not significantly worse** than {alphabet[0]} within the predefined margin.")
                 else:
                     st.warning(f"The non-inferiority test does not provide sufficient evidence to conclude that {alphabet[i]} performs at least as well as {alphabet[0]}.")
-                
-                # --- FPR / FNDR block ---
-                st.write("#### False Positive / Negative Risk")
-                power = observed_powers[challenger_index_in_lists]
-                alpha = results['sidak_alpha']
-        
-                if is_significant[challenger_index_in_lists]:
-                    fpr = calculate_fpr(alpha=alpha, power=power, prior=prior)
-                    st.metric(
-                        label="False Positive Risk",
-                        value=f"{fpr:.1%}",
-                        help="Probability that this significant result is actually a false positive, given your prior."
-                    )
-                    if fpr > 0.20:
-                        st.warning(f"With a {prior:.0%} prior, there's a {fpr:.1%} chance this result is a false positive. Consider replication before acting.")
-                    else:
-                        st.success(f"False Positive Risk is low at {fpr:.1%}.")
-                else:
-                    fndr = calculate_fndr(alpha=alpha, power=power, prior=prior)
-                    st.metric(
-                        label="False Negative Discovery Rate",
-                        value=f"{fndr:.1%}",
-                        help="Probability that a real effect was missed, given your prior and observed power."
-                    )
-                    if fndr > 0.20:
-                        st.warning(f"With a {prior:.0%} prior, there's a {fndr:.1%} chance a real effect was missed. Power may be insufficient.")
-                    else:
-                        st.success(f"False Negative Risk is low at {fndr:.1%}.")
             else: # Voor 'less' tail
                 st.info(f"There is no strong evidence of a difference, and the effect size remains uncertain.")
 
+        # --- FPR / FNDR block ---
+        st.write("#### False Positive / Negative Risk")
+        power = observed_powers[challenger_index_in_lists]
+        alpha = results['sidak_alpha']
+
+        if is_significant[challenger_index_in_lists]:
+            fpr = calculate_fpr(alpha=alpha, power=power, prior=prior)
+            st.metric(
+                label="False Positive Risk",
+                value=f"{fpr:.1%}",
+                help="Probability that this significant result is actually a false positive, given your prior."
+            )
+            if fpr > 0.20:
+                st.warning(f"With a {prior:.0%} prior, there's a {fpr:.1%} chance this result is a false positive. Consider replication before acting.")
+            else:
+                st.success(f"False Positive Risk is low at {fpr:.1%}.")
+        else:
+            fndr = calculate_fndr(alpha=alpha, power=power, prior=prior)
+            st.metric(
+                label="False Negative Discovery Rate",
+                value=f"{fndr:.1%}",
+                help="Probability that a real effect was missed, given your prior and observed power."
+            )
+            if fndr > 0.20:
+                st.warning(f"With a {prior:.0%} prior, there's a {fndr:.1%} chance a real effect was missed. Power may be insufficient.")
+            else:
+                st.success(f"False Negative Risk is low at {fndr:.1%}.")
 
 # Main logic
+
 def run():
     st.title("Experiment Analysis")
     st.markdown("""
