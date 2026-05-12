@@ -627,13 +627,12 @@ def plot_uplift_histograms(
         ax.set_xlim(range_min, range_max)
 
         # 2. TICK FORMATTING
-        # We avoid the complex 'renderer' logic which causes VSCode errors
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f'{x:.2f}%'))
         plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
 
         line_label = f'Observed Uplift ({challenger_label} vs {control_label}): {observed_uplift:.2f}%'
         
-        # 3. AXVLINE (ensure x is a single float)
+        # 3. AXVLINE
         line_observed_uplift = ax.axvline(x=observed_uplift, color='red', linestyle='--', linewidth=2, label=line_label)
         
         patch_a = mpatches.Patch(color='lightcoral', label=f'{control_label} is better')
@@ -962,7 +961,7 @@ def plot_cuped_comparison(
         cr = results['conversion_rates'][i]
         se = results['standard_errors'][i]
         
-        # Calculate the Probability Density Function ("Bell Curve")
+        # Calculate the Probability Density Function
         y = norm.pdf(x, cr, se)
         
         label = f"Variant {alphabet[i]} (Control)" if i == 0 else f"Variant {alphabet[i]}"
