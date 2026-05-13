@@ -80,7 +80,7 @@ def display_dynamic_documentation(analysis_method):
             st.markdown("""
             This engine provides a **probabilistic** view of the experiment, moving away from "significant/not significant" to "how much better is it?"
             
-            * **Risk-Aware Decisioning:** Quantifies the **Expected Monetary Risk**—the literal monetary amount you stand to lose if the variant is actually worse.
+            * **Risk-Aware Decisioning:** Quantifies the **Expected Monetary Risk**: the literal monetary amount you stand to lose if the variant is actually worse.
             * **Business Impact:** Translates statistical lift into a **6-month revenue projection** based on your AOV as a constant.
             * **Direct Probabilities:** Gives you a clear "Chance to Beat Control" percentage.
             """)
@@ -631,7 +631,7 @@ def sample_aov(mean_aov: float, cv: float, n_samples: int, rng: np.random.Genera
     and coefficient of variation (CV = std / mean).
 
     The parameterisation preserves E[AOV] = mean_aov exactly, so predictions
-    are not inflated or deflated — only variance is added.
+    are not inflated or deflated; only variance is added.
 
     Typical CV for e-commerce AOV: 0.5 (stable catalogue) to 1.5 (wide price range).
     """
@@ -779,7 +779,7 @@ def display_results_per_variant(
 
                     **AOV sampling**
                     Rather than treating AOV as a fixed constant, it is drawn from a log-normal distribution on each
-                    simulation. The distribution is parameterised so that the expected value equals your input AOV exactly —
+                    simulation. The distribution is parameterised so that the expected value equals your input AOV exactly -
                     only variance is added, not bias. The degree of spread is controlled by the AOV Variability slider
                     (coefficient of variation: std / mean).
 
@@ -883,7 +883,7 @@ def validate_timeseries_data(
     if (df[conversions_col] > df[visitors_col]).any():
         return (
             False,
-            "Some rows show more conversions than visitors — check your column mapping.",
+            "Some rows show more conversions than visitors - check your column mapping.",
             n_periods,
         )
 
@@ -1110,7 +1110,7 @@ def plot_variance_adjusted_comparison(results, visitor_counts) -> go.Figure:
         adjustment_label = "No Variance Adjustment Applied"
 
     fig.update_layout(
-        title=f"Probability Density — Variance Adjustment: {adjustment_label}",
+        title=f"Probability Density - Variance Adjustment: {adjustment_label}",
         xaxis_title="Conversion Rate",
         yaxis_title="Probability Density",
         template="plotly_white",
@@ -1250,7 +1250,7 @@ def calculate_frequentist_statistics(
             power_method_used = "Analytical"
             st.warning(
                 "Variance adjustment is active. Bootstrap power estimation is not compatible "
-                "with a scaled standard error — falling back to the analytical method."
+                "with a scaled standard error - falling back to the analytical method."
             )
             for i in range(1, num_variants):
                 se_diff = np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
@@ -1519,14 +1519,14 @@ def display_frequentist_summary(
     if reduction_factor < 1.0:
         pct_reduced = (1 - reduction_factor) * 100
         st.info(
-            f"**Variance Adjustment Active** — SE reduced by {pct_reduced:.1f}% "
+            f"**Variance Adjustment Active** - SE reduced by {pct_reduced:.1f}% "
             f"(φ = {reduction_factor:.3f}). Your historical conversion rate is more "
             f"stable than the binomial assumption; confidence intervals are tightened accordingly."
         )
     elif reduction_factor > 1.0:
         pct_inflated = (reduction_factor - 1) * 100
         st.info(
-            f"**Variance Adjustment Active** — SE inflated by {pct_inflated:.1f}% "
+            f"**Variance Adjustment Active** - SE inflated by {pct_inflated:.1f}% "
             f"(φ = {reduction_factor:.3f}). Overdispersion was detected in your historical data; "
             f"confidence intervals are widened to maintain a honest false positive rate."
         )
@@ -1753,7 +1753,7 @@ def run():
 
                     rf = test_results['reduction_factor']
 
-                    # ── Variance adjustment feedback (metrics + prose only) ──────────
+                    # -- Variance adjustment feedback (metrics + prose only) ----------
                     # The φ value is now embedded in the density chart title, so no
                     # separate Plotly chart is needed here.
                     if rf < 1.0:
@@ -1776,7 +1776,7 @@ def run():
                         st.success(
                             f"**Variance Adjustment:** Your historical conversion rate is more stable "
                             f"than pure binomial sampling predicts (φ = {rf:.2f}). "
-                            f"Confidence intervals tightened — equivalent to running the experiment "
+                            f"Confidence intervals tightened - equivalent to running the experiment "
                             f"**{days_saved} days longer** without the adjustment."
                         )
 
@@ -1784,7 +1784,7 @@ def run():
                         pct_inflated = (rf - 1) * 100
                         st.warning(
                             f"⚠️ **Overdispersion detected (φ = {rf:.2f}):** Your historical conversion "
-                            f"rate varies more than binomial theory predicts — likely due to "
+                            f"rate varies more than binomial theory predicts - likely due to "
                             f"campaign bursts, seasonality, or other structural noise. "
                             f"Standard errors have been inflated by {pct_inflated:.1f}% to keep "
                             f"your false positive rate honest. Consider a quieter baseline period."
