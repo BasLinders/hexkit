@@ -1759,7 +1759,6 @@ def run():
                     if rf < 1.0:
                         pct_reduced = (1 - rf) * 100
                         days_saved = calculate_time_savings(rf, test_duration)
-                        st.write("---")
                         col1, col2 = st.columns(2)
                         with col1:
                             st.metric(
