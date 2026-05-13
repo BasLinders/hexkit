@@ -975,7 +975,7 @@ def render_variance_reduction_ui() -> float:
 
     st.info(
         "**How this works:** Upload a daily aggregate export from a comparable "
-        "historical period (e.g. the 4–8 weeks before your experiment). "
+        "historical period (e.g. the 4-8 weeks before your experiment). "
         "We compare the observed day-to-day volatility of your conversion rate "
         "to what pure binomial sampling would predict.\n\n"
         "- If your rate is **more stable** than theory expects -> SE is reduced, "
