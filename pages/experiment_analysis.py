@@ -329,7 +329,6 @@ def get_frequentist_inputs():
             can produce this without a user-level join.
         """)
 
-    # render_variance_reduction_ui() handles its own template download button internally.
     reduction_factor = render_variance_reduction_ui()
 
     st.write("---")
@@ -1131,10 +1130,8 @@ def calculate_time_savings(reduction_factor, days_running) -> float:
     """
     if reduction_factor >= 1.0 or days_running <= 0:
         return 0
-
     total_days_required_without_adjustment = days_running / reduction_factor
     days_saved = total_days_required_without_adjustment - days_running
-
     return round(days_saved, 1)
 
 
@@ -1174,17 +1171,6 @@ def calculate_frequentist_statistics(
     tail,
     reduction_factor=1.0
 ) -> Dict[str, Any]:
-    """
-    Calculates frequentist z-test statistics with optional variance adjustment.
-
-    The reduction_factor parameter scales the standard error:
-      - Values < 1.0 shrink the SE  (historically stable conversion rate)
-      - Values > 1.0 inflate the SE (overdispersion detected in historical data)
-      - Value of 1.0 applies no adjustment (default, binomial assumption)
-
-    This factor is computed externally by calculate_timeseries_reduction_factor()
-    and passed in; this function does not assume any particular source for it.
-    """
     if sum(visitor_counts) == 0 or any(v < 0 for v in visitor_counts):
         raise ValueError("Visitor counts must be positive and sum to a non-zero value.")
 
@@ -1225,7 +1211,6 @@ def calculate_frequentist_statistics(
 
     pooled_proportion = sum(conversion_counts) / sum(visitor_counts)
 
-    # Unpooled variance preserves the variance adjustment in the z-statistic
     z_stats = [
         (conversion_rates[i] - conversion_rates[0]) / np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
         if (standard_errors[i]**2 + standard_errors[0]**2) > 0 else 0
@@ -1262,8 +1247,6 @@ def calculate_frequentist_statistics(
 
     else:
         if reduction_factor != 1.0:
-            # Bootstrap power is not compatible with a scaled SE; fall back to
-            # the analytical method which correctly incorporates the adjustment.
             power_method_used = "Analytical"
             st.warning(
                 "Variance adjustment is active. Bootstrap power estimation is not compatible "
@@ -1344,7 +1327,7 @@ def calculate_frequentist_statistics(
     return results
 
 
-def plot_conversion_distributions(results):
+def plot_conversion_distributions(results, reduction_factor=1.0):
     if not results:
         st.warning("Cannot generate visualization because calculation results are missing.")
         return
@@ -1445,7 +1428,19 @@ def plot_conversion_distributions(results):
 
     ax.set_xlabel('Conversion rate (%)')
     ax.set_ylabel('Probability density')
-    ax.set_title('Comparison of Estimated Conversion Rate Distributions')
+
+    # Build a dynamic title that incorporates the variance adjustment so a
+    # separate Plotly chart is no longer needed to communicate phi.
+    if reduction_factor < 1.0:
+        pct = (1 - reduction_factor) * 100
+        adjustment_note = f" | SE reduced {pct:.1f}% (φ = {reduction_factor:.2f})"
+    elif reduction_factor > 1.0:
+        pct = (reduction_factor - 1) * 100
+        adjustment_note = f" | SE inflated {pct:.1f}% (φ = {reduction_factor:.2f})"
+    else:
+        adjustment_note = ""
+
+    ax.set_title(f'Comparison of Estimated Conversion Rate Distributions{adjustment_note}')
     ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1))
     ax.set_ylim(bottom=0)
     ax.grid(True, which='major', linestyle='--', linewidth=0.5, alpha=0.3)
@@ -1757,18 +1752,13 @@ def run():
                         )
 
                     rf = test_results['reduction_factor']
+
+                    # ── Variance adjustment feedback (metrics + prose only) ──────────
+                    # The φ value is now embedded in the density chart title, so no
+                    # separate Plotly chart is needed here.
                     if rf < 1.0:
-                        st.plotly_chart(
-                            plot_variance_adjusted_comparison(test_results, visitor_counts),
-                            width='stretch'
-                        )
                         pct_reduced = (1 - rf) * 100
-                        st.caption(
-                            f"The curves above are narrowed by {pct_reduced:.1f}% "
-                            "based on historical stability of your conversion rate."
-                        )
                         days_saved = calculate_time_savings(rf, test_duration)
-                        st.write("---")
                         col1, col2 = st.columns(2)
                         with col1:
                             st.metric(
@@ -1801,7 +1791,7 @@ def run():
                         )
 
                     if test_results:
-                        plot_conversion_distributions(test_results)
+                        plot_conversion_distributions(test_results, reduction_factor=rf)
                         display_frequentist_summary(
                             test_results,
                             visitor_counts,
@@ -1813,7 +1803,6 @@ def run():
 
                 except Exception as e:
                     st.error(f"Analysis failed: {e}")
-
 
 if __name__ == "__main__":
     run()
