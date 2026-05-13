@@ -39,7 +39,7 @@ def initialize_session_state():
     st.session_state.setdefault("probability_winner", 80.0)
     st.session_state.setdefault("runtime_days", 0)
 
-# --- Information / documentation --- 
+# --- Information / documentation ---
 def display_dynamic_documentation(analysis_method):
     st.subheader(f"Documentation: {analysis_method}")
 
@@ -52,18 +52,18 @@ def display_dynamic_documentation(analysis_method):
             * **Error Control:** Strictly controls for **Type I Errors** (False Positives) via $p$-values.
             * **Dual-Gate Evaluation:** First, it checks for a traditional superior win ($p < 0.05$). If that isn't met, it automatically pivots to a **Non-Inferiority Test**.
             * **Risk Mitigation:** Specifically designed for feature parity tests or migrations where the primary goal is "Do No Harm."
-            * **Variance-Adjusted Sensitivity:** Uses CUPED to strip out historical noise, allowing for a tighter, more accurate assessment of the difference between variants.
+            * **Variance-Adjusted Sensitivity:** Uses historical daily aggregate data to detect whether your conversion rate is more stable or noisier than pure binomial sampling predicts, allowing for a tighter - or more conservative - assessment of the difference between variants.
             """)
 
         with st.expander("Frequentist: How it works"):
             st.markdown(r"""
             1.  **Metric Calculation:** Calculates the standard conversion rates and uses a $z$-test for proportions.
-            2.  **Standard Error Calculation:** The engine uses an **unpooled standard error** $(SE_{unpooled})$ that incorporates the CUPED reduction factor ($r$):
-                $$SE = \sqrt{\frac{p_c(1-p_c)r}{n_c} + \frac{p_v(1-p_v)r}{n_v}}$$
+            2.  **Standard Error Calculation:** The engine uses an **unpooled standard error** $(SE_{unpooled})$ that incorporates the variance adjustment factor ($\varphi$):
+                $$SE = \sqrt{\frac{p_c(1-p_c)\varphi}{n_c} + \frac{p_v(1-p_v)\varphi}{n_v}}$$
             3.  **Non-Inferiority Z-Score:** We calculate the $Z$-stat by adding the **Non-Inferiority Margin ($\Delta$)** back into the observed difference:
                 $$Z_{NI} = \frac{(CR_v - CR_c) + \Delta}{SE_{unpooled}}$$
             4.  **Lower Bound Estimation:** The engine calculates the lower bound of the difference. If this bound stays above $-\Delta$, the variant is considered "safe."
-            5.  **CUPED Adjustment:** If CSV data is provided, it calculates the **Pearson Correlation ($\rho$)**. It then applies a variance reduction factor of $(1 - \rho^2)$ to the standard error, narrowing your confidence intervals.
+            5.  **Variance Adjustment:** If historical daily data is provided, the observed day-to-day variance of the conversion rate is compared to what pure binomial sampling would predict. The ratio $\varphi = \sigma^2_{observed} / \sigma^2_{binomial}$ is used to scale the standard error, shrinking it when the rate is historically stable ($\varphi < 1$), and inflating it conservatively when overdispersion is present ($\varphi > 1$).
             """)
 
         with st.expander("Frequentist: Interpretation"):
@@ -71,7 +71,7 @@ def display_dynamic_documentation(analysis_method):
             * **p-value (Z-test):** If $p < 0.05$, we reject the null hypothesis. There is less than a 5% chance the observed lift is due to random noise.
             * **Confidence Intervals (CI):** If the CI for the *relative lift* does not cross $0\%$, the result is statistically significant.
             * **P-value (Non-Inferiority):** Tests the null hypothesis that the Variant is worse than the Control by more than the margin. If $p \le \alpha$, we reject the idea that the variant is a "loser" and label it non-inferior.
-            * **Lower Bound of Difference:** Represents the "worst-case scenario" for the variant’s performance. If the bound is $-0.5\%$ and your limit is $-1.0\%$, the test passes.
+            * **Lower Bound of Difference:** Represents the "worst-case scenario" for the variant's performance. If the bound is $-0.5\%$ and your limit is $-1.0\%$, the test passes.
             * **Success Status:** A green success message indicates that while the variant might not be a "winner," it is statistically unlikely to cause a regression beyond your defined tolerance.
             """)
 
@@ -111,7 +111,6 @@ def get_bayesian_inputs():
 
     num_variants = st.session_state.num_variants
 
-    # Ensure that the lists in the session state have the correct length
     for key, default_value in [("visitor_counts", 0), ("conversion_counts", 0), ("aovs", 0.0)]:
         if len(st.session_state[key]) != num_variants:
             current_len = len(st.session_state[key])
@@ -123,7 +122,6 @@ def get_bayesian_inputs():
     alphabet = string.ascii_uppercase
     st.write("---")
 
-    # Create two columns for visitors and conversions
     col1, col2 = st.columns(2)
 
     with col1:
@@ -131,7 +129,6 @@ def get_bayesian_inputs():
     with col2:
         st.write("#### Conversions")
 
-    # Add the input fields for each variant to the respective columns
     for i in range(num_variants):
         with col1:
             st.session_state.visitor_counts[i] = st.number_input(
@@ -149,7 +146,7 @@ def get_bayesian_inputs():
                 key=f"b_conversions_{i}",
                 label_visibility="visible"
             )
-            
+
     st.write("---")
     st.write("#### Average Order Value (€)")
 
@@ -160,7 +157,7 @@ def get_bayesian_inputs():
             value=st.session_state.aovs[i],
             key=f"b_aov_{i}"
         )
-    
+
     st.session_state.aov_cv = st.slider(
         "AOV Variability",
         min_value=0.1, max_value=2.0, step=0.1,
@@ -179,10 +176,10 @@ def get_bayesian_inputs():
         value=st.session_state.probability_winner,
         help="Enter the success rate that determines if your test has a winner."
     )
-    
+
     st.session_state.runtime_days = st.number_input(
         "How many days did your test run?",
-        min_value=0, step=1, 
+        min_value=0, step=1,
         value=st.session_state.runtime_days
     )
 
@@ -190,7 +187,7 @@ def get_bayesian_inputs():
         "Apply a lift prior?",
         help="Express skepticism about large lifts before seeing the data. Recommended for most experiments."
     )
-    
+
     if use_priors:
         st.write("##### Prior Beliefs")
         col1, col2 = st.columns(2)
@@ -207,12 +204,11 @@ def get_bayesian_inputs():
                 index=0,
                 help="How strongly you believe large lifts are implausible. 'Skeptical' resists extreme results; 'uninformative' applies almost no pressure."
             )
-    
-        beta_prior = get_beta_priors()
 
+        beta_prior = get_beta_priors()
         valid_scepticism = cast(Literal["skeptical", "moderate", "uninformative"], raw_skepticism)
         lift_prior = get_lift_prior(expected_lift_pct=expected_lift_pct, skepticism=valid_scepticism)
-    
+
         st.caption(
             f"A **{valid_scepticism}** prior is applied with an expected lift of **{expected_lift_pct:+.1f}%**. "
             f"At your typical sample sizes, this will only meaningfully affect results when the data is ambiguous."
@@ -231,7 +227,8 @@ def get_bayesian_inputs():
         st.session_state.probability_winner,
         st.session_state.runtime_days
     )
-    
+
+
 def get_frequentist_inputs():
     st.session_state.num_variants = st.number_input(
         "How many variants did your experiment have (including control)?",
@@ -274,6 +271,7 @@ def get_frequentist_inputs():
                 value=st.session_state.conversion_counts[i],
                 key=f"f_conversions_{i}"
             )
+
     st.write("---")
     st.session_state.confidence_level = st.number_input(
         "In %, how confident do you want to be in the results?",
@@ -282,97 +280,57 @@ def get_frequentist_inputs():
         help="Set the confidence level for which you want to test (enter 90, 95, etc)."
     )
     st.session_state.test_duration = st.number_input(
-        "How many days has this test been running?", 
-        min_value=1, 
+        "How many days has this test been running?",
+        min_value=1,
         value=st.session_state.get("test_duration", 7),
-        help="Enter the number of days the experiment has been running. This is used to estimate potential time savings from CUPED variance reduction."
+        help="Enter the number of days the experiment has been running. Used to estimate potential time savings from variance adjustment."
     )
 
     st.write("---")
-    st.write("### CUPED Variance Reduction (Optional)")
-    with st.expander("How CUPED works", expanded=False):
-        # Use LaTeX formatting for mathematical expressions
+    st.write("### Variance Adjustment (Optional)")
+    with st.expander("How variance adjustment works", expanded=False):
         st.markdown(r"""
-            ### CUPED (Controlled-experiment Using Pre-Experiment Data)
+            ### Aggregate Time-Series Variance Adjustment
 
-            CUPED is a variance reduction technique that uses historical data to account for pre-existing differences between users. 
-            By identifying how much of a user's behavior is 'typical' for them (based on the correlation between the pre-test and test periods), we can strip away the 'noise.'
+            This tool uses a historical daily aggregate of your conversion data to estimate how
+            stable or noisy your conversion rate truly is, and adjusts the experiment's standard
+            errors accordingly.
 
-            The result: Narrower confidence intervals and the ability to detect smaller effects with the same sample size.
+            Rather than requiring individual user-level data (which demands returning visitors and
+            a complex export), you only need a simple day-by-day summary: total visitors and
+            total conversions per day from a comparable period before the experiment.
 
             **How it works**
-            *HEXKIT* has a CUPED-light implementation (multi-period historical benchmark instead of historical benchmark combined with user-level experiment data) that uses your uploaded historical data to calculate the Pearson correlation coefficient ($\rho^2$) between two time periods. This tells us how consistent your users are over time.
-            We then apply this correlation as a variance adjustment factor to your current experiment results. The Standard Error is adjusted using the formula $$ SE_{adjusted} = \sqrt{\frac{p(1-p)(1-\rho^2)}{n}} $$. This effectively 'shrinks' the probability density curves, removing the portion of variance that was already predictable from pre-experiment behavior.   
+
+            We compare the *observed* day-to-day variance of your historical conversion rate to
+            what pure binomial sampling would predict for the same traffic volumes.
+
+            The dispersion ratio is:
+            $$\varphi = \frac{\sigma^2_{\text{observed}}}{\sigma^2_{\text{binomial}}}$$
+
+            Both variances are weighted by daily visitor volume to avoid small-day distortion.
+
+            - $\varphi < 1$ - your rate is **more stable** than binomial theory predicts.
+              Standard errors are reduced: confidence intervals tighten and you reach
+              significance faster.
+            - $\varphi \approx 1$ - your rate behaves as pure binomial sampling expects.
+              No meaningful adjustment is applied.
+            - $\varphi > 1$ - **overdispersion detected** (e.g. campaign bursts, day-of-week
+              spikes, seasonality). Standard errors are *inflated* conservatively to protect
+              your false positive rate.
+
+            The standard error is scaled as:
+            $$SE_{\text{adjusted}} = \sqrt{\frac{p(1-p)\,\varphi}{n}}$$
+
+            **What to upload**
+
+            A daily aggregate CSV with at least 14 rows (one per day) and three columns:
+            date, visitors, conversions. Any analytics tool (e.g. GA4, Piano, Matomo, your own BI)
+            can produce this without a user-level join.
         """)
-    
-    # Template download
-    template_csv = get_cuped_template()
-    st.download_button(
-        label="Download CSV Template",
-        data=template_csv,
-        file_name="cuped_template.csv",
-        mime="text/csv",
-        help="Use this format: one row per user, with 1 (converted) or 0 (not converted) for two periods."
-    )
 
-    use_cuped = st.checkbox("Apply Variance Reduction via Historical Benchmark")
-    reduction_factor = 1.0 
-        
-    if use_cuped:
-        st.info("""
-            **How this works:** Upload a CSV containing two periods of historical data for the same users. 
-            We will calculate the typical correlation ($\rho$) to adjust your current experiment's variance.
-        """)
-        
-        uploaded_file = st.file_uploader("Upload Historical CSV (e.g., User ID, Pre-Period, Post-Period)", type="csv")
-        
-        if uploaded_file:
-            df_hist = pd.read_csv(uploaded_file)
-            cols = df_hist.columns.tolist()
-            
-            st.write("### Select baseline columns")
-            c1, c2 = st.columns(2)
-            with c1:
-                idx1 = cols.index("period_1") if "period_1" in cols else 0
-                col_pre = st.selectbox("Historical Baseline (Period A)", cols, index=idx1, key="cuped_pre")
-            with c2:
-                idx2 = cols.index("period_2") if "period_2" in cols else 0
-                col_post = st.selectbox("Historical Follow-up (Period B)", cols, index=idx2, key="cuped_post")
-        
-            is_valid, message, overlap_count = check_cuped_validity(df_hist, col_pre, col_post)
-            row_count = len(df_hist)
-
-            if not is_valid:
-                st.warning(message)
-            else:
-                with st.expander("Data Quality & CUPED Reliability", expanded=False):
-                    st.markdown(f"**Users found in both periods:** `{row_count:,}`")
-                    
-                    # Determine status based on row count
-                    if row_count < 500:
-                        status = "**High Risk**"
-                        advice = "Sample size is too small. Correlation may be a 'fluke'. Stick to standard Frequentist results."
-                    elif row_count < 2000:
-                        status = "**Moderate**"
-                        advice = "Reliable if correlation is > 0.3. Double-check if 'Days Saved' makes sense."
-                    else:
-                        status = "**Stable**"
-                        advice = "Excellent sample size. CUPED results are statistically robust."
-
-                    st.markdown(f"""
-                    | Metric | Status / Recommendation |
-                    | :--- | :--- |
-                    | **Reliability** | {status} |
-                    | **Advice** | {advice} |
-                    """)
-
-                    st.info("**Note:** CUPED effectiveness depends on 'Returning Users'. If your business has low repeat-visit rates, variance reduction will naturally be limited.")
-
-                reduction_factor, corr = calculate_cuped_reduction_factor(df_hist, col_pre, col_post)
-            
-                st.info(f"**Correlation Found:** {corr:.2f}")
-                st.metric("New Variance Level", f"{(reduction_factor * 100):.1f}%", 
-                        delta=f"-{((1 - reduction_factor) * 100):.1f}% Noise", delta_color="normal")
+    # render_variance_reduction_ui() handles its own template download button internally.
+    reduction_factor = render_variance_reduction_ui()
 
     st.write("---")
     st.write("### False Positive / Negative Risk")
@@ -404,30 +362,26 @@ def get_frequentist_inputs():
             "Custom prior probability P(H1)",
             min_value=0.0, max_value=1.0, step=0.01, value=0.5
         )
-        
+
     return (
-        st.session_state.visitor_counts, 
-        st.session_state.conversion_counts, 
-        st.session_state.confidence_level, 
+        st.session_state.visitor_counts,
+        st.session_state.conversion_counts,
+        st.session_state.confidence_level,
         reduction_factor,
         st.session_state.test_duration,
         sensitivity_mode,
         custom_prior
-        )
+    )
 
-def validate_inputs(
-    visitors, 
-    conversions, 
-    aovs=None
-) -> bool:
-    
+
+def validate_inputs(visitors, conversions, aovs=None) -> bool:
     visitors_list = visitors if isinstance(visitors, list) else [visitors]
     conversions_list = conversions if isinstance(conversions, list) else [conversions]
-    
+
     aovs_list = []
     if aovs is not None:
         aovs_list = aovs if isinstance(aovs, list) else [aovs]
-    
+
     for i in range(len(visitors_list)):
         v = visitors_list[i]
         c = conversions_list[i]
@@ -442,13 +396,13 @@ def validate_inputs(
         if c > v:
             st.error(f"Error for Variant {variant_name}: The amount of conversions ({c}) cannot exceed the amount of visitors ({v}).")
             return False
-        
+
         if aovs_list and i < len(aovs_list):
             a = aovs_list[i]
             if not isinstance(a, (int, float)) or a < 0:
                 st.error(f"Error for Variant {variant_name}: AOV must be a non-negative number.")
                 return False
-            
+
     return True
 
 
@@ -458,7 +412,7 @@ def validate_inputs(
 class BetaPrior:
     alpha: float
     beta: float
-    
+
 @dataclass(frozen=True)
 class LiftPrior:
     mean_log_lift: float
@@ -479,21 +433,18 @@ def calculate_probabilities(
     seed: int = 42,
 ) -> Tuple[List[float], np.ndarray]:
     rng = np.random.default_rng(seed=seed)
-
     num_variants = len(visitor_counts)
 
     all_samples = []
     for i in range(num_variants):
         alpha_post = beta_prior.alpha + conversion_counts[i]
-        beta_post = beta_prior.beta  + (visitor_counts[i] - conversion_counts[i])
+        beta_post = beta_prior.beta + (visitor_counts[i] - conversion_counts[i])
         samples = rng.beta(alpha_post, beta_post, size=num_samples)
         all_samples.append(samples)
 
-    samples_matrix = np.array(all_samples)  # shape: (num_variants, num_samples)
-
-    # Apply lift prior weights relative to control for each challenger,
-    # then average across challengers to get a single weight per sample
+    samples_matrix = np.array(all_samples)
     control_samples = samples_matrix[0]
+
     if num_variants > 1:
         per_challenger_weights = np.array([
             compute_lift_weights(control_samples, samples_matrix[i], lift_prior)
@@ -505,7 +456,6 @@ def calculate_probabilities(
         weights = np.ones(num_samples) / num_samples
 
     best_variant_indices = np.argmax(samples_matrix, axis=0)
-
     probabilities_to_be_best = [
         np.average(best_variant_indices == i, weights=weights)
         for i in range(num_variants)
@@ -513,12 +463,14 @@ def calculate_probabilities(
 
     return probabilities_to_be_best, samples_matrix
 
+
 def get_beta_priors() -> BetaPrior:
     """
-    Returns a fixed uninformative prior. At your sample sizes the data
+    Returns a fixed uninformative prior. At typical sample sizes the data
     dominates regardless; beliefs about lift are expressed via get_lift_prior.
     """
     return BetaPrior(alpha=1.0, beta=1.0)
+
 
 def get_lift_prior(
     expected_lift_pct: float,
@@ -536,6 +488,7 @@ def get_lift_prior(
         std_log_lift=_LIFT_PRIOR_STD[skepticism],
     )
 
+
 def compute_lift_weights(
     cr_samples_control: np.ndarray,
     cr_samples_challenger: np.ndarray,
@@ -546,25 +499,25 @@ def compute_lift_weights(
     w = np.exp(log_w - log_w.max())
     return w / w.sum()
 
+
 def simulate_uplift_distributions(
-    visitor_counts, 
-    conversion_counts, 
+    visitor_counts,
+    conversion_counts,
     beta_prior: BetaPrior,
     lift_prior: LiftPrior,
-    num_samples: int = 20000, 
-    seed: int = 42
+    num_samples: int = 20000,
+    seed: int = 42,
 ) -> List[np.ndarray]:
-    
     rng = np.random.default_rng(seed=seed)
     num_variants = len(visitor_counts)
 
     all_samples = []
     for i in range(num_variants):
         alpha_post = beta_prior.alpha + conversion_counts[i]
-        beta_post  = beta_prior.beta  + (visitor_counts[i] - conversion_counts[i])
+        beta_post = beta_prior.beta + (visitor_counts[i] - conversion_counts[i])
         all_samples.append(rng.beta(alpha_post, beta_post, size=num_samples))
 
-    samples_matrix  = np.array(all_samples)
+    samples_matrix = np.array(all_samples)
     control_samples = samples_matrix[0]
 
     uplift_distributions = []
@@ -572,36 +525,31 @@ def simulate_uplift_distributions(
         challenger_samples = samples_matrix[i]
         weights = compute_lift_weights(control_samples, challenger_samples, lift_prior)
         uplift = (challenger_samples - control_samples) / (control_samples + 1e-9)
-
-        # Resample using importance weights so the returned distribution already reflects the prior
         resampled_indices = rng.choice(num_samples, size=num_samples, p=weights)
         uplift_distributions.append(uplift[resampled_indices])
 
     return uplift_distributions
-    
-def plot_uplift_histograms(
-    uplift_distributions, 
-    observed_uplifts
-):
+
+
+def plot_uplift_histograms(uplift_distributions, observed_uplifts):
     num_challengers = len(uplift_distributions)
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
     fig, axes = plt.subplots(
-        nrows=num_challengers, 
-        ncols=1, 
-        figsize=(14, 8 * num_challengers), 
+        nrows=num_challengers,
+        ncols=1,
+        figsize=(14, 8 * num_challengers),
         squeeze=False
     )
     axes = axes.flatten()
 
     for i, ax in enumerate(axes):
         diffs_percentage = uplift_distributions[i] * 100
-        # Ensure observed_uplift is a float, not an array
-        observed_uplift = float(observed_uplifts[i] * 100) 
-        
+        observed_uplift = float(observed_uplifts[i] * 100)
+
         challenger_label = alphabet[i + 1]
         control_label = alphabet[0]
-        
+
         def calculate_optimal_bins(data):
             n = len(data)
             iqr = np.percentile(data, 75) - np.percentile(data, 25)
@@ -611,10 +559,8 @@ def plot_uplift_histograms(
             return min(int(np.ceil((np.max(data) - np.min(data)) / bin_width_fd)), 200)
 
         num_bins = calculate_optimal_bins(diffs_percentage)
-        
         n, bins, patches = ax.hist(diffs_percentage, bins=num_bins, edgecolor='black', alpha=0.6)
-        
-        # Color logic
+
         for patch in patches:
             if patch.get_x() < 0:
                 patch.set_facecolor('lightcoral')
@@ -626,39 +572,36 @@ def plot_uplift_histograms(
         range_min, range_max = mean_diff - 3.5 * std_diff, mean_diff + 3.5 * std_diff
         ax.set_xlim(range_min, range_max)
 
-        # 2. TICK FORMATTING
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f'{x:.2f}%'))
         plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
 
         line_label = f'Observed Uplift ({challenger_label} vs {control_label}): {observed_uplift:.2f}%'
-        
-        # 3. AXVLINE
         line_observed_uplift = ax.axvline(x=observed_uplift, color='red', linestyle='--', linewidth=2, label=line_label)
-        
+
         patch_a = mpatches.Patch(color='lightcoral', label=f'{control_label} is better')
         patch_b = mpatches.Patch(color='lightgreen', label=f'{challenger_label} is better')
-        
+
         ax.set_title(f'Distribution of Simulated Uplift: Variant {challenger_label} vs. Variant {control_label}')
         ax.set_xlabel('Percentage Uplift in Conversion Rate (%)')
         ax.set_ylabel('Frequency')
         ax.legend(handles=[line_observed_uplift, patch_a, patch_b])
         ax.grid(True, linestyle='--', alpha=0.6)
 
-    fig.tight_layout(pad=3.0, rect=(0, 0, 1, 1)) 
+    fig.tight_layout(pad=3.0, rect=(0, 0, 1, 1))
     st.pyplot(fig)
     plt.close(fig)
 
+
 def plot_winner_probabilities_chart(probabilities_to_be_best):
     num_variants = len(probabilities_to_be_best)
-    
     alphabet = string.ascii_uppercase
     variant_labels = [f"Variant {alphabet[i]}" for i in range(num_variants)]
-    cmap = colormaps['viridis'] 
+    cmap = colormaps['viridis']
     colors = cmap(np.linspace(0, 1, num_variants))
-    
+
     fig_height = 2 + num_variants * 0.8
     fig, ax = plt.subplots(figsize=(10, fig_height))
-    
+
     ax.barh(variant_labels, probabilities_to_be_best, color=colors, edgecolor='black', alpha=0.8)
     ax.set_xlabel('Chance for Variants to be the Best')
     ax.set_title('Chance per Variant to generate the most Conversions')
@@ -666,31 +609,24 @@ def plot_winner_probabilities_chart(probabilities_to_be_best):
     ax.invert_yaxis()
 
     def get_contrast_color(rgb):
-        # Convert RGB to perceived luminance (WCAG formula)
         r, g, b = rgb[:3]
         luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
         return 'black' if luminance > 0.5 else 'white'
 
     for index, (value, color) in enumerate(zip(probabilities_to_be_best, colors)):
         text_color = get_contrast_color(color)
-        
         if value > 0.9:
-            ax.text(value - 0.02, index, f"{value:.2%}", ha='right', va='center', 
+            ax.text(value - 0.02, index, f"{value:.2%}", ha='right', va='center',
                     color=text_color, fontweight='bold', fontsize=12)
         else:
             ax.text(value + 0.01, index, f"{value:.2%}",
-                    ha='left', va='center', 
-                    color='black', fontsize=11)
+                    ha='left', va='center', color='black', fontsize=11)
 
     st.pyplot(fig)
     plt.close(fig)
 
-def sample_aov(
-    mean_aov: float, 
-    cv: float, 
-    n_samples: int, 
-    rng: np.random.Generator
-) -> np.ndarray:
+
+def sample_aov(mean_aov: float, cv: float, n_samples: int, rng: np.random.Generator) -> np.ndarray:
     """
     Draw AOV samples from a log-normal distribution with the given mean
     and coefficient of variation (CV = std / mean).
@@ -701,22 +637,22 @@ def sample_aov(
     Typical CV for e-commerce AOV: 0.5 (stable catalogue) to 1.5 (wide price range).
     """
     sigma2 = np.log1p(cv ** 2)
-    mu     = np.log(mean_aov) - sigma2 / 2
+    mu = np.log(mean_aov) - sigma2 / 2
     return rng.lognormal(mean=mu, sigma=np.sqrt(sigma2), size=n_samples)
-    
+
+
 def perform_multi_variant_risk_assessment(
-    visitor_counts, 
-    conversion_counts, 
-    aovs, 
+    visitor_counts,
+    conversion_counts,
+    aovs,
     probabilities_to_be_best,
-    runtime_days, 
-    beta_prior: BetaPrior, 
+    runtime_days,
+    beta_prior: BetaPrior,
     lift_prior: LiftPrior,
-    aov_cv: float = 0.5, 
-    projection_period: int = 183, 
+    aov_cv: float = 0.5,
+    projection_period: int = 183,
     seed: int = 42,
 ) -> pd.DataFrame:
-
     rng = np.random.default_rng(seed)
     num_variants = len(visitor_counts)
     if runtime_days == 0:
@@ -728,13 +664,13 @@ def perform_multi_variant_risk_assessment(
 
     for i in range(num_variants):
         alpha_post = beta_prior.alpha + conversion_counts[i]
-        beta_post  = beta_prior.beta  + (visitor_counts[i] - conversion_counts[i])
+        beta_post = beta_prior.beta + (visitor_counts[i] - conversion_counts[i])
         samples_cr = rng.beta(alpha_post, beta_post, size=n_simulations)
         cr_samples.append(samples_cr)
         all_daily_conversion_samples.append((samples_cr * visitor_counts[i]) / runtime_days)
 
     control_samples = all_daily_conversion_samples[0]
-    control_cr = cr_samples[0]  # was undefined
+    control_cr = cr_samples[0]
 
     results = []
     for i in range(1, num_variants):
@@ -782,15 +718,15 @@ def perform_multi_variant_risk_assessment(
         ])
     return pd.DataFrame(results)
 
+
 def display_results_per_variant(
-    probabilities_to_be_best, 
-    observed_uplifts, 
+    probabilities_to_be_best,
+    observed_uplifts,
     probability_winner,
-    aovs, 
-    runtime_days, 
+    aovs,
+    runtime_days,
     df=None
 ):
-
     num_variants = len(probabilities_to_be_best)
     alphabet = string.ascii_uppercase
 
@@ -800,9 +736,8 @@ def display_results_per_variant(
     for i in range(1, num_variants):
         challenger_index = i
         control_index = 0
-        
+
         challenger_label = alphabet[challenger_index]
-        
         probability_challenger_better = probabilities_to_be_best[challenger_index]
         probability_control_better = probabilities_to_be_best[control_index]
         observed_uplift_challenger = observed_uplifts[i - 1] * 100
@@ -813,14 +748,14 @@ def display_results_per_variant(
             bayesian_result = "a <span style='color: red; font-weight: bold;'>loss averted</span>"
         else:
             bayesian_result = "<span style='color: black; font-weight: bold;'>inconclusive</span>. There is no real effect to be found, or you need to collect more data"
-        
+
         st.write(f"#### Variant {challenger_label} vs Control (A)")
         st.markdown(
             f"Variant {challenger_label} has a {round(probability_challenger_better * 100, 2)}% chance to win with a relative change of {round(observed_uplift_challenger, 2)}%. "
             f"Because your winning threshold was set to {int(probability_winner)}%, this experiment is {bayesian_result}.",
             unsafe_allow_html=True
         )
-        
+
         if num_variants > 2:
             st.write("---")
 
@@ -882,69 +817,265 @@ def display_results_per_variant(
 
 # -- Frequentist helper functions --
 
-def calculate_cuped_reduction_factor(
-    df, 
-    period_1_col, 
-    period_2_col
-) -> Tuple[float, float]:
-    """
-    Calculates the reduction factor based on historical user consistency.
-    period_1_col: e.g., 'purchases_jan'
-    period_2_col: e.g., 'purchases_feb'
-    """
-    try:
-        # Calculate Pearson correlation between two historical periods
-        correlation = df[period_1_col].corr(df[period_2_col])
-        
-        # CUPED variance reduction factor is (1 - rho^2)
-        reduction_factor = max(0.0, 1.0 - (correlation**2))
-        
-        return reduction_factor, correlation
-    except Exception as e:
-        st.error(f"Error calculating historical correlation: {e}")
-        return 1.0, 0.0
+# ─────────────────────────────────────────────────────────────────────────────
+# AGGREGATE TIME-SERIES VARIANCE ADJUSTMENT
+#
+# Core idea:
+#   The standard frequentist test assumes binomial variance p*(1-p)/n.
+#   We compare the *observed* day-to-day variance of the historical conversion
+#   rate against what pure binomial sampling would predict.
+#
+#   Dispersion φ = observed_variance / expected_binomial_variance
+#     φ < 1  ->  the rate is MORE stable than binomial theory assumes
+#               -> SE is defensibly shrunk -> reduction_factor = φ
+#     φ ≈ 1  ->  binomial assumption is accurate -> no adjustment
+#     φ > 1  ->  the rate is NOISIER than binomial -> SE is inflated (conservative)
+#               -> reduction_factor = φ, shown as a WARNING in the UI
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Simple visual representation of a cuped template
-def get_cuped_template() -> str:
-    # Create a simple dummy dataframe
+def get_timeseries_template() -> str:
+    """
+    Returns a minimal CSV template: one row per day with total visitors
+    and total conversions. Easily exported from any analytics tool without
+    requiring a user-level join across periods.
+    """
     template_df = pd.DataFrame({
-        "user_id": ["user_1", "user_2", "user_3", "user_4"],
-        "historical_period_1": [1, 0, 1, 0],
-        "historical_period_2": [1, 1, 0, 0]
+        "date": pd.date_range("2024-01-01", periods=14).strftime("%Y-%m-%d"),
+        "visitors": [1200, 980, 1100, 1350, 900, 800, 1050,
+                    1180, 1020, 1090, 1300, 950, 820, 1070],
+        "conversions": [48, 39, 44, 54, 36, 32, 42,
+                        47, 41, 43, 52, 38, 33, 43],
     })
-    
-    # Convert to CSV buffer
     buffer = io.StringIO()
     template_df.to_csv(buffer, index=False)
     return buffer.getvalue()
 
-def calculate_time_savings(
-    reduction_factor, 
-    days_running
-) -> float:
-    """
-    Estimates how much longer the test would have needed to run
-    to achieve the same precision without CUPED.
-    """
-    if reduction_factor >= 1.0 or days_running <= 0:
-        return 0
-    
-    # Without CUPED, required N is N_current / reduction_factor
-    # Therefore, time required is Days / reduction_factor
-    total_days_required_without_cuped = days_running / reduction_factor
-    days_saved = total_days_required_without_cuped - days_running
-    
-    return round(days_saved, 1)
 
-def plot_cuped_comparison(
-    results, 
-    visitor_counts
-) -> go.Figure:
+def validate_timeseries_data(
+    df: pd.DataFrame,
+    visitors_col: str,
+    conversions_col: str,
+) -> Tuple[bool, str, int]:
+    """
+    Validates uploaded aggregate time-series data before computing the
+    dispersion ratio.
+
+    Returns:
+        is_valid bool - whether the data passes all checks
+        message str - human-readable status or error description
+        n_periods int - number of rows (days) in the upload
+    """
+    n_periods = len(df)
+
+    if n_periods < 14:
+        return (
+            False,
+            f"Too few periods ({n_periods} rows). At least 14 days are needed "
+            "for a reliable dispersion estimate.",
+            n_periods,
+        )
+
+    if (df[visitors_col] <= 0).any():
+        return False, "Some rows have zero or negative visitor counts.", n_periods
+
+    if (df[conversions_col] < 0).any():
+        return False, "Conversion column contains negative values.", n_periods
+
+    if (df[conversions_col] > df[visitors_col]).any():
+        return (
+            False,
+            "Some rows show more conversions than visitors — check your column mapping.",
+            n_periods,
+        )
+
+    rates = df[conversions_col] / df[visitors_col]
+    if rates.std() == 0:
+        return False, "Conversion rate is identical across all periods (zero variance).", n_periods
+
+    return True, "Data quality looks good.", n_periods
+
+
+def calculate_timeseries_reduction_factor(
+    df: pd.DataFrame,
+    visitors_col: str,
+    conversions_col: str,
+) -> Tuple[float, float, str]:
+    """
+    Estimates a variance scaling factor (φ) from aggregate historical
+    time-series data.
+
+    Method:
+      1. Compute the visitor-weighted observed variance of daily conversion rates.
+      2. Compute the expected binomial variance for the same days (p*(1-p)/n),
+         again visitor-weighted to prevent small-traffic days from dominating.
+      3. φ = observed / expected.
+         φ < 1 -> stable process, SE is shrunk.
+         φ > 1 -> overdispersed process, SE is inflated (conservative).
+         φ = 1 -> no adjustment.
+
+    Returns:
+        reduction_factor float - multiply variance by this; <1 shrinks, >1 inflates
+        phi float - raw dispersion ratio (shown to the user)
+        regime str - 'stable' | 'neutral' | 'noisy' | 'high_noise'
+    """
+    visitors = df[visitors_col].astype(float)
+    conversions = df[conversions_col].astype(float)
+    rates = conversions / visitors
+
+    weights = visitors / visitors.sum()
+    weighted_mean = (rates * weights).sum()
+
+    observed_var = (weights * (rates - weighted_mean) ** 2).sum()
+    expected_binomial_var = (weights * rates * (1 - rates) / visitors).sum()
+
+    if expected_binomial_var == 0:
+        return 1.0, 1.0, "neutral"
+
+    phi = observed_var / expected_binomial_var
+    reduction_factor = float(np.clip(phi, 0.10, None))
+
+    if phi < 0.80:
+        regime = "stable"
+    elif phi < 1.05:
+        regime = "neutral"
+    elif phi < 1.50:
+        regime = "noisy"
+    else:
+        regime = "high_noise"
+
+    return reduction_factor, phi, regime
+
+
+def render_variance_reduction_ui() -> float:
+    """
+    Renders the variance adjustment section and returns a reduction_factor
+    to be passed into calculate_frequentist_statistics().
+
+    reduction_factor < 1.0 -> SE shrunk (process more stable than binomial)
+    reduction_factor = 1.0 -> no adjustment
+    reduction_factor > 1.0 -> SE inflated (overdispersion detected)
+    """
+    template_csv = get_timeseries_template()
+    st.download_button(
+        label="Download CSV Template",
+        data=template_csv,
+        file_name="timeseries_template.csv",
+        mime="text/csv",
+        help=(
+            "One row per day: date, visitors, conversions. "
+            "Export this from GA4, Piano, or any BI tool; "
+            "no user-level join required."
+        ),
+    )
+
+    use_vr = st.checkbox("Apply Variance Adjustment via Historical Benchmark")
+    reduction_factor = 1.0
+
+    if not use_vr:
+        return reduction_factor
+
+    st.info(
+        "**How this works:** Upload a daily aggregate export from a comparable "
+        "historical period (e.g. the 4–8 weeks before your experiment). "
+        "We compare the observed day-to-day volatility of your conversion rate "
+        "to what pure binomial sampling would predict.\n\n"
+        "- If your rate is **more stable** than theory expects -> SE is reduced, "
+        "reaching significance faster.\n"
+        "- If your rate is **noisier** (e.g. campaign bursts, seasonality) -> "
+        "SE is conservatively inflated, protecting against false positives."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload Historical Daily Aggregate CSV",
+        type="csv",
+        help="Columns required: a date column, a visitors column, a conversions column.",
+    )
+
+    if not uploaded_file:
+        return reduction_factor
+
+    df_hist = pd.read_csv(uploaded_file)
+    cols = df_hist.columns.tolist()
+
+    st.write("### Map your columns")
+    c1, c2 = st.columns(2)
+    with c1:
+        default_visitors = next(
+            (i for i, c in enumerate(cols) if "visit" in c.lower() or "session" in c.lower()), 0
+        )
+        visitors_col = st.selectbox("Visitors column", cols, index=default_visitors, key="ts_visitors")
+    with c2:
+        default_conv = next(
+            (i for i, c in enumerate(cols) if "conv" in c.lower() or "purchas" in c.lower()), 0
+        )
+        conversions_col = st.selectbox("Conversions column", cols, index=default_conv, key="ts_conversions")
+
+    is_valid, message, n_periods = validate_timeseries_data(df_hist, visitors_col, conversions_col)
+
+    if not is_valid:
+        st.warning(message)
+        return reduction_factor
+
+    reduction_factor, phi, regime = calculate_timeseries_reduction_factor(
+        df_hist, visitors_col, conversions_col
+    )
+
+    with st.expander("Data Quality & Variance Adjustment Details", expanded=False):
+        regime_labels = {
+            "stable": ("**Stable**", "green", "Your conversion rate is more consistent than binomial theory predicts. SE will be reduced."),
+            "neutral": ("**Neutral**", "blue", "Your conversion rate behaves close to the binomial assumption. Little adjustment applied."),
+            "noisy": ("**Noisy**", "orange", "Extra day-to-day volatility detected (campaigns? seasonality?). SE is conservatively inflated."),
+            "high_noise": ("**High Noise**","red", "Strong overdispersion. SE inflated substantially. Consider a longer or calmer baseline period."),
+        }
+        label, color, advice = regime_labels[regime]
+
+        st.markdown(f"""
+        | Metric | Value |
+        | :--- | :--- |
+        | **Historical periods** | {n_periods} days |
+        | **Dispersion φ** | `{phi:.3f}` |
+        | **Process regime** | {label} |
+        | **Advice** | {advice} |
+        """)
+
+        st.caption(
+            "φ = observed day-to-day variance ÷ expected binomial variance. "
+            "φ < 1 enables SE reduction; φ > 1 triggers conservative inflation."
+        )
+
+    if regime in ("stable", "neutral"):
+        pct_change = (1 - reduction_factor) * 100
+        st.success(f"**φ = {phi:.2f}**: process is stable.")
+        st.metric(
+            "Variance Adjustment",
+            f"{pct_change:.1f}% reduction",
+            delta=f"-{pct_change:.1f}% noise",
+            delta_color="normal",
+        )
+    else:
+        pct_inflation = (reduction_factor - 1) * 100
+        st.warning(
+            f"**φ = {phi:.2f}**: overdispersion detected. "
+            f"SE inflated by {pct_inflation:.1f}% to protect against false positives."
+        )
+        st.metric(
+            "Variance Adjustment",
+            f"+{pct_inflation:.1f}% (conservative inflation)",
+            delta=f"+{pct_inflation:.1f}% caution added",
+            delta_color="inverse",
+        )
+
+    return reduction_factor
+
+
+def plot_variance_adjusted_comparison(results, visitor_counts) -> go.Figure:
+    """
+    Plots the probability density curves for each variant after variance
+    adjustment. The title reflects the direction of adjustment (reduction
+    or inflation) based on the dispersion ratio φ.
+    """
     fig = go.Figure()
-    
-    # Generate a range of x-values (conversion rates) for the plot
-    # x_min = max(0, results['lowest boundary'] - 0.05)
-    # x_max = min(1, results['highest boundary'] + 0.05)
+
     all_means = np.array(results['conversion_rates'])
     all_ses = np.array(results['standard_errors'])
     reach = 4 * np.maximum(all_ses, 1e-9)
@@ -960,54 +1091,57 @@ def plot_cuped_comparison(
     for i in range(results['num_variants']):
         cr = results['conversion_rates'][i]
         se = results['standard_errors'][i]
-        
-        # Calculate the Probability Density Function
         y = norm.pdf(x, cr, se)
-        
         label = f"Variant {alphabet[i]} (Control)" if i == 0 else f"Variant {alphabet[i]}"
-        
+
         fig.add_trace(go.Scatter(
             x=x, y=y,
             mode='lines',
             name=label,
             line=dict(color=colors[i % len(colors)], width=3),
-            fill='tozeroy' # Fills the Area Under the Curve
+            fill='tozeroy'
         ))
 
+    rf = results['reduction_factor']
+    if rf < 1.0:
+        adjustment_label = f"SE Reduced by {(1 - rf) * 100:.1f}% (φ = {rf:.2f})"
+    elif rf > 1.0:
+        adjustment_label = f"SE Inflated by {(rf - 1) * 100:.1f}% (φ = {rf:.2f})"
+    else:
+        adjustment_label = "No Variance Adjustment Applied"
+
     fig.update_layout(
-        title=f"Probability Density (CUPED Reduction: {(1-results['reduction_factor'])*100:.1f}%)",
+        title=f"Probability Density — Variance Adjustment: {adjustment_label}",
         xaxis_title="Conversion Rate",
         yaxis_title="Probability Density",
         template="plotly_white",
         hovermode="x unified"
     )
-    
+
     return fig
 
-def check_cuped_validity(df, col1, col2) -> Tuple[bool, str, int]:
-    # Drop rows where either period is missing to find the 'Returning User' count
-    overlap_df = df.dropna(subset=[col1, col2])
-    overlap_count = len(overlap_df)
-    total_users = len(df)
-    
-    if overlap_count < 100:
-        return False, f"Critically low overlap ({overlap_count} users). Need at least 100 returning users.", overlap_count
-    
-    # Check if there is actual variance (don't want all 0s)
-    if overlap_df[col1].std() == 0 or overlap_df[col2].std() == 0:
-        return False, "One of the columns has zero variance (all values are the same).", overlap_count
-        
-    return True, "Data quality looks good.", overlap_count
-    
-def display_ci_chart(
-    results, 
-    current_variant_idx, 
-    alphabet
-) -> alt.LayerChart:
-    # Prepare data for Control (0) and the current Variant (i)
+
+def calculate_time_savings(reduction_factor, days_running) -> float:
+    """
+    Estimates how many additional days would have been needed to achieve
+    the same precision without variance adjustment.
+
+    Only meaningful when reduction_factor < 1.0 (i.e. SE was shrunk).
+    Returns 0 for neutral or inflated cases.
+    """
+    if reduction_factor >= 1.0 or days_running <= 0:
+        return 0
+
+    total_days_required_without_adjustment = days_running / reduction_factor
+    days_saved = total_days_required_without_adjustment - days_running
+
+    return round(days_saved, 1)
+
+
+def display_ci_chart(results, current_variant_idx, alphabet) -> alt.LayerChart:
     indices = [0, current_variant_idx]
     names = [f"({alphabet[0]}) Control", f"({alphabet[current_variant_idx]}) Challenger"]
-    
+
     data = pd.DataFrame({
         'Variant': names,
         'CR': [results['conversion_rates'][i] * 100 for i in indices],
@@ -1015,7 +1149,6 @@ def display_ci_chart(
         'Upper': [results['confidence_intervals'][i][1] * 100 for i in indices]
     })
 
-    # 1. Create the points (Means)
     points = alt.Chart(data).mark_point(
         filled=True, size=100, color='#009900'
     ).encode(
@@ -1024,42 +1157,48 @@ def display_ci_chart(
         tooltip=['Variant', alt.Tooltip('CR:Q', format='.2f')]
     )
 
-    # 2. Create the ranges (Confidence Intervals)
     error_bars = alt.Chart(data).mark_errorbar(thickness=3, color='#b7e1cd').encode(
         x='Lower:Q',
         x2='Upper:Q',
         y='Variant:N'
     )
 
-    # Layer them and display
     chart = (error_bars + points).properties(width='container', height=150)
     return chart
 
+
 def calculate_frequentist_statistics(
-    visitor_counts, 
-    conversion_counts, 
-    confidence_level, 
-    tail, 
+    visitor_counts,
+    conversion_counts,
+    confidence_level,
+    tail,
     reduction_factor=1.0
 ) -> Dict[str, Any]:
-    # --- Input Validation & Setup ---
+    """
+    Calculates frequentist z-test statistics with optional variance adjustment.
+
+    The reduction_factor parameter scales the standard error:
+      - Values < 1.0 shrink the SE  (historically stable conversion rate)
+      - Values > 1.0 inflate the SE (overdispersion detected in historical data)
+      - Value of 1.0 applies no adjustment (default, binomial assumption)
+
+    This factor is computed externally by calculate_timeseries_reduction_factor()
+    and passed in; this function does not assume any particular source for it.
+    """
     if sum(visitor_counts) == 0 or any(v < 0 for v in visitor_counts):
         raise ValueError("Visitor counts must be positive and sum to a non-zero value.")
-    
+
     num_variants = len(visitor_counts)
     alpha = 1 - (confidence_level / 100)
-    
-    # Šídák correction
+
     sidak_alpha = 1 - (1 - alpha)**(1 / (num_variants - 1)) if num_variants > 2 else alpha
 
-    # --- Core calculations ---
     conversion_rates = [c / v if v > 0 else 0 for c, v in zip(conversion_counts, visitor_counts)]
     standard_errors = [
-        np.sqrt(cr * (1 - cr) * reduction_factor / v) if v > 0 else 0 
+        np.sqrt(cr * (1 - cr) * reduction_factor / v) if v > 0 else 0
         for cr, v in zip(conversion_rates, visitor_counts)
     ]
 
-    # Confidence interval calculation for conversion rates
     z_critical = norm.ppf(1 - (alpha / 2))
     margins_of_error = [z_critical * se for se in standard_errors]
     confidence_intervals = [
@@ -1069,54 +1208,39 @@ def calculate_frequentist_statistics(
 
     lower_boundaries = [interval[0] for interval in confidence_intervals]
     upper_boundaries = [interval[1] for interval in confidence_intervals]
-
     lowest_interval = min(lower_boundaries)
     highest_interval = max(upper_boundaries)
-    
 
-    # Confidence interval for the difference
     confidence_intervals_diff = []
-
     for i in range(1, num_variants):
         diff_cr = conversion_rates[i] - conversion_rates[0]
         se_diff = np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
         moe_diff = z_critical * se_diff
-        
-        # Confidence interval for the difference
         ci_diff = (diff_cr - moe_diff, diff_cr + moe_diff)
         confidence_intervals_diff.append(ci_diff)
 
-    # SRM Check
     observed = np.array(visitor_counts)
     expected = np.array([sum(observed) / num_variants] * num_variants)
     _, srm_p_value = chisquare(f_obs=observed, f_exp=expected)
-    
-    # Z-statistics
-    pooled_proportion = sum(conversion_counts) / sum(visitor_counts)
-    # se_pooled_list = [np.sqrt(pooled_proportion * (1 - pooled_proportion) / v) if v > 0 else 0 for v in visitor_counts]
-    #z_stats = [
-    #    (conversion_rates[i] - conversion_rates[0]) / np.sqrt(se_pooled_list[i]**2 + se_pooled_list[0]**2) if (se_pooled_list[i]**2 + se_pooled_list[0]**2) > 0 else 0
-    #    for i in range(1, num_variants)
-    #]
 
-    # Unpooled variance approach to maintain CUPED reduction integrity
+    pooled_proportion = sum(conversion_counts) / sum(visitor_counts)
+
+    # Unpooled variance preserves the variance adjustment in the z-statistic
     z_stats = [
         (conversion_rates[i] - conversion_rates[0]) / np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
         if (standard_errors[i]**2 + standard_errors[0]**2) > 0 else 0
         for i in range(1, num_variants)
     ]
 
-    # P-values
     if tail == 'Greater':
         p_values = [1 - norm.cdf(z) for z in z_stats]
     elif tail == 'Less':
         p_values = [norm.cdf(z) for z in z_stats]
-    else: # 'Two-sided'
+    else:
         p_values = [2 * (1 - norm.cdf(abs(z))) for z in z_stats]
-    
+
     significant_results = [p <= sidak_alpha for p in p_values]
 
-    # --- Observed Power Analysis ---
     power_method_used = ""
     observed_powers = []
 
@@ -1137,9 +1261,14 @@ def calculate_frequentist_statistics(
             observed_powers.append(power)
 
     else:
-        if reduction_factor < 1.0:
-            st.warning("CUPED variance reduction is enabled, but observed power calculation via bootstrap is not compatible with CUPED. Falling back to analytical method without CUPED adjustment for power estimation.")
+        if reduction_factor != 1.0:
+            # Bootstrap power is not compatible with a scaled SE; fall back to
+            # the analytical method which correctly incorporates the adjustment.
             power_method_used = "Analytical"
+            st.warning(
+                "Variance adjustment is active. Bootstrap power estimation is not compatible "
+                "with a scaled standard error — falling back to the analytical method."
+            )
             for i in range(1, num_variants):
                 se_diff = np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
                 if se_diff == 0:
@@ -1190,54 +1319,15 @@ def calculate_frequentist_statistics(
                 bootstrap_power(data_controls[0], data_controls[i], alpha, tail)
                 for i in range(1, num_variants)
             ]
-            
-        def bootstrap_sample(data_control, data_variant, alpha, tail):
 
-            # Using 'alpha' passed here (original overall alpha), not necessarily sidak_alpha
-            sample_control = np.random.choice(data_control, size=len(data_control), replace=True)
-            sample_variant = np.random.choice(data_variant, size=len(data_variant), replace=True)
-            pooled_p = (np.sum(sample_control) + np.sum(sample_variant)) / (len(sample_control) + len(sample_variant))
-            se = np.sqrt(pooled_p * (1 - pooled_p) * (1 / len(sample_control) + 1 / len(sample_variant)))
-            if se == 0:
-                z_stat = 0
-            else:
-                z_stat = (np.mean(sample_variant) - np.mean(sample_control)) / se
-            p_value = 2 * (1 - norm.cdf(abs(z_stat)))
-
-            # Adjust p-value based on tail
-            if tail == 'Greater':
-                p_value = 1 - norm.cdf(z_stat)
-            elif tail == 'Less':
-                p_value = norm.cdf(z_stat)
-            else:
-                p_value = 2 * (1 - norm.cdf(abs(z_stat)))
-
-            return p_value < alpha
-
-        # bootstrap_power definition
-        def bootstrap_power(data_control, data_variant, alpha, tail, n_bootstraps=10000):
-            # Note: Uses overall alpha based on original call
-            significant_results = 0
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = [executor.submit(bootstrap_sample, data_control, data_variant, alpha, tail) for _ in range(n_bootstraps)]
-                for future in concurrent.futures.as_completed(futures):
-                    if future.result():
-                        significant_results += 1
-            return significant_results / n_bootstraps
-            
-        data_controls = [np.concatenate([np.ones(c), np.zeros(v - c)]) for c, v in zip(conversion_counts, visitor_counts)]
-        observed_powers = [bootstrap_power(data_controls[0], data_controls[i], alpha, tail) for i in range(1, num_variants)]
-
-    # --- Single dictionary ---
     results = {
         "num_variants": num_variants,
         "tail": tail,
-        "confidence_intervals": confidence_intervals, # CI for each variant
-        "confidence_intervals_diff": confidence_intervals_diff, # CI for the difference
+        "confidence_intervals": confidence_intervals,
+        "confidence_intervals_diff": confidence_intervals_diff,
         "conversion_rates": conversion_rates,
         "lowest boundary": lowest_interval,
         "highest boundary": highest_interval,
-        "conversion_rates": conversion_rates,
         "standard_errors": standard_errors,
         "z_stats": z_stats,
         "p_values": p_values,
@@ -1250,9 +1340,10 @@ def calculate_frequentist_statistics(
         "confidence_level": confidence_level,
         "reduction_factor": reduction_factor
     }
-    
+
     return results
-        
+
+
 def plot_conversion_distributions(results):
     if not results:
         st.warning("Cannot generate visualization because calculation results are missing.")
@@ -1263,13 +1354,12 @@ def plot_conversion_distributions(results):
     num_variants = results['num_variants']
     significant_results = results['is_significant']
     sidak_alpha = results['sidak_alpha']
-    
+
     st.write("")
     st.write("### Probability Density of Estimated Conversion Rates")
 
     fig, ax = plt.subplots(figsize=(12, 7))
 
-    # --- Dynamic plot range ---
     all_means = np.array(conversion_rates)
     all_ses = np.array(se_list)
     plot_min = np.min(all_means - 4 * np.maximum(all_ses, 1e-9))
@@ -1279,38 +1369,32 @@ def plot_conversion_distributions(results):
     if x_max <= x_min: x_max = x_min + 1e-6
     x_range = np.linspace(x_min, x_max, 1000)
 
-    # --- Define color pallette and plot PDFs ---
     colors = ['#808080', '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
     shade_colors = {'better': '#90EE90', 'worse': '#F08080'}
     base_alpha = 0.9
     shade_alpha = 0.3
-    
+
     pdfs = []
     for i in range(num_variants):
         se = max(se_list[i], 1e-9)
         pdf = norm.pdf(x_range, conversion_rates[i], se)
         pdfs.append(pdf)
-        
+
         variant_label = f'Variant {string.ascii_uppercase[i]}' if i > 0 else 'Control (A)'
         line_color = colors[i % len(colors)]
 
         ax.plot(x_range * 100, pdf, label=variant_label, color=line_color, alpha=base_alpha, linewidth=1.5)
-        ax.axvline(conversion_rates[i] * 100, color=line_color, linestyle='--', alpha=base_alpha*0.8)
-        
+        ax.axvline(conversion_rates[i] * 100, color=line_color, linestyle='--', alpha=base_alpha * 0.8)
+
         text_left_margin = 0.005
-        ax.text(conversion_rates[i] * 100 + text_left_margin, 
+        ax.text(conversion_rates[i] * 100 + text_left_margin,
                 ax.get_ylim()[1] * 0.03,
                 f' {string.ascii_uppercase[i]}: {conversion_rates[i]*100:.2f}%',
-                color=line_color, 
-                ha='left', 
-                rotation=90, 
-                va='bottom', 
-                fontsize=9)
+                color=line_color, ha='left', rotation=90, va='bottom', fontsize=9)
 
-    # --- Shade areas when significant ---
     control_cr = conversion_rates[0]
     control_se = max(se_list[0], 1e-9)
-    
+
     for i in range(1, num_variants):
         if significant_results[i - 1]:
             variant_cr = conversion_rates[i]
@@ -1328,7 +1412,7 @@ def plot_conversion_distributions(results):
                 z_score = mean_diff / se_diff
                 prob_variant_better = norm.cdf(z_score)
             prob_control_better = 1 - prob_variant_better
-            
+
             if is_better:
                 lower_bound = norm.ppf(sidak_alpha, loc=variant_cr, scale=variant_se)
                 fill_condition = (x_range >= lower_bound)
@@ -1344,25 +1428,18 @@ def plot_conversion_distributions(results):
                 label_text = f'{control_label_char} vs {variant_label_char} (Significant)'
             else:
                 label_text = ''
-            
+
             ax.fill_between(x_range * 100, pdf_variant, 0, where=fill_condition.tolist(),
                             color=shade_color, alpha=shade_alpha, label=label_text)
-            
-            prob_text_display = f"P({variant_label_char}>{control_label_char}): {prob_variant_better*100:.1f}%"
 
+            prob_text_display = f"P({variant_label_char}>{control_label_char}): {prob_variant_better*100:.1f}%"
             ax.axvline(float(bound_line_value), color='grey', linestyle=':', linewidth=1, alpha=0.7)
-            
+
             mid_point_cr = (control_cr + variant_cr) / 2.0
-            
             current_ylim = ax.get_ylim()
             y_pos_text = current_ylim[1] * 0.85
-            ax.text(mid_point_cr * 100, 
-                    y_pos_text, 
-                    prob_text_display,
-                    color='black', 
-                    ha='center', 
-                    va='center', 
-                    fontsize=10,
+            ax.text(mid_point_cr * 100, y_pos_text, prob_text_display,
+                    color='black', ha='center', va='center', fontsize=10,
                     bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.7, ec='none'))
             ax.set_ylim(current_ylim)
 
@@ -1374,9 +1451,9 @@ def plot_conversion_distributions(results):
     ax.grid(True, which='major', linestyle='--', linewidth=0.5, alpha=0.3)
 
     fig.tight_layout(rect=(0, 0, 0.85, 1))
-
     st.pyplot(fig)
     plt.close(fig)
+
 
 def resolve_prior(sensitivity_mode='neutral', custom_prior=None):
     priors = {'skeptical': 0.1, 'neutral': 0.5, 'optimistic': 0.9}
@@ -1390,11 +1467,13 @@ def resolve_prior(sensitivity_mode='neutral', custom_prior=None):
         raise ValueError(f"Unknown sensitivity_mode '{sensitivity_mode}'.")
     return priors[sensitivity_mode]
 
+
 def calculate_fpr(alpha, power, prior):
     p1, p0 = prior, 1 - prior
     numerator = alpha * p0
     denominator = (alpha * p0) + (power * p1)
     return numerator / denominator if denominator else 0.0
+
 
 def calculate_fndr(alpha, power, prior):
     p1, p0 = prior, 1 - prior
@@ -1404,16 +1483,16 @@ def calculate_fndr(alpha, power, prior):
     denominator = (beta * p1) + (specificity * p0)
     return numerator / denominator if denominator else 0.0
 
+
 def display_frequentist_summary(
-    results, 
-    visitor_counts, 
+    results,
+    visitor_counts,
     conversion_counts,
     non_inferiority_margin=0.01,
     confidence_noninf=95,
     reduction_factor=1.0,
     prior=0.5
 ):
-
     if not results:
         st.error("Calculation results are missing, cannot display summary.")
         return
@@ -1428,8 +1507,7 @@ def display_frequentist_summary(
     alpha_unadjusted = results['alpha']
     tail = results['tail']
     alphabet = string.ascii_uppercase
-    
-    # --- SRM Check and Šidák Info ---
+
     st.write("### SRM Check")
     if srm_p_value > 0.01:
         st.write("This test is <span style='color: #009900; font-weight: 600;'>valid</span>. The distribution is as expected.", unsafe_allow_html=True)
@@ -1439,21 +1517,33 @@ def display_frequentist_summary(
     if num_variants >= 3:
         st.write("### Šidák Correction applied")
         st.info(f"The Šidák correction was applied due to 3 or more variants in the test. The alpha threshold has been set to **{results['sidak_alpha']:.4f}** instead of {alpha_unadjusted:.4f}.")
-    
+
     st.write("## Results summary")
     st.write("---")
+
     if reduction_factor < 1.0:
-        st.info(f"**CUPED Active**. Variance reduced by {reduction_factor:.4f} using pre-test data correlation.")
+        pct_reduced = (1 - reduction_factor) * 100
+        st.info(
+            f"**Variance Adjustment Active** — SE reduced by {pct_reduced:.1f}% "
+            f"(φ = {reduction_factor:.3f}). Your historical conversion rate is more "
+            f"stable than the binomial assumption; confidence intervals are tightened accordingly."
+        )
+    elif reduction_factor > 1.0:
+        pct_inflated = (reduction_factor - 1) * 100
+        st.info(
+            f"**Variance Adjustment Active** — SE inflated by {pct_inflated:.1f}% "
+            f"(φ = {reduction_factor:.3f}). Overdispersion was detected in your historical data; "
+            f"confidence intervals are widened to maintain a honest false positive rate."
+        )
 
     for i in range(1, num_variants):
         challenger_index_in_lists = i - 1
 
         st.write(f"### Test results for {alphabet[i]} vs {alphabet[0]}")
 
-        # Show confidence intervals for each variant
         control_ci = results['confidence_intervals'][0]
         challenger_ci = results['confidence_intervals'][i]
-        ci_difference = results['confidence_intervals_diff'][challenger_index_in_lists] 
+        ci_difference = results['confidence_intervals_diff'][challenger_index_in_lists]
         observed_diff = conversion_rates[i] - conversion_rates[0]
 
         col1, col2, col3 = st.columns(3)
@@ -1472,39 +1562,33 @@ def display_frequentist_summary(
         with col3:
             st.metric(
                 label=f"Uplift CI ({alphabet[i]} vs {alphabet[0]})",
-                value=f"{observed_diff*100:+.2f}%", # The '+' forces a +/- sign
+                value=f"{observed_diff*100:+.2f}%",
                 help=f"The {results['confidence_level']}% confidence interval for the uplift is from {ci_difference[0]*100:+.2f}% to {ci_difference[1]*100:+.2f}%."
             )
-            
+
         st.write("#### Confidence Interval Comparison")
         fig = display_ci_chart(results, i, alphabet)
         st.altair_chart(fig, width='stretch')
         st.write("")
-        
-        # --- Superiority Test ---
+
         if is_significant[challenger_index_in_lists]:
             st.markdown(f" * **Statistically significant result** for {alphabet[i]} with p-value: {p_values[challenger_index_in_lists]:.4f}!")
-            # st.markdown(f" * **Observed power**: {observed_powers[challenger_index_in_lists] * 100:.2f}%")
             st.markdown(f" * **Conversion rate change** for {alphabet[i]}: {((conversion_rates[i] - conversion_rates[0]) / conversion_rates[0]) * 100:.2f}%")
             if conversion_rates[i] > conversion_rates[0]:
                 st.success(f"Variant **{alphabet[i]}** is a **winner**, congratulations!")
             else:
-                if reduction_factor < 1.0:
-                    st.info(f"CUPED Adjusted. Variance reduction factor applied: {reduction_factor:.4f}")
                 st.warning(f"**Loss averted** with variant **{alphabet[i]}**! Congratulations with this valuable insight.")
-        
-        # --- Non-inferiority Test ---
+
         else:
             st.markdown(f" * The Z-test is not statistically significant (p = {p_values[challenger_index_in_lists]:.4f}).")
-            # st.markdown(f" * **Observed power**: {observed_powers[challenger_index_in_lists] * 100:.2f}%")
             st.markdown(f" * **Conversion rate change for {alphabet[i]}:** {((conversion_rates[i] - conversion_rates[0]) / conversion_rates[0]) * 100:.2f}%")
 
             if tail == 'Greater' or tail == 'Two-sided':
                 se_unpooled = np.sqrt(
-                    (conversion_rates[0] * (1 - conversion_rates[0]) * reduction_factor / visitor_counts[0]) + 
+                    (conversion_rates[0] * (1 - conversion_rates[0]) * reduction_factor / visitor_counts[0]) +
                     (conversion_rates[i] * (1 - conversion_rates[i]) * reduction_factor / visitor_counts[i])
                 )
-                
+
                 z_stat_noninf = (conversion_rates[i] - conversion_rates[0] + non_inferiority_margin) / se_unpooled
                 p_value_noninf = 1 - norm.cdf(z_stat_noninf)
                 alpha_noninf = 1 - (confidence_noninf / 100)
@@ -1513,20 +1597,18 @@ def display_frequentist_summary(
 
                 st.markdown(f" * **P-value (non-inferiority test):** {p_value_noninf:.4f} (margin: {non_inferiority_margin*100:.1f}%)")
                 st.markdown(f" * **Lower Bound of Difference:** {lower_bound_diff*100:.2f}% (Limit: {-non_inferiority_margin*100:.2f}%)")
-                
+
                 if p_value_noninf <= alpha_noninf:
                     st.success(f"Although not a winner, the non-inferiority test suggests that {alphabet[i]} is **not significantly worse** than {alphabet[0]} within the predefined margin.")
                 else:
                     st.warning(f"The non-inferiority test does not provide sufficient evidence to conclude that {alphabet[i]} performs at least as well as {alphabet[0]}.")
-            else: # Voor 'less' tail
+            else:
                 st.info(f"There is no strong evidence of a difference, and the effect size remains uncertain.")
 
-        # --- FPR / FNDR block ---
         st.write("#### False Positive / Negative Risk")
         power = observed_powers[challenger_index_in_lists]
         fpr_alpha = results['sidak_alpha']
 
-        # Direction-aware labels and help text
         if tail == 'Greater':
             fpr_label = "False Positive Risk"
             fpr_help = "Probability this apparent improvement is a false positive, given your prior."
@@ -1535,7 +1617,6 @@ def display_frequentist_summary(
             fndr_help = "Probability a real improvement was missed, given your prior and observed power."
             fndr_warning_suffix = "Power may be insufficient to detect a real improvement."
             fndr_success = "False Negative Risk is low: If a real improvement exists, this test was likely sensitive enough to find it."
-
         elif tail == 'Less':
             fpr_label = "False Positive Risk (Harm Detection)"
             fpr_help = "Probability this apparent harm is a false positive, given your prior."
@@ -1544,8 +1625,7 @@ def display_frequentist_summary(
             fndr_help = "Probability real harm was missed, given your prior and observed power."
             fndr_warning_suffix = "Power may be insufficient to detect real harm."
             fndr_success = "False Negative Risk is low: If the variant truly underperforms, this test was likely sensitive enough to detect it."
-
-        else:  # Two-sided
+        else:
             fpr_label = "False Positive Risk"
             fpr_help = "Probability this detected difference (in either direction) is a false positive, given your prior."
             fpr_warning_suffix = "Direction is uncertain: Treat with caution before acting."
@@ -1569,6 +1649,7 @@ def display_frequentist_summary(
             else:
                 st.success(fndr_success)
 
+
 # Main logic
 
 def run():
@@ -1578,7 +1659,7 @@ def run():
     """)
     st.write("---")
     initialize_session_state()
-    
+
     analysis_method = st.radio(
         "Choose your analysis method:",
         ("Frequentist Analysis", "Bayesian Analysis"),
@@ -1594,15 +1675,15 @@ def run():
     # ==============================================================================
     if analysis_method == "Bayesian Analysis":
         st.header("Bayesian Analysis Inputs")
-        
+
         (
-            visitor_counts, 
-            conversion_counts, 
-            aovs, 
+            visitor_counts,
+            conversion_counts,
+            aovs,
             aov_cv,
-            beta_prior, 
-            lift_prior, 
-            probability_winner, 
+            beta_prior,
+            lift_prior,
+            probability_winner,
             runtime_days
         ) = get_bayesian_inputs()
 
@@ -1611,8 +1692,6 @@ def run():
             if validate_inputs(visitor_counts, conversion_counts, aovs):
                 st.write("---")
                 try:
-                    # --- Calculations ---
-
                     cr_control = conversion_counts[0] / visitor_counts[0] if visitor_counts[0] > 0 else 0
                     observed_uplifts = [
                         ((conversion_counts[i] / visitor_counts[i]) - cr_control) / cr_control if cr_control > 0 and visitor_counts[i] > 0 else 0.0
@@ -1620,29 +1699,19 @@ def run():
                     ]
 
                     probabilities_to_be_best, _ = calculate_probabilities(
-                        visitor_counts, 
-                        conversion_counts, 
-                        beta_prior=beta_prior,
-                        lift_prior=lift_prior,
+                        visitor_counts, conversion_counts,
+                        beta_prior=beta_prior, lift_prior=lift_prior,
                     )
                     uplift_distributions = simulate_uplift_distributions(
-                        visitor_counts, 
-                        conversion_counts, 
-                        beta_prior=beta_prior,
-                        lift_prior=lift_prior
+                        visitor_counts, conversion_counts,
+                        beta_prior=beta_prior, lift_prior=lift_prior
                     )
                     df_business = perform_multi_variant_risk_assessment(
-                        visitor_counts, 
-                        conversion_counts, 
-                        aovs,
-                        probabilities_to_be_best, 
-                        runtime_days,
-                        beta_prior=beta_prior, 
-                        lift_prior=lift_prior,
-                        aov_cv=aov_cv
+                        visitor_counts, conversion_counts, aovs,
+                        probabilities_to_be_best, runtime_days,
+                        beta_prior=beta_prior, lift_prior=lift_prior, aov_cv=aov_cv
                     )
 
-                    # --- Visualizations and Results ---
                     plot_winner_probabilities_chart(probabilities_to_be_best)
                     plot_uplift_histograms(uplift_distributions, observed_uplifts)
                     display_results_per_variant(
@@ -1652,80 +1721,99 @@ def run():
 
                 except Exception as e:
                     st.error(f"An error occurred during calculation: {e}")
-            else:
-                pass
 
     # ==============================================================================
     #                           FREQUENTIST ANALYSIS FLOW
     # ==============================================================================
     elif analysis_method == "Frequentist Analysis":
         st.header("Frequentist Analysis Inputs")
-        
         visitor_counts, conversion_counts, confidence_level, reduction_factor, test_duration, sensitivity_mode, custom_prior = get_frequentist_inputs()
-
         st.write("---")
-        
         st.session_state.tail = st.radio(
             "Select the test hypothesis (tail):",
             ('Greater', 'Less', 'Two-sided'),
             horizontal=True,
-            help="'Two-sided' (A != B), 'Greater' (B > A), 'Less' (B < A). Be aware that 'Greater' and 'Less' are directional tests, while 'Two-sided' is non-directional. For a directional claim, choose a one-sided hypothesis."
+            help="'Two-sided' (A != B), 'Greater' (B > A), 'Less' (B < A)."
         )
         non_inferiority_margin = st.number_input(
-            "Non-inferiority margin (absolute %)", 
+            "Non-inferiority margin (absolute %)",
             min_value=0.0, max_value=10.0, value=1.0, step=0.1,
-            help="Set the acceptable negative performance margin for non-significant results (e.g., 1.0 for -1%)."
+            help="Set the acceptable negative performance margin for non-significant results."
         ) / 100
-
         st.write("")
+
         if st.button("Calculate Frequentist Results", type="primary"):
             if validate_inputs(visitor_counts, conversion_counts):
                 prior = resolve_prior(sensitivity_mode, custom_prior)
                 st.write("---")
                 try:
-                    # --- Calculations ---
                     with st.spinner("Analysis in progress..."):
                         test_results = calculate_frequentist_statistics(
                             visitor_counts,
                             conversion_counts,
                             confidence_level,
                             st.session_state.tail,
-                            reduction_factor=reduction_factor
+                            reduction_factor=reduction_factor,
                         )
-                        
-                        if test_results['reduction_factor'] < 1.0:
-                            st.plotly_chart(plot_cuped_comparison(test_results, visitor_counts), width='stretch')
-                            st.caption(f"The curves above are narrowed by {((1-test_results['reduction_factor'])*100):.1f}% "
-                                    "based on your historical benchmark data.")
 
-                            days_saved = calculate_time_savings(test_results['reduction_factor'], test_duration)
-    
-                            st.write("---")
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.metric("CUPED Efficiency", f"{((1/test_results['reduction_factor'] - 1) * 100):.1f}%", 
-                                        help="This is the increase in effective sample size gained from variance reduction.")
-                            with col2:
-                                st.metric("Time Saved", f"{days_saved} Days", 
-                                        delta="Faster Significance", delta_color="normal")
-                                
-                            st.success(f"**CUPED Impact:** By reducing noise, you reached this level of precision **{days_saved} days sooner** than a standard A/B test would have.")
-
-                        # --- Visualization and Results ---
-                        if test_results:
-                            plot_conversion_distributions(test_results)
-                            display_frequentist_summary(
-                                test_results,
-                                visitor_counts,
-                                conversion_counts,
-                                non_inferiority_margin=non_inferiority_margin,
-                                reduction_factor=reduction_factor,
-                                prior=prior
+                    rf = test_results['reduction_factor']
+                    if rf < 1.0:
+                        st.plotly_chart(
+                            plot_variance_adjusted_comparison(test_results, visitor_counts),
+                            width='stretch'
+                        )
+                        pct_reduced = (1 - rf) * 100
+                        st.caption(
+                            f"The curves above are narrowed by {pct_reduced:.1f}% "
+                            "based on historical stability of your conversion rate."
+                        )
+                        days_saved = calculate_time_savings(rf, test_duration)
+                        st.write("---")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric(
+                                "Variance Reduction",
+                                f"{pct_reduced:.1f}%",
+                                help="How much noise was removed relative to the binomial baseline."
                             )
+                        with col2:
+                            st.metric(
+                                "Estimated Time Saved",
+                                f"{days_saved} Days",
+                                delta="Faster Significance",
+                                delta_color="normal",
+                            )
+                        st.success(
+                            f"**Variance Adjustment:** Your historical conversion rate is more stable "
+                            f"than pure binomial sampling predicts (φ = {rf:.2f}). "
+                            f"Confidence intervals tightened — equivalent to running the experiment "
+                            f"**{days_saved} days longer** without the adjustment."
+                        )
+
+                    elif rf > 1.0:
+                        pct_inflated = (rf - 1) * 100
+                        st.warning(
+                            f"⚠️ **Overdispersion detected (φ = {rf:.2f}):** Your historical conversion "
+                            f"rate varies more than binomial theory predicts — likely due to "
+                            f"campaign bursts, seasonality, or other structural noise. "
+                            f"Standard errors have been inflated by {pct_inflated:.1f}% to keep "
+                            f"your false positive rate honest. Consider a quieter baseline period."
+                        )
+
+                    if test_results:
+                        plot_conversion_distributions(test_results)
+                        display_frequentist_summary(
+                            test_results,
+                            visitor_counts,
+                            conversion_counts,
+                            non_inferiority_margin=non_inferiority_margin,
+                            reduction_factor=reduction_factor,
+                            prior=prior,
+                        )
+
                 except Exception as e:
-                    st.error(f"An error occurred during calculation: {e}")
-            else:
-                pass
-            
+                    st.error(f"Analysis failed: {e}")
+
+
 if __name__ == "__main__":
     run()
