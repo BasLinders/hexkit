@@ -441,7 +441,7 @@ def render_info_expanders(test_names: List[str]) -> None:
     with st.expander("Why Use This Tool?"):
         st.markdown("""
 ### The Problem: Interaction Bias
-When you run multiple experiments simultaneously, you risk **Interaction Bias** — the effect
+When you run multiple experiments simultaneously, you risk **Interaction Bias**; the effect
 of one change (e.g. a new button colour) being influenced by another change (e.g. new pricing).
 Standard A/B dashboards assume independence and can declare a "winner" that actually performs
 poorly when combined with other live features.
@@ -460,19 +460,18 @@ This tool calculates the **Combined Effect** across every variant combination.
 
     with st.expander("How to Use This Tool"):
         st.markdown("""
-1. **Define Tests & Variants** — Name your tests and list variants separated by commas (e.g. `A, B, C`).
-2. **The Matrix** — The table auto-generates every possible variant combination.
-3. **First is Baseline** — The **first variant** listed for each test is the statistical control.
-4. **Fill & Calculate** — Enter visitor/conversion counts and click *Calculate*.
+1. **Define Tests & Variants** - Name your tests and list variants separated by commas (e.g. `A, B, C`).
+2. **The Matrix** - The table auto-generates every possible variant combination.
+3. **First is Baseline** - The **first variant** listed for each test is the statistical control.
+4. **Fill & Calculate** - Enter visitor/conversion counts and click *Calculate*.
         """)
 
     with st.expander("Methodology & Statistical Approach"):
         st.markdown(r"""
 This tool uses a **Generalized Linear Model (GLM)** with a Binomial family (logistic regression).
 
-The response is modelled as a **two-column binomial** `(conversions, non_conversions)` — the
-statistically correct approach for pre-aggregated count data. This avoids inflating the effective
-sample size (which `freq_weights` would do), ensuring that standard errors and p-values are reliable.
+The response is modelled as a **two-column binomial** `(conversions, non_conversions)`. This avoids inflating the effective
+sample size, ensuring that standard errors and p-values are reliable.
 
 **The Interaction Formula** (two tests):
 $$\text{logit}(p) = \beta_0 + \beta_1\,\text{Test}_1 + \beta_2\,\text{Test}_2 + \beta_3(\text{Test}_1 \times \text{Test}_2)$$
