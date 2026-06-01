@@ -898,38 +898,54 @@ def calculate_timeseries_reduction_factor(
     df: pd.DataFrame,
     visitors_col: str,
     conversions_col: str,
+    date_col: str
 ) -> Tuple[float, float, str]:
     """
     Estimates a variance scaling factor (φ) from aggregate historical
-    time-series data.
+    time-series data, controlling for day-of-week seasonality.
 
     Method:
-      1. Compute the visitor-weighted observed variance of daily conversion rates.
-      2. Compute the expected binomial variance for the same days (p*(1-p)/n),
-         again visitor-weighted to prevent small-traffic days from dominating.
-      3. φ = observed / expected.
-         φ < 1 -> stable process, SE is shrunk.
-         φ > 1 -> overdispersed process, SE is inflated (conservative).
-         φ = 1 -> no adjustment.
-
-    Returns:
-        reduction_factor float - multiply variance by this; <1 shrinks, >1 inflates
-        phi float - raw dispersion ratio (shown to the user)
-        regime str - 'stable' | 'neutral' | 'noisy' | 'high_noise'
+      1. Group data by Day of Week (DOW) to calculate DOW-specific baseline conversion rates.
+      2. Compute the visitor-weighted observed variance of daily conversion rates 
+         relative to their specific DOW baseline (residual variance).
+      3. Compute the expected binomial variance for the same days (p*(1-p)/n).
+      4. φ = observed / expected.
     """
+    df = df.copy()
+
+    # Ensure date is a datetime object and extract the day of the week (0=Monday, 6=Sunday)
+    df[date_col] = pd.to_datetime(df[date_col])
+    df['dow'] = df[date_col].dt.dayofweek
+
     visitors = df[visitors_col].astype(float)
     conversions = df[conversions_col].astype(float)
     rates = conversions / visitors
 
-    weights = visitors / visitors.sum()
-    weighted_mean = (rates * weights).sum()
+    # --- De-trending Logic ---
+    # Calculate the weighted average conversion rate for each day of the week
+    dow_totals = df.groupby('dow').agg(
+        dow_visitors=(visitors_col, 'sum'),
+        dow_conversions=(conversions_col, 'sum')
+    )
+    dow_totals['dow_baseline_rate'] = dow_totals['dow_conversions'] / dow_totals['dow_visitors']
 
-    observed_var = (weights * (rates - weighted_mean) ** 2).sum()
+    # Map the expected DOW baseline rate back to each individual day in the timeseries
+    df['expected_dow_rate'] = df['dow'].map(dow_totals['dow_baseline_rate'])
+
+    # Global weights to prevent small-traffic days from dominating the variance sum
+    weights = visitors / visitors.sum()
+
+    # Calculate observed variance as the residual squared error from the DOW baseline
+    # Mathematically: Variance of (r_i - r_dow)
+    observed_var = (weights * (rates - df['expected_dow_rate']) ** 2).sum()
+
+    # Expected binomial variance remains the standard coin-flip noise formula
     expected_binomial_var = (weights * rates * (1 - rates) / visitors).sum()
 
     if expected_binomial_var == 0:
         return 1.0, 1.0, "neutral"
 
+    # --- Calculate Phi ---
     phi = observed_var / expected_binomial_var
     reduction_factor = float(np.clip(phi, 0.10, None))
 
