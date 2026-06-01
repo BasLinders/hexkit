@@ -52,7 +52,7 @@ def display_dynamic_documentation(analysis_method):
             * **Error Control:** Strictly controls for **Type I Errors** (False Positives) via $p$-values.
             * **Dual-Gate Evaluation:** First, it checks for a traditional superior win ($p < 0.05$). If that isn't met, it automatically pivots to a **Non-Inferiority Test**.
             * **Risk Mitigation:** Specifically designed for feature parity tests or migrations where the primary goal is "Do No Harm."
-            * **Variance-Adjusted Sensitivity:** Uses historical daily aggregate data to detect whether your conversion rate is more stable or noisier than pure binomial sampling predicts, allowing for a tighter - or more conservative - assessment of the difference between variants.
+            * **Overdispersion Correction (Safety Net):** Uses historical daily aggregate data to detect environmental traffic noise, safely inflating confidence intervals to protect against false positives that standard A/B testing calculators miss.
             """)
 
         with st.expander("Frequentist: How it works"):
@@ -63,7 +63,7 @@ def display_dynamic_documentation(analysis_method):
             3.  **Non-Inferiority Z-Score:** We calculate the $Z$-stat by adding the **Non-Inferiority Margin ($\Delta$)** back into the observed difference:
                 $$Z_{NI} = \frac{(CR_v - CR_c) + \Delta}{SE_{unpooled}}$$
             4.  **Lower Bound Estimation:** The engine calculates the lower bound of the difference. If this bound stays above $-\Delta$, the variant is considered "safe."
-            5.  **Variance Adjustment:** If historical daily data is provided, the observed day-to-day variance of the conversion rate is compared to what pure binomial sampling would predict. The ratio $\varphi = \sigma^2_{observed} / \sigma^2_{binomial}$ is used to scale the standard error, shrinking it when the rate is historically stable ($\varphi < 1$), and inflating it conservatively when overdispersion is present ($\varphi > 1$).
+            5.  **Overdispersion Correction:** Real-world web traffic is never as perfectly stable as a theoretical coin flip. If historical daily data is provided, the engine compares your actual day-to-day variance against the pure binomial minimum. The ratio $\varphi = \sigma^2_{observed} / \sigma^2_{binomial}$ is used to scale the standard error, adapting your test's sensitivity to the true noisiness of your data stream.
             """)
 
         with st.expander("Frequentist: Interpretation"):
@@ -287,46 +287,32 @@ def get_frequentist_inputs():
     )
 
     st.write("---")
-    st.write("### Variance Adjustment (Optional)")
-    with st.expander("How variance adjustment works", expanded=False):
+    st.write("### Overdispersion Correction (Optional)")
+    with st.expander("Why this matters & how it works", expanded=False):
         st.markdown(r"""
-            ### Aggregate Time-Series Variance Adjustment
+            ### Protecting Against Real-World Noise
 
-            This tool uses a historical daily aggregate of your conversion data to estimate how
-            stable or noisy your conversion rate truly is, and adjusts the experiment's standard
-            errors accordingly.
+            Standard A/B testing calculators assume your traffic behaves like independent, identical coin flips (a pure **binomial distribution**). In reality, conversion rates fluctuate due to macro trends, marketing blasts, and day-of-week seasonality. 
 
-            Rather than requiring individual user-level data (which demands returning visitors and
-            a complex export), you only need a simple day-by-day summary: total visitors and
-            total conversions per day from a comparable period before the experiment.
+            Because naive calculators ignore this environmental noise, their confidence intervals are artificially narrow, leading to rampant false positives. This tool uses historical aggregate data to measure your true baseline noise and corrects the math.
 
             **How it works**
 
-            We compare the *observed* day-to-day variance of your historical conversion rate to
-            what pure binomial sampling would predict for the same traffic volumes.
+            We compare the *observed* day-to-day residual variance of your historical conversion rate (after stripping out typical day-of-week seasonality) to what pure theoretical binomial sampling would predict.
 
             The dispersion ratio is:
             $$\varphi = \frac{\sigma^2_{\text{observed}}}{\sigma^2_{\text{binomial}}}$$
 
-            Both variances are weighted by daily visitor volume to avoid small-day distortion.
+            - $\varphi \approx 1$ - **Ideal Conditions:** Your traffic is incredibly clean and behaves almost identically to textbook theory.
+            - $\varphi > 1$ - **Overdispersion Detected:** Typical real-world behavior. Standard errors are *inflated* proportionally to protect your false positive rate and prevent you from calling a winner on pure noise.
 
-            - $\varphi < 1$ - your rate is **more stable** than binomial theory predicts.
-              Standard errors are reduced: confidence intervals tighten and you reach
-              significance faster.
-            - $\varphi \approx 1$ - your rate behaves as pure binomial sampling expects.
-              No meaningful adjustment is applied.
-            - $\varphi > 1$ - **overdispersion detected** (e.g. campaign bursts, day-of-week
-              spikes, seasonality). Standard errors are *inflated* conservatively to protect
-              your false positive rate.
-
-            The standard error is scaled as:
+            The standard error is scaled safely as:
             $$SE_{\text{adjusted}} = \sqrt{\frac{p(1-p)\,\varphi}{n}}$$
 
             **What to upload**
 
             A daily aggregate CSV with at least 14 rows (one per day) and three columns:
-            date, visitors, conversions. Any analytics tool (e.g. GA4, Piano, Matomo, your own BI)
-            can produce this without a user-level join.
+            date, visitors, conversions. Any analytics tool can produce this without a complex user-level join.
         """)
 
     reduction_factor = render_variance_reduction_ui()
@@ -854,6 +840,7 @@ def validate_timeseries_data(
     df: pd.DataFrame,
     visitors_col: str,
     conversions_col: str,
+    date_col: str
 ) -> Tuple[bool, str, int]:
     """
     Validates uploaded aggregate time-series data before computing the
@@ -903,17 +890,9 @@ def calculate_timeseries_reduction_factor(
     """
     Estimates a variance scaling factor (φ) from aggregate historical
     time-series data, controlling for day-of-week seasonality.
-
-    Method:
-      1. Group data by Day of Week (DOW) to calculate DOW-specific baseline conversion rates.
-      2. Compute the visitor-weighted observed variance of daily conversion rates 
-         relative to their specific DOW baseline (residual variance).
-      3. Compute the expected binomial variance for the same days (p*(1-p)/n).
-      4. φ = observed / expected.
     """
     df = df.copy()
 
-    # Ensure date is a datetime object and extract the day of the week (0=Monday, 6=Sunday)
     df[date_col] = pd.to_datetime(df[date_col])
     df['dow'] = df[date_col].dt.dayofweek
 
@@ -921,42 +900,33 @@ def calculate_timeseries_reduction_factor(
     conversions = df[conversions_col].astype(float)
     rates = conversions / visitors
 
-    # --- De-trending Logic ---
-    # Calculate the weighted average conversion rate for each day of the week
     dow_totals = df.groupby('dow').agg(
         dow_visitors=(visitors_col, 'sum'),
         dow_conversions=(conversions_col, 'sum')
     )
     dow_totals['dow_baseline_rate'] = dow_totals['dow_conversions'] / dow_totals['dow_visitors']
 
-    # Map the expected DOW baseline rate back to each individual day in the timeseries
     df['expected_dow_rate'] = df['dow'].map(dow_totals['dow_baseline_rate'])
 
-    # Global weights to prevent small-traffic days from dominating the variance sum
     weights = visitors / visitors.sum()
 
-    # Calculate observed variance as the residual squared error from the DOW baseline
-    # Mathematically: Variance of (r_i - r_dow)
     observed_var = (weights * (rates - df['expected_dow_rate']) ** 2).sum()
-
-    # Expected binomial variance remains the standard coin-flip noise formula
     expected_binomial_var = (weights * rates * (1 - rates) / visitors).sum()
 
     if expected_binomial_var == 0:
-        return 1.0, 1.0, "neutral"
+        return 1.0, 1.0, "clean"
 
-    # --- Calculate Phi ---
     phi = observed_var / expected_binomial_var
     reduction_factor = float(np.clip(phi, 0.10, None))
 
-    if phi < 0.80:
-        regime = "stable"
-    elif phi < 1.05:
-        regime = "neutral"
+    if phi < 0.90:
+        regime = "textbook"
+    elif phi < 1.15:
+        regime = "clean"
     elif phi < 1.50:
-        regime = "noisy"
+        regime = "overdispersed"
     else:
-        regime = "high_noise"
+        regime = "highly_overdispersed"
 
     return reduction_factor, phi, regime
 
@@ -983,7 +953,7 @@ def render_variance_reduction_ui() -> float:
         ),
     )
 
-    use_vr = st.checkbox("Apply Variance Adjustment via Historical Benchmark")
+    use_vr = st.checkbox("Apply Overdispersion Safety Net via Historical Benchmark")
     reduction_factor = 1.0
 
     if not use_vr:
@@ -991,13 +961,10 @@ def render_variance_reduction_ui() -> float:
 
     st.info(
         "**How this works:** Upload a daily aggregate export from a comparable "
-        "historical period (e.g. the 4-8 weeks before your experiment). "
+        "historical period (e.g., the 4-8 weeks before your experiment). "
         "We compare the observed day-to-day volatility of your conversion rate "
-        "to what pure binomial sampling would predict.\n\n"
-        "- If your rate is **more stable** than theory expects -> SE is reduced, "
-        "reaching significance faster.\n"
-        "- If your rate is **noisier** (e.g. campaign bursts, seasonality) -> "
-        "SE is conservatively inflated, protecting against false positives."
+        "to the theoretical minimum (pure coin flips). The standard error will be adjusted "
+        "to reflect the true noise of your traffic stream."
     )
 
     uploaded_file = st.file_uploader(
@@ -1024,23 +991,25 @@ def render_variance_reduction_ui() -> float:
             (i for i, c in enumerate(cols) if "conv" in c.lower() or "purchas" in c.lower()), 0
         )
         conversions_col = st.selectbox("Conversions column", cols, index=default_conv, key="ts_conversions")
+    
+    date_col = st.selectbox("Date column", cols, index=0, key="ts_date")
 
-    is_valid, message, n_periods = validate_timeseries_data(df_hist, visitors_col, conversions_col)
+    is_valid, message, n_periods = validate_timeseries_data(df_hist, visitors_col, conversions_col, date_col)
 
     if not is_valid:
         st.warning(message)
         return reduction_factor
 
     reduction_factor, phi, regime = calculate_timeseries_reduction_factor(
-        df_hist, visitors_col, conversions_col
+        df_hist, visitors_col, conversions_col, date_col
     )
 
-    with st.expander("Data Quality & Variance Adjustment Details", expanded=False):
+    with st.expander("Data Quality & Adjustment Details", expanded=False):
         regime_labels = {
-            "stable": ("**Stable**", "green", "Your conversion rate is more consistent than binomial theory predicts. SE will be reduced."),
-            "neutral": ("**Neutral**", "blue", "Your conversion rate behaves close to the binomial assumption. Little adjustment applied."),
-            "noisy": ("**Noisy**", "orange", "Extra day-to-day volatility detected (campaigns? seasonality?). SE is conservatively inflated."),
-            "high_noise": ("**High Noise**","red", "Strong overdispersion. SE inflated substantially. Consider a longer or calmer baseline period."),
+            "textbook": ("**Textbook / Underdispersed**", "green", "Your conversion rate is mathematically pristine, rarely seen in the wild."),
+            "clean": ("**Clean**", "blue", "Your conversion rate behaves very closely to pure binomial theory."),
+            "overdispersed": ("**Overdispersed**", "orange", "Typical real-world noise detected. SE safely inflated to protect your false positive rate."),
+            "highly_overdispersed": ("**Highly Overdispersed**","red", "Strong environmental noise detected. SE inflated substantially. Ensure no tracking errors are present."),
         }
         label, color, advice = regime_labels[regime]
 
@@ -1054,28 +1023,27 @@ def render_variance_reduction_ui() -> float:
         """)
 
         st.caption(
-            "φ = observed day-to-day variance ÷ expected binomial variance. "
-            "φ < 1 enables SE reduction; φ > 1 triggers conservative inflation."
+            "φ = observed residual variance ÷ theoretical binomial minimum. "
+            "φ > 1 indicates real-world noise and triggers an honest inflation of confidence intervals."
         )
 
-    if regime in ("stable", "neutral"):
-        pct_change = (1 - reduction_factor) * 100
-        st.success(f"**φ = {phi:.2f}**: process is stable.")
+    if regime in ("textbook", "clean"):
+        pct_change = abs(1 - reduction_factor) * 100
+        st.success(f"**φ = {phi:.2f}**: Traffic is clean and highly predictable.")
         st.metric(
-            "Variance Adjustment",
-            f"{pct_change:.1f}% reduction",
-            delta=f"-{pct_change:.1f}% noise",
-            delta_color="normal",
+            "Standard Error Adjustment",
+            f"{pct_change:.1f}% change applied",
+            delta=None
         )
     else:
         pct_inflation = (reduction_factor - 1) * 100
         st.warning(
-            f"**φ = {phi:.2f}**: overdispersion detected. "
-            f"SE inflated by {pct_inflation:.1f}% to protect against false positives."
+            f"**φ = {phi:.2f}**: Real-world overdispersion detected. "
+            f"SE securely inflated by {pct_inflation:.1f}%."
         )
         st.metric(
-            "Variance Adjustment",
-            f"+{pct_inflation:.1f}% (conservative inflation)",
+            "Standard Error Adjustment",
+            f"+{pct_inflation:.1f}% (Conservative Inflation)",
             delta=f"+{pct_inflation:.1f}% caution added",
             delta_color="inverse",
         )
@@ -1265,8 +1233,8 @@ def calculate_frequentist_statistics(
         if reduction_factor != 1.0:
             power_method_used = "Analytical"
             st.warning(
-                "Variance adjustment is active. Bootstrap power estimation is not compatible "
-                "with a scaled standard error - falling back to the analytical method."
+                "Overdispersion Safety Net is active. Bootstrap power estimation is not compatible "
+                "with adjusted standard errors; falling back to the analytical method."
             )
             for i in range(1, num_variants):
                 se_diff = np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
@@ -1535,16 +1503,14 @@ def display_frequentist_summary(
     if reduction_factor < 1.0:
         pct_reduced = (1 - reduction_factor) * 100
         st.info(
-            f"**Variance Adjustment Active** - SE reduced by {pct_reduced:.1f}% "
-            f"(φ = {reduction_factor:.3f}). Your historical conversion rate is more "
-            f"stable than the binomial assumption; confidence intervals are tightened accordingly."
+            f"**Safety Net Active:** Standard error scaled down by {pct_reduced:.1f}% "
+            f"(φ = {reduction_factor:.3f}). Your traffic behaves even cleaner than standard models predict."
         )
     elif reduction_factor > 1.0:
         pct_inflated = (reduction_factor - 1) * 100
         st.info(
-            f"**Variance Adjustment Active** - SE inflated by {pct_inflated:.1f}% "
-            f"(φ = {reduction_factor:.3f}). Overdispersion was detected in your historical data; "
-            f"confidence intervals are widened to maintain a honest false positive rate."
+            f"**Safety Net Active:** Standard error inflated by {pct_inflated:.1f}% "
+            f"(φ = {reduction_factor:.3f}). True real-world noise has been accounted for, keeping your false positive rate honest."
         )
 
     for i in range(1, num_variants):
