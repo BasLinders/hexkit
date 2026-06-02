@@ -38,6 +38,5 @@ Happy Horizon is a creative digital agency of experts in strategic thinking, ana
 """, unsafe_allow_html=True)
 
 linkedin_url = "https://www.linkedin.com/in/blinders/"
-happyhorizon_url = "https://happyhorizon.com/"
 footnote_text = f"""Engineered and developed by <a href="{linkedin_url}" target="_blank">Bas Linders</a>"""
 st.markdown(footnote_text, unsafe_allow_html=True)
