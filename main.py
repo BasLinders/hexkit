@@ -7,9 +7,12 @@ st.set_page_config(
 )
 
 # Main Page UI
+logo_url = "https://raw.githubusercontent.com/BasLinders/hexkit/main/hexkit-logo-final_small.png"
+st.sidebar.image(logo_url, width="stretch")
 
-st.title("HEXKIT")
-st.write("### <span style='color: orange;'>v0.7.3-beta</span>", unsafe_allow_html=True)
+# st.title("HEXKIT")
+# st.image(logo_url)
+st.write("### <span style='color: orange;'>v1.4.1</span>", unsafe_allow_html=True)
 st.write("""
 This is the main page for the Happy Horizon Experimentation Toolkit. You can navigate to individual apps using the sidebar.
 
@@ -35,6 +38,5 @@ Happy Horizon is a creative digital agency of experts in strategic thinking, ana
 """, unsafe_allow_html=True)
 
 linkedin_url = "https://www.linkedin.com/in/blinders/"
-happyhorizon_url = "https://happyhorizon.com/"
 footnote_text = f"""Engineered and developed by <a href="{linkedin_url}" target="_blank">Bas Linders</a>"""
 st.markdown(footnote_text, unsafe_allow_html=True)

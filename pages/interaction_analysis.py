@@ -1,8 +1,8 @@
+import patsy
 import itertools
 import re
 import textwrap
 from typing import Any, Dict, List, Tuple
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -12,15 +12,15 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="Interaction Analysis", page_icon="🔢")
+st.set_page_config(page_title="Interaction Analysis", page_icon="🔢", layout="wide")
 
 
 # ---------------------------------------------------------------------------
-# InteractionEngine (inlined — no external import required)
+# InteractionEngine
 # ---------------------------------------------------------------------------
 
 # Pre-compiled regex for parsing statsmodels coefficient names like:
-# "C(test1)[T.VariantB]"  →  group(1)="test1", group(2)="VariantB"
+# "C(test1)[T.VariantB]" -> group(1)="test1", group(2)="VariantB"
 _COEF_TERM_RE = re.compile(r"C\((\w+)\)\[T\.([^\]]+)\]")
 
 
@@ -47,8 +47,8 @@ class InteractionEngine:
         Prepares a cleaned, aggregated dataframe for model fitting.
 
         Each row represents one unique combination of test variants.
-        The response is kept as (conversions, non_conversions) — a two-column
-        binomial response — which is the statistically correct approach for
+        The response is kept as (conversions, non_conversions) - a two-column
+        binomial response - which is the statistically correct approach for
         pre-aggregated count data.
         """
         df = input_df.copy()
@@ -57,31 +57,27 @@ class InteractionEngine:
         df["non_conversions"] = df["visitors"] - df["conversions"]
         return df
 
-    def fit_interaction_model_from_formula(
-        self, df: pd.DataFrame, test_cols: List[str]
-    ):
+    def fit_interaction_model(self, df: pd.DataFrame, test_cols: List[str]):
         """
-        Fits a full-factorial GLM-Binomial model using the statsmodels
-        formula API.
+        Fits a full-factorial GLM-Binomial model using explicit matrices.
 
         Uses a two-column binomial response (conversions, non_conversions),
         which is correct for pre-aggregated count data and does NOT inflate
         the effective sample size the way freq_weights would.
-
-        Raises
-        ------
-        ValueError
-            On invalid inputs or model fitting failure.
         """
         self._validate_inputs(df, test_cols)
 
+        # 1. Prepare 2D Endogenous Variable (Response) explicitly
+        endog = df[["conversions", "non_conversions"]].to_numpy()
+
+        # 2. Build Exogenous Design Matrix via patsy
         formula_rhs = " * ".join([f"C({col})" for col in test_cols])
-        formula = f"conversions + non_conversions ~ {formula_rhs}"
+        exog = patsy.dmatrix(f"~ {formula_rhs}", data=df, return_type='dataframe') # type: ignore
 
         try:
-            model = sm.formula.glm(
-                formula=formula,
-                data=df,
+            model = sm.GLM(
+                endog=endog,
+                exog=exog,
                 family=sm.families.Binomial(),
             ).fit()
         except Exception as e:
@@ -90,14 +86,16 @@ class InteractionEngine:
         return model
 
     @staticmethod
-    def format_summary_table(model) -> pd.DataFrame:
+    def format_summary_table(model) -> Tuple[pd.DataFrame, Dict[str, str]]:
         """
-        Returns a copy of the coefficient summary table with human-readable
-        index labels.
+        Returns the coefficient summary table with human-readable index labels,
+        alongside the raw→readable name mapping so callers don't need to
+        re-parse the model object.
         """
-        summary = model.summary2().tables[1].copy()
-        summary.index = summary.index.map(InteractionEngine._rename_coefficient)
-        return summary
+        raw_summary = model.summary2().tables[1].copy()
+        name_map = {raw: InteractionEngine._rename_coefficient(raw) for raw in raw_summary.index}
+        raw_summary.index = raw_summary.index.map(name_map)
+        return raw_summary, name_map
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -124,8 +122,8 @@ class InteractionEngine:
         if df["conversions"].lt(0).any():
             raise ValueError("'conversions' column contains negative values.")
 
-        if df["visitors"].lt(0).any():
-            raise ValueError("'visitors' column contains negative values.")
+        if df["visitors"].le(0).any():
+            raise ValueError("'visitors' column contains zero or negative values.")
 
         if (df["conversions"] > df["visitors"]).any():
             raise ValueError(
@@ -174,10 +172,9 @@ _engine = InteractionEngine()
 # Sidebar / input
 # ---------------------------------------------------------------------------
 
-def _build_sidebar() -> Tuple[List[Dict[str, Any]], int]:
+def _build_sidebar() -> List[Dict[str, Any]]:
     """
-    Renders the sidebar configuration widgets and returns the test configs
-    and the number of tests.  Does NOT render the data editor.
+    Renders the sidebar configuration widgets and returns the test configs.
     """
     st.sidebar.header("Configuration")
 
@@ -203,7 +200,7 @@ def _build_sidebar() -> Tuple[List[Dict[str, Any]], int]:
         variants = [v.strip() for v in variants_str.split(",") if v.strip()]
         test_configs.append({"name": name, "variants": variants})
 
-    return test_configs, num_tests
+    return test_configs
 
 
 def _build_default_df(
@@ -226,6 +223,17 @@ def _build_default_df(
     return df
 
 
+def _df_signature(df: pd.DataFrame, test_names: List[str]) -> str:
+    """
+    Returns a string that changes whenever the table schema OR the set of
+    variant combinations changes.  Columns alone are insufficient because
+    adding a variant (e.g. "A, B" → "A, B, C") doesn't change column names.
+    """
+    col_sig = str(list(df.columns))
+    row_sig = str([tuple(r) for r in df[test_names].itertuples(index=False)])
+    return col_sig + row_sig
+
+
 def user_input() -> Tuple[pd.DataFrame, List[str]]:
     """
     Full input section: sidebar + data editor.
@@ -239,17 +247,19 @@ def user_input() -> Tuple[pd.DataFrame, List[str]]:
     edited_df : pd.DataFrame
     test_names : list[str]
     """
-    test_configs, _ = _build_sidebar()
+    test_configs = _build_sidebar()
     test_names = [cfg["name"] for cfg in test_configs]
 
     default_df = _build_default_df(test_configs, test_names)
 
     # --- Session-state persistence -------------------------------------------
-    col_signature = str(list(default_df.columns))
-    schema_changed = st.session_state.get("_col_sig") != col_signature
+    # Include variant-row structure in the signature, not just column names,
+    # so that adding/removing variants correctly triggers a table rebuild.
+    sig = _df_signature(default_df, test_names)
+    schema_changed = st.session_state.get("_col_sig") != sig
 
     if schema_changed:
-        st.session_state["_col_sig"] = col_signature
+        st.session_state["_col_sig"] = sig
         # Only initialize the base dataframe when the schema changes
         st.session_state["input_df"] = default_df
         # Removing the editor key forces Streamlit to rebuild the widget
@@ -267,18 +277,18 @@ def user_input() -> Tuple[pd.DataFrame, List[str]]:
         st.session_state["input_df"],
         key="_data_editor",
         num_rows="fixed",
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     
-    # We DO NOT write edited_df back to st.session_state["input_df"] here.
-    # We just return it for downstream calculations.
+    # DO NOT write edited_df back to st.session_state["input_df"] here.
+    # Just return it for downstream calculations.
 
     return edited_df, test_names
 
 
 # ---------------------------------------------------------------------------
-# Validation (UI layer — user-friendly messages)
+# Validation
 # ---------------------------------------------------------------------------
 
 def validate_input_df(df: pd.DataFrame, test_cols: List[str]) -> List[str]:
@@ -319,13 +329,10 @@ def render_model_summary(model) -> Dict[str, str]:
     Renders the coefficient summary table and interaction analysis section.
     Returns the readable name mapping so downstream plots can reuse it.
     """
-    summary_df = InteractionEngine.format_summary_table(model)
-    # Build a name map from raw index → readable index for use in plots
-    raw_index = model.summary2().tables[1].index
-    name_map = dict(zip(raw_index, summary_df.index))
+    summary_df, name_map = InteractionEngine.format_summary_table(model)
 
     st.write("### Model Summary")
-    st.dataframe(summary_df.astype(float).round(4), use_container_width=True)
+    st.dataframe(summary_df.astype(float).round(4), width="stretch")
 
     # --- Interaction analysis -----------------------------------------------
     p_values = model.pvalues
@@ -369,10 +376,10 @@ def render_forest_plot(model, name_map: Dict[str, str]) -> None:
 
     results = pd.DataFrame(
         {
-            "Feature":     [name_map.get(n, n) for n in params.index],
+            "Feature": [name_map.get(n, n) for n in params.index],
             "Coefficient": params.values,
-            "Lower":       conf[0].values,
-            "Upper":       conf[1].values,
+            "Lower": conf[0].values,
+            "Upper": conf[1].values,
         }
     ).sort_values("Coefficient")
 
@@ -402,6 +409,7 @@ def render_forest_plot(model, name_map: Dict[str, str]) -> None:
     plt.tight_layout()
 
     st.pyplot(fig)
+    plt.close(fig)
 
 
 def render_interaction_table(model, name_map: Dict[str, str]) -> None:
@@ -412,8 +420,8 @@ def render_interaction_table(model, name_map: Dict[str, str]) -> None:
     st.write("### Interaction Term Details")
 
     params = model.params
-    pvals  = model.pvalues
-    conf   = model.conf_int()
+    pvals = model.pvalues
+    conf = model.conf_int()
 
     interaction_idx = [n for n in params.index if ":" in n]
     if not interaction_idx:
@@ -424,17 +432,17 @@ def render_interaction_table(model, name_map: Dict[str, str]) -> None:
     for raw in interaction_idx:
         rows.append(
             {
-                "Interaction":   name_map.get(raw, raw),
-                "Coefficient":   round(params[raw], 4),
-                "p-value":       round(pvals[raw], 4),
-                "CI Lower":      round(conf.loc[raw, 0], 4),
-                "CI Upper":      round(conf.loc[raw, 1], 4),
-                "Significant":   "✅" if pvals[raw] < 0.05 else "—",
-                "Direction":     "Synergy 📈" if params[raw] > 0 else "Clash 📉",
+                "Interaction": name_map.get(raw, raw),
+                "Coefficient": round(params[raw], 4),
+                "p-value": round(pvals[raw], 4),
+                "CI Lower": round(conf.loc[raw, 0], 4),
+                "CI Upper": round(conf.loc[raw, 1], 4),
+                "Significant": "✅" if pvals[raw] < 0.05 else "—",
+                "Direction": "Synergy 📈" if params[raw] > 0 else "Clash 📉",
             }
         )
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -444,18 +452,18 @@ def render_interaction_table(model, name_map: Dict[str, str]) -> None:
 def render_info_expanders(test_names: List[str]) -> None:
     with st.expander("Why Use This Tool?"):
         st.markdown("""
-### The Problem: Interaction Bias
-When you run multiple experiments simultaneously, you risk **Interaction Bias** — the effect
-of one change (e.g. a new button colour) being influenced by another change (e.g. new pricing).
-Standard A/B dashboards assume independence and can declare a "winner" that actually performs
-poorly when combined with other live features.
-
-### Solution: Factorial Interaction Analysis
-This tool calculates the **Combined Effect** across every variant combination.
-
-- **Detect Clashes:** Two great features that hurt conversion when shown together.
-- **Discover Synergies:** Combinations where 1 + 1 = 3.
-- **Clean Results:** Remove noise caused by concurrent tests to isolate true lift.
+            ### The Problem: Interaction Bias
+            When you run multiple experiments simultaneously, you risk **Interaction Bias**; the effect
+            of one change (e.g. a new button colour) being influenced by another change (e.g. new pricing).
+            Standard A/B dashboards assume independence and can declare a "winner" that actually performs
+            poorly when combined with other live features.
+            
+            ### Solution: Factorial Interaction Analysis
+            This tool calculates the **Combined Effect** across every variant combination.
+            
+            - **Detect Clashes:** Two great features that hurt conversion when shown together.
+            - **Discover Synergies:** Combinations where 1 + 1 = 3.
+            - **Clean Results:** Remove noise caused by concurrent tests to isolate true lift.
         """)
         st.info(
             "Use this tool whenever you have overlapping traffic between two or more "
@@ -464,25 +472,24 @@ This tool calculates the **Combined Effect** across every variant combination.
 
     with st.expander("How to Use This Tool"):
         st.markdown("""
-1. **Define Tests & Variants** — Name your tests and list variants separated by commas (e.g. `A, B, C`).
-2. **The Matrix** — The table auto-generates every possible variant combination.
-3. **First is Baseline** — The **first variant** listed for each test is the statistical control.
-4. **Fill & Calculate** — Enter visitor/conversion counts and click *Calculate*.
+            1. **Define Tests & Variants** - Name your tests and list variants separated by commas (e.g. `A, B, C`).
+            2. **The Matrix** - The table auto-generates every possible variant combination.
+            3. **First is Baseline** - The **first variant** listed for each test is the statistical control.
+            4. **Fill & Calculate** - Enter visitor/conversion counts and click *Calculate*.
         """)
 
     with st.expander("Methodology & Statistical Approach"):
         st.markdown(r"""
-This tool uses a **Generalized Linear Model (GLM)** with a Binomial family (logistic regression).
-
-The response is modelled as a **two-column binomial** `(conversions, non_conversions)` — the
-statistically correct approach for pre-aggregated count data. This avoids inflating the effective
-sample size (which `freq_weights` would do), ensuring that standard errors and p-values are reliable.
-
-**The Interaction Formula** (two tests):
-$$\text{logit}(p) = \beta_0 + \beta_1\,\text{Test}_1 + \beta_2\,\text{Test}_2 + \beta_3(\text{Test}_1 \times \text{Test}_2)$$
-
-The **interaction term** ($\beta_3$) tells us whether the combined effect of two variants differs
-significantly from the sum of their individual effects.
+            This tool uses a **Generalized Linear Model (GLM)** with a Binomial family (logistic regression).
+            
+            The response is modelled as a **two-column binomial** `(conversions, non_conversions)`. This avoids inflating the effective
+            sample size, ensuring that standard errors and p-values are reliable.
+            
+            **The Interaction Formula** (two tests):
+            $$\text{logit}(p) = \beta_0 + \beta_1\,\text{Test}_1 + \beta_2\,\text{Test}_2 + \beta_3(\text{Test}_1 \times \text{Test}_2)$$
+            
+            The **interaction term** ($\beta_3$) tells us whether the combined effect of two variants differs
+            significantly from the sum of their individual effects.
         """)
 
     with st.expander("SQL Query Helper (Get your data)"):
@@ -534,7 +541,7 @@ def run() -> None:
         # --- Prepare data & fit model via engine ---
         try:
             df_prepared = InteractionEngine.prepare_aggregated_format(edited_df, test_cols)
-            model = _engine.fit_interaction_model_from_formula(df_prepared, test_cols)
+            model = _engine.fit_interaction_model(df_prepared, test_cols)
         except ValueError as exc:
             st.error(f"Model fitting failed: {exc}")
             st.stop()

@@ -9,6 +9,7 @@ import math
 st.set_page_config(
     page_title="SRM calculator",
     page_icon="🔢",
+    layout="wide",
 )
 
 def calculate_srm(visitor_counts, expected_proportions):
@@ -71,7 +72,7 @@ def render_results(results, visitor_counts, num_variants):
         xOffset='Metric:N' # Creates the "grouped" bar effect
     ).properties(height=400)
 
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
     if results["is_mismatch"]:
         st.error(f"SRM Detected! P-value: {p_value:.4f}")
@@ -94,6 +95,8 @@ def run():
     """
     
     num_variants = st.number_input("Number of variants?", min_value=2, max_value=26, step=1)
+
+    initialize_state(num_variants)
     
     col1, col2 = st.columns(2)
     alphabet = string.ascii_uppercase
@@ -121,6 +124,8 @@ def run():
         # Critical Blockers: Total proportions are zero or negative
         elif current_sum <= 0:
             st.error("Total expected proportions must be greater than 0%.")
+        elif any(p == 0 for p in expected_proportions):
+            st.error("Expected % must be greater than 0 for all active variants.")
 
         # Successful path (with optional non-blocking warnings)
         else:
