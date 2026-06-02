@@ -2,6 +2,7 @@ import patsy
 import itertools
 import re
 import textwrap
+import warnings as _warnings
 from typing import Any, Dict, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,11 +17,11 @@ st.set_page_config(page_title="Interaction Analysis", page_icon="🔢", layout="
 
 
 # ---------------------------------------------------------------------------
-# InteractionEngine
+# InteractionEngine (inlined — no external import required)
 # ---------------------------------------------------------------------------
 
 # Pre-compiled regex for parsing statsmodels coefficient names like:
-# "C(test1)[T.VariantB]" -> group(1)="test1", group(2)="VariantB"
+# "C(test1)[T.VariantB]"  →  group(1)="test1", group(2)="VariantB"
 _COEF_TERM_RE = re.compile(r"C\((\w+)\)\[T\.([^\]]+)\]")
 
 
@@ -57,14 +58,58 @@ class InteractionEngine:
         df["non_conversions"] = df["visitors"] - df["conversions"]
         return df
 
-    def fit_interaction_model(self, df: pd.DataFrame, test_cols: List[str]):
+    @staticmethod
+    def check_data_quality(df: pd.DataFrame, test_cols: List[str]) -> List[str]:
+        """
+        Returns soft warnings (not errors) about data conditions likely to
+        cause perfect separation in the GLM.  Called before fitting so the
+        user understands the root cause if statsmodels warnings appear.
+        """
+        messages: List[str] = []
+
+        def _combo_label(row: pd.Series) -> str:
+            return " / ".join(f"{col}={row[col]}" for col in test_cols)
+
+        zero_rate_rows = df[df["conversions"] == 0]
+        full_rate_rows = df[df["conversions"] == df["visitors"]]
+
+        if not zero_rate_rows.empty:
+            combos = zero_rate_rows.apply(_combo_label, axis=1).tolist()
+            messages.append(
+                f"The following segment(s) have a **0% conversion rate**, which can "
+                f"cause perfect separation - coefficient estimates may be unreliable: "
+                f"{', '.join(combos)}."
+            )
+        if not full_rate_rows.empty:
+            combos = full_rate_rows.apply(_combo_label, axis=1).tolist()
+            messages.append(
+                f"The following segment(s) have a **100% conversion rate**, which can "
+                f"cause perfect separation - coefficient estimates may be unreliable: "
+                f"{', '.join(combos)}."
+            )
+
+        return messages
+
+    def fit_interaction_model(
+        self, df: pd.DataFrame, test_cols: List[str]
+    ) -> Tuple[Any, List[str]]:
         """
         Fits a full-factorial GLM-Binomial model using explicit matrices.
 
         Uses a two-column binomial response (conversions, non_conversions),
         which is correct for pre-aggregated count data and does NOT inflate
         the effective sample size the way freq_weights would.
+
+        Returns
+        -------
+        model : fitted GLMResults
+        fit_warnings : list[str]
+            Human-readable messages for any PerfectSeparationWarning or
+            numerical RuntimeWarning raised during fitting.  The caller is
+            responsible for surfacing these to the user.
         """
+        from statsmodels.genmod.generalized_linear_model import PerfectSeparationWarning
+
         self._validate_inputs(df, test_cols)
 
         # 1. Prepare 2D Endogenous Variable (Response) explicitly
@@ -75,15 +120,40 @@ class InteractionEngine:
         exog = patsy.dmatrix(f"~ {formula_rhs}", data=df, return_type='dataframe') # type: ignore
 
         try:
-            model = sm.GLM(
-                endog=endog,
-                exog=exog,
-                family=sm.families.Binomial(),
-            ).fit()
+            with _warnings.catch_warnings(record=True) as caught:
+                _warnings.simplefilter("always")
+                model = sm.GLM(
+                    endog=endog,
+                    exog=exog,
+                    family=sm.families.Binomial(),
+                ).fit()
         except Exception as e:
             raise ValueError(f"Interaction model fitting failed: {e}") from e
 
-        return model
+        # Translate captured warnings into readable strings and deduplicate.
+        # statsmodels tends to emit each warning twice (once per IRLS pass).
+        seen: set = set()
+        fit_warnings: List[str] = []
+        for w in caught:
+            if issubclass(w.category, PerfectSeparationWarning):
+                msg = (
+                    "**Perfect separation detected** — one or more variant combinations "
+                    "may have a 0% or 100% conversion rate. Affected coefficient "
+                    "estimates and p-values should be treated with caution."
+                )
+            elif issubclass(w.category, RuntimeWarning) and "divide by zero" in str(w.message):
+                msg = (
+                    "**Numerical instability during fitting** (divide by zero in scale "
+                    "calculation). This is typically a secondary symptom of perfect "
+                    "separation - see the data quality warning above."
+                )
+            else:
+                continue
+            if msg not in seen:
+                seen.add(msg)
+                fit_warnings.append(msg)
+
+        return model, fit_warnings
 
     @staticmethod
     def format_summary_table(model) -> Tuple[pd.DataFrame, Dict[str, str]]:
@@ -164,7 +234,7 @@ class InteractionEngine:
         return name
 
 
-# Singleton engine — constructed once per session
+# Singleton engine, constructed once per session
 _engine = InteractionEngine()
 
 
@@ -260,9 +330,7 @@ def user_input() -> Tuple[pd.DataFrame, List[str]]:
 
     if schema_changed:
         st.session_state["_col_sig"] = sig
-        # Only initialize the base dataframe when the schema changes
         st.session_state["input_df"] = default_df
-        # Removing the editor key forces Streamlit to rebuild the widget
         st.session_state.pop("_data_editor", None)
 
     st.write("### Experiment Data Entry")
@@ -271,8 +339,6 @@ def user_input() -> Tuple[pd.DataFrame, List[str]]:
         "The **first variant** listed for each test is treated as the control."
     )
 
-    # Streamlit will automatically apply any user edits stored in 
-    # st.session_state["_data_editor"] to the base "input_df".
     edited_df = st.data_editor(
         st.session_state["input_df"],
         key="_data_editor",
@@ -288,7 +354,7 @@ def user_input() -> Tuple[pd.DataFrame, List[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Validation
+# Validation (UI layer — user-friendly messages)
 # ---------------------------------------------------------------------------
 
 def validate_input_df(df: pd.DataFrame, test_cols: List[str]) -> List[str]:
@@ -420,8 +486,8 @@ def render_interaction_table(model, name_map: Dict[str, str]) -> None:
     st.write("### Interaction Term Details")
 
     params = model.params
-    pvals = model.pvalues
-    conf = model.conf_int()
+    pvals  = model.pvalues
+    conf   = model.conf_int()
 
     interaction_idx = [n for n in params.index if ":" in n]
     if not interaction_idx:
@@ -457,10 +523,10 @@ def render_info_expanders(test_names: List[str]) -> None:
             of one change (e.g. a new button colour) being influenced by another change (e.g. new pricing).
             Standard A/B dashboards assume independence and can declare a "winner" that actually performs
             poorly when combined with other live features.
-            
+
             ### Solution: Factorial Interaction Analysis
             This tool calculates the **Combined Effect** across every variant combination.
-            
+
             - **Detect Clashes:** Two great features that hurt conversion when shown together.
             - **Discover Synergies:** Combinations where 1 + 1 = 3.
             - **Clean Results:** Remove noise caused by concurrent tests to isolate true lift.
@@ -481,13 +547,13 @@ def render_info_expanders(test_names: List[str]) -> None:
     with st.expander("Methodology & Statistical Approach"):
         st.markdown(r"""
             This tool uses a **Generalized Linear Model (GLM)** with a Binomial family (logistic regression).
-            
+
             The response is modelled as a **two-column binomial** `(conversions, non_conversions)`. This avoids inflating the effective
             sample size, ensuring that standard errors and p-values are reliable.
-            
+
             **The Interaction Formula** (two tests):
             $$\text{logit}(p) = \beta_0 + \beta_1\,\text{Test}_1 + \beta_2\,\text{Test}_2 + \beta_3(\text{Test}_1 \times \text{Test}_2)$$
-            
+
             The **interaction term** ($\beta_3$) tells us whether the combined effect of two variants differs
             significantly from the sum of their individual effects.
         """)
@@ -541,7 +607,16 @@ def run() -> None:
         # --- Prepare data & fit model via engine ---
         try:
             df_prepared = InteractionEngine.prepare_aggregated_format(edited_df, test_cols)
-            model = _engine.fit_interaction_model(df_prepared, test_cols)
+
+            # Soft data-quality warnings shown before fitting so the user
+            # understands the root cause of any perfect-separation messages.
+            for msg in InteractionEngine.check_data_quality(df_prepared, test_cols):
+                st.warning(msg)
+
+            model, fit_warnings = _engine.fit_interaction_model(df_prepared, test_cols)
+
+            for msg in fit_warnings:
+                st.warning(msg)
         except ValueError as exc:
             st.error(f"Model fitting failed: {exc}")
             st.stop()
