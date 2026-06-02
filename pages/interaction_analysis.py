@@ -2,6 +2,7 @@ import patsy
 import itertools
 import re
 import textwrap
+import warnings as _warnings
 from typing import Any, Dict, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
@@ -47,8 +48,8 @@ class InteractionEngine:
         Prepares a cleaned, aggregated dataframe for model fitting.
 
         Each row represents one unique combination of test variants.
-        The response is kept as (conversions, non_conversions) — a two-column
-        binomial response — which is the statistically correct approach for
+        The response is kept as (conversions, non_conversions) - a two-column
+        binomial response - which is the statistically correct approach for
         pre-aggregated count data.
         """
         df = input_df.copy()
@@ -57,14 +58,58 @@ class InteractionEngine:
         df["non_conversions"] = df["visitors"] - df["conversions"]
         return df
 
-    def fit_interaction_model(self, df: pd.DataFrame, test_cols: List[str]):
+    @staticmethod
+    def check_data_quality(df: pd.DataFrame, test_cols: List[str]) -> List[str]:
+        """
+        Returns soft warnings (not errors) about data conditions likely to
+        cause perfect separation in the GLM.  Called before fitting so the
+        user understands the root cause if statsmodels warnings appear.
+        """
+        messages: List[str] = []
+
+        def _combo_label(row: pd.Series) -> str:
+            return " / ".join(f"{col}={row[col]}" for col in test_cols)
+
+        zero_rate_rows = df[df["conversions"] == 0]
+        full_rate_rows = df[df["conversions"] == df["visitors"]]
+
+        if not zero_rate_rows.empty:
+            combos = zero_rate_rows.apply(_combo_label, axis=1).tolist()
+            messages.append(
+                f"The following segment(s) have a **0% conversion rate**, which can "
+                f"cause perfect separation - coefficient estimates may be unreliable: "
+                f"{', '.join(combos)}."
+            )
+        if not full_rate_rows.empty:
+            combos = full_rate_rows.apply(_combo_label, axis=1).tolist()
+            messages.append(
+                f"The following segment(s) have a **100% conversion rate**, which can "
+                f"cause perfect separation - coefficient estimates may be unreliable: "
+                f"{', '.join(combos)}."
+            )
+
+        return messages
+
+    def fit_interaction_model(
+        self, df: pd.DataFrame, test_cols: List[str]
+    ) -> Tuple[Any, List[str]]:
         """
         Fits a full-factorial GLM-Binomial model using explicit matrices.
 
         Uses a two-column binomial response (conversions, non_conversions),
         which is correct for pre-aggregated count data and does NOT inflate
         the effective sample size the way freq_weights would.
+
+        Returns
+        -------
+        model : fitted GLMResults
+        fit_warnings : list[str]
+            Human-readable messages for any PerfectSeparationWarning or
+            numerical RuntimeWarning raised during fitting.  The caller is
+            responsible for surfacing these to the user.
         """
+        from statsmodels.genmod.generalized_linear_model import PerfectSeparationWarning
+
         self._validate_inputs(df, test_cols)
 
         # 1. Prepare 2D Endogenous Variable (Response) explicitly
@@ -75,25 +120,52 @@ class InteractionEngine:
         exog = patsy.dmatrix(f"~ {formula_rhs}", data=df, return_type='dataframe') # type: ignore
 
         try:
-            model = sm.GLM(
-                endog=endog,
-                exog=exog,
-                family=sm.families.Binomial(),
-            ).fit()
+            with _warnings.catch_warnings(record=True) as caught:
+                _warnings.simplefilter("always")
+                model = sm.GLM(
+                    endog=endog,
+                    exog=exog,
+                    family=sm.families.Binomial(),
+                ).fit()
         except Exception as e:
             raise ValueError(f"Interaction model fitting failed: {e}") from e
 
-        return model
+        # Translate captured warnings into readable strings and deduplicate.
+        # statsmodels tends to emit each warning twice (once per IRLS pass).
+        seen: set = set()
+        fit_warnings: List[str] = []
+        for w in caught:
+            if issubclass(w.category, PerfectSeparationWarning):
+                msg = (
+                    "**Perfect separation detected** — one or more variant combinations "
+                    "may have a 0% or 100% conversion rate. Affected coefficient "
+                    "estimates and p-values should be treated with caution."
+                )
+            elif issubclass(w.category, RuntimeWarning) and "divide by zero" in str(w.message):
+                msg = (
+                    "**Numerical instability during fitting** (divide by zero in scale "
+                    "calculation). This is typically a secondary symptom of perfect "
+                    "separation - see the data quality warning above."
+                )
+            else:
+                continue
+            if msg not in seen:
+                seen.add(msg)
+                fit_warnings.append(msg)
+
+        return model, fit_warnings
 
     @staticmethod
-    def format_summary_table(model) -> pd.DataFrame:
+    def format_summary_table(model) -> Tuple[pd.DataFrame, Dict[str, str]]:
         """
-        Returns a copy of the coefficient summary table with human-readable
-        index labels.
+        Returns the coefficient summary table with human-readable index labels,
+        alongside the raw→readable name mapping so callers don't need to
+        re-parse the model object.
         """
-        summary = model.summary2().tables[1].copy()
-        summary.index = summary.index.map(InteractionEngine._rename_coefficient)
-        return summary
+        raw_summary = model.summary2().tables[1].copy()
+        name_map = {raw: InteractionEngine._rename_coefficient(raw) for raw in raw_summary.index}
+        raw_summary.index = raw_summary.index.map(name_map)
+        return raw_summary, name_map
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -120,8 +192,8 @@ class InteractionEngine:
         if df["conversions"].lt(0).any():
             raise ValueError("'conversions' column contains negative values.")
 
-        if df["visitors"].lt(0).any():
-            raise ValueError("'visitors' column contains negative values.")
+        if df["visitors"].le(0).any():
+            raise ValueError("'visitors' column contains zero or negative values.")
 
         if (df["conversions"] > df["visitors"]).any():
             raise ValueError(
@@ -162,7 +234,7 @@ class InteractionEngine:
         return name
 
 
-# Singleton engine — constructed once per session
+# Singleton engine, constructed once per session
 _engine = InteractionEngine()
 
 
@@ -170,10 +242,9 @@ _engine = InteractionEngine()
 # Sidebar / input
 # ---------------------------------------------------------------------------
 
-def _build_sidebar() -> Tuple[List[Dict[str, Any]], int]:
+def _build_sidebar() -> List[Dict[str, Any]]:
     """
-    Renders the sidebar configuration widgets and returns the test configs
-    and the number of tests.  Does NOT render the data editor.
+    Renders the sidebar configuration widgets and returns the test configs.
     """
     st.sidebar.header("Configuration")
 
@@ -199,7 +270,7 @@ def _build_sidebar() -> Tuple[List[Dict[str, Any]], int]:
         variants = [v.strip() for v in variants_str.split(",") if v.strip()]
         test_configs.append({"name": name, "variants": variants})
 
-    return test_configs, num_tests
+    return test_configs
 
 
 def _build_default_df(
@@ -222,6 +293,17 @@ def _build_default_df(
     return df
 
 
+def _df_signature(df: pd.DataFrame, test_names: List[str]) -> str:
+    """
+    Returns a string that changes whenever the table schema OR the set of
+    variant combinations changes.  Columns alone are insufficient because
+    adding a variant (e.g. "A, B" → "A, B, C") doesn't change column names.
+    """
+    col_sig = str(list(df.columns))
+    row_sig = str([tuple(r) for r in df[test_names].itertuples(index=False)])
+    return col_sig + row_sig
+
+
 def user_input() -> Tuple[pd.DataFrame, List[str]]:
     """
     Full input section: sidebar + data editor.
@@ -235,20 +317,20 @@ def user_input() -> Tuple[pd.DataFrame, List[str]]:
     edited_df : pd.DataFrame
     test_names : list[str]
     """
-    test_configs, _ = _build_sidebar()
+    test_configs = _build_sidebar()
     test_names = [cfg["name"] for cfg in test_configs]
 
     default_df = _build_default_df(test_configs, test_names)
 
     # --- Session-state persistence -------------------------------------------
-    col_signature = str(list(default_df.columns))
-    schema_changed = st.session_state.get("_col_sig") != col_signature
+    # Include variant-row structure in the signature, not just column names,
+    # so that adding/removing variants correctly triggers a table rebuild.
+    sig = _df_signature(default_df, test_names)
+    schema_changed = st.session_state.get("_col_sig") != sig
 
     if schema_changed:
-        st.session_state["_col_sig"] = col_signature
-        # Only initialize the base dataframe when the schema changes
+        st.session_state["_col_sig"] = sig
         st.session_state["input_df"] = default_df
-        # Removing the editor key forces Streamlit to rebuild the widget
         st.session_state.pop("_data_editor", None)
 
     st.write("### Experiment Data Entry")
@@ -257,8 +339,6 @@ def user_input() -> Tuple[pd.DataFrame, List[str]]:
         "The **first variant** listed for each test is treated as the control."
     )
 
-    # Streamlit will automatically apply any user edits stored in 
-    # st.session_state["_data_editor"] to the base "input_df".
     edited_df = st.data_editor(
         st.session_state["input_df"],
         key="_data_editor",
@@ -267,8 +347,8 @@ def user_input() -> Tuple[pd.DataFrame, List[str]]:
         hide_index=True,
     )
     
-    # We DO NOT write edited_df back to st.session_state["input_df"] here.
-    # We just return it for downstream calculations.
+    # DO NOT write edited_df back to st.session_state["input_df"] here.
+    # Just return it for downstream calculations.
 
     return edited_df, test_names
 
@@ -315,10 +395,7 @@ def render_model_summary(model) -> Dict[str, str]:
     Renders the coefficient summary table and interaction analysis section.
     Returns the readable name mapping so downstream plots can reuse it.
     """
-    summary_df = InteractionEngine.format_summary_table(model)
-    # Build a name map from raw index → readable index for use in plots
-    raw_index = model.summary2().tables[1].index
-    name_map = dict(zip(raw_index, summary_df.index))
+    summary_df, name_map = InteractionEngine.format_summary_table(model)
 
     st.write("### Model Summary")
     st.dataframe(summary_df.astype(float).round(4), width="stretch")
@@ -365,10 +442,10 @@ def render_forest_plot(model, name_map: Dict[str, str]) -> None:
 
     results = pd.DataFrame(
         {
-            "Feature":     [name_map.get(n, n) for n in params.index],
+            "Feature": [name_map.get(n, n) for n in params.index],
             "Coefficient": params.values,
-            "Lower":       conf[0].values,
-            "Upper":       conf[1].values,
+            "Lower": conf[0].values,
+            "Upper": conf[1].values,
         }
     ).sort_values("Coefficient")
 
@@ -398,6 +475,7 @@ def render_forest_plot(model, name_map: Dict[str, str]) -> None:
     plt.tight_layout()
 
     st.pyplot(fig)
+    plt.close(fig)
 
 
 def render_interaction_table(model, name_map: Dict[str, str]) -> None:
@@ -420,13 +498,13 @@ def render_interaction_table(model, name_map: Dict[str, str]) -> None:
     for raw in interaction_idx:
         rows.append(
             {
-                "Interaction":   name_map.get(raw, raw),
-                "Coefficient":   round(params[raw], 4),
-                "p-value":       round(pvals[raw], 4),
-                "CI Lower":      round(conf.loc[raw, 0], 4),
-                "CI Upper":      round(conf.loc[raw, 1], 4),
-                "Significant":   "✅" if pvals[raw] < 0.05 else "—",
-                "Direction":     "Synergy 📈" if params[raw] > 0 else "Clash 📉",
+                "Interaction": name_map.get(raw, raw),
+                "Coefficient": round(params[raw], 4),
+                "p-value": round(pvals[raw], 4),
+                "CI Lower": round(conf.loc[raw, 0], 4),
+                "CI Upper": round(conf.loc[raw, 1], 4),
+                "Significant": "✅" if pvals[raw] < 0.05 else "—",
+                "Direction": "Synergy 📈" if params[raw] > 0 else "Clash 📉",
             }
         )
 
@@ -440,18 +518,18 @@ def render_interaction_table(model, name_map: Dict[str, str]) -> None:
 def render_info_expanders(test_names: List[str]) -> None:
     with st.expander("Why Use This Tool?"):
         st.markdown("""
-### The Problem: Interaction Bias
-When you run multiple experiments simultaneously, you risk **Interaction Bias**; the effect
-of one change (e.g. a new button colour) being influenced by another change (e.g. new pricing).
-Standard A/B dashboards assume independence and can declare a "winner" that actually performs
-poorly when combined with other live features.
+            ### The Problem: Interaction Bias
+            When you run multiple experiments simultaneously, you risk **Interaction Bias**; the effect
+            of one change (e.g. a new button colour) being influenced by another change (e.g. new pricing).
+            Standard A/B dashboards assume independence and can declare a "winner" that actually performs
+            poorly when combined with other live features.
 
-### Solution: Factorial Interaction Analysis
-This tool calculates the **Combined Effect** across every variant combination.
+            ### Solution: Factorial Interaction Analysis
+            This tool calculates the **Combined Effect** across every variant combination.
 
-- **Detect Clashes:** Two great features that hurt conversion when shown together.
-- **Discover Synergies:** Combinations where 1 + 1 = 3.
-- **Clean Results:** Remove noise caused by concurrent tests to isolate true lift.
+            - **Detect Clashes:** Two great features that hurt conversion when shown together.
+            - **Discover Synergies:** Combinations where 1 + 1 = 3.
+            - **Clean Results:** Remove noise caused by concurrent tests to isolate true lift.
         """)
         st.info(
             "Use this tool whenever you have overlapping traffic between two or more "
@@ -460,24 +538,24 @@ This tool calculates the **Combined Effect** across every variant combination.
 
     with st.expander("How to Use This Tool"):
         st.markdown("""
-1. **Define Tests & Variants** - Name your tests and list variants separated by commas (e.g. `A, B, C`).
-2. **The Matrix** - The table auto-generates every possible variant combination.
-3. **First is Baseline** - The **first variant** listed for each test is the statistical control.
-4. **Fill & Calculate** - Enter visitor/conversion counts and click *Calculate*.
+            1. **Define Tests & Variants** - Name your tests and list variants separated by commas (e.g. `A, B, C`).
+            2. **The Matrix** - The table auto-generates every possible variant combination.
+            3. **First is Baseline** - The **first variant** listed for each test is the statistical control.
+            4. **Fill & Calculate** - Enter visitor/conversion counts and click *Calculate*.
         """)
 
     with st.expander("Methodology & Statistical Approach"):
         st.markdown(r"""
-This tool uses a **Generalized Linear Model (GLM)** with a Binomial family (logistic regression).
+            This tool uses a **Generalized Linear Model (GLM)** with a Binomial family (logistic regression).
 
-The response is modelled as a **two-column binomial** `(conversions, non_conversions)`. This avoids inflating the effective
-sample size, ensuring that standard errors and p-values are reliable.
+            The response is modelled as a **two-column binomial** `(conversions, non_conversions)`. This avoids inflating the effective
+            sample size, ensuring that standard errors and p-values are reliable.
 
-**The Interaction Formula** (two tests):
-$$\text{logit}(p) = \beta_0 + \beta_1\,\text{Test}_1 + \beta_2\,\text{Test}_2 + \beta_3(\text{Test}_1 \times \text{Test}_2)$$
+            **The Interaction Formula** (two tests):
+            $$\text{logit}(p) = \beta_0 + \beta_1\,\text{Test}_1 + \beta_2\,\text{Test}_2 + \beta_3(\text{Test}_1 \times \text{Test}_2)$$
 
-The **interaction term** ($\beta_3$) tells us whether the combined effect of two variants differs
-significantly from the sum of their individual effects.
+            The **interaction term** ($\beta_3$) tells us whether the combined effect of two variants differs
+            significantly from the sum of their individual effects.
         """)
 
     with st.expander("SQL Query Helper (Get your data)"):
@@ -529,7 +607,16 @@ def run() -> None:
         # --- Prepare data & fit model via engine ---
         try:
             df_prepared = InteractionEngine.prepare_aggregated_format(edited_df, test_cols)
-            model = _engine.fit_interaction_model(df_prepared, test_cols)
+
+            # Soft data-quality warnings shown before fitting so the user
+            # understands the root cause of any perfect-separation messages.
+            for msg in InteractionEngine.check_data_quality(df_prepared, test_cols):
+                st.warning(msg)
+
+            model, fit_warnings = _engine.fit_interaction_model(df_prepared, test_cols)
+
+            for msg in fit_warnings:
+                st.warning(msg)
         except ValueError as exc:
             st.error(f"Model fitting failed: {exc}")
             st.stop()
