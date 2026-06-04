@@ -1,4 +1,7 @@
-from email import message
+"""
+Experiment Analysis — Streamlit app (Bayesian + Frequentist A/B testing).
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,16 +11,13 @@ import concurrent.futures
 import altair as alt
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import matplotlib.cm as cm
 import matplotlib.ticker as mticker
-import matplotlib.colors as mcolors
 from matplotlib import colormaps
-from matplotlib.figure import Figure
 import plotly.graph_objects as go
 from scipy.stats import beta, norm, chisquare
 import math
 from dataclasses import dataclass
-from typing import Literal, List, Tuple, Dict, Any, cast
+from typing import Literal, List, Tuple, Dict, Any, Optional, cast
 
 
 st.set_page_config(
@@ -25,6 +25,7 @@ st.set_page_config(
     page_icon="🔢",
     layout="wide",
 )
+
 
 def initialize_session_state():
     st.session_state.setdefault("num_variants", 2)
@@ -35,9 +36,10 @@ def initialize_session_state():
     st.session_state.setdefault("aov_cv", 0.5)
     st.session_state.setdefault("confidence_level", 95)
     st.session_state.setdefault("test_duration", 7)
-    st.session_state.setdefault("tail", 'Greater')
+    st.session_state.setdefault("tail", "Greater")
     st.session_state.setdefault("probability_winner", 80.0)
     st.session_state.setdefault("runtime_days", 0)
+
 
 # --- Information / documentation ---
 def display_dynamic_documentation(analysis_method):
@@ -47,7 +49,7 @@ def display_dynamic_documentation(analysis_method):
         with st.expander("Frequentist Analysis: What it provides"):
             st.markdown("""
             This engine focuses on **Null Hypothesis Statistical Testing (NHST)** to determine if the observed difference between variants is statistically significant.
-            
+
             * **Fixed-Horizon Testing:** Ideal for tests where you have a pre-determined sample size.
             * **Error Control:** Strictly controls for **Type I Errors** (False Positives) via $p$-values.
             * **Dual-Gate Evaluation:** First, it checks for a traditional superior win ($p < 0.05$). If that isn't met, it automatically pivots to a **Non-Inferiority Test**.
@@ -63,13 +65,13 @@ def display_dynamic_documentation(analysis_method):
             3.  **Non-Inferiority Z-Score:** We calculate the $Z$-stat by adding the **Non-Inferiority Margin ($\Delta$)** back into the observed difference:
                 $$Z_{NI} = \frac{(CR_v - CR_c) + \Delta}{SE_{unpooled}}$$
             4.  **Lower Bound Estimation:** The engine calculates the lower bound of the difference. If this bound stays above $-\Delta$, the variant is considered "safe."
-            5.  **Overdispersion Correction:** Real-world web traffic is never as perfectly stable as a theoretical coin flip. If historical daily data is provided, the engine compares your actual day-to-day variance against the pure binomial minimum. The ratio $\varphi = \sigma^2_{observed} / \sigma^2_{binomial}$ is used to scale the standard error, adapting your test's sensitivity to the true noisiness of your data stream.
+            5.  **Overdispersion Correction:** Real-world web traffic is never as perfectly stable as a theoretical coin flip. If historical daily data is provided, the engine compares your actual day-to-day variance against the pure binomial minimum, after stripping day-of-week seasonality and correcting for the degrees of freedom consumed by that fit. The ratio $\varphi = \sigma^2_{observed} / \sigma^2_{binomial}$ is used to scale the standard error.
             """)
 
         with st.expander("Frequentist: Interpretation"):
             st.markdown(r"""
             * **p-value (Z-test):** If $p < 0.05$, we reject the null hypothesis. There is less than a 5% chance the observed lift is due to random noise.
-            * **Confidence Intervals (CI):** If the CI for the *relative lift* does not cross $0\%$, the result is statistically significant.
+            * **Confidence Intervals (CI):** The difference CI uses the family-wise (Šidák) level when 3+ variants are present, so it agrees with the significance verdict. If the CI for the *relative lift* does not cross $0\%$, the result is statistically significant.
             * **P-value (Non-Inferiority):** Tests the null hypothesis that the Variant is worse than the Control by more than the margin. If $p \le \alpha$, we reject the idea that the variant is a "loser" and label it non-inferior.
             * **Lower Bound of Difference:** Represents the "worst-case scenario" for the variant's performance. If the bound is $-0.5\%$ and your limit is $-1.0\%$, the test passes.
             * **Success Status:** A green success message indicates that while the variant might not be a "winner," it is statistically unlikely to cause a regression beyond your defined tolerance.
@@ -79,7 +81,7 @@ def display_dynamic_documentation(analysis_method):
         with st.expander("Bayesian Analysis: What it provides"):
             st.markdown("""
             This engine provides a **probabilistic** view of the experiment, moving away from "significant/not significant" to "how much better is it?"
-            
+
             * **Risk-Aware Decisioning:** Quantifies the **Expected Monetary Risk**: the literal monetary amount you stand to lose if the variant is actually worse.
             * **Business Impact:** Translates statistical lift into a **6-month revenue projection** based on your AOV as a constant.
             * **Direct Probabilities:** Gives you a clear "Chance to Beat Control" percentage.
@@ -99,6 +101,7 @@ def display_dynamic_documentation(analysis_method):
             * **Expected Total Contribution:** The net expected monetary gain over 6 months. This accounts for both the upside and the downside risk.
             * **Probability Density Graph:** Visualizes the uncertainty. Thinner, taller peaks indicate higher certainty in the conversion rate.
             """)
+
 
 # -- Data input functions
 def get_bayesian_inputs():
@@ -154,7 +157,7 @@ def get_bayesian_inputs():
         st.session_state.aovs[i] = st.number_input(
             f"Average Order Value for Variant {alphabet[i]}",
             min_value=0.0, step=0.01,
-            value=st.session_state.aovs[i],
+            value=st.session_state.aovs[i] if st.session_state.aovs[i] is not None else 0.0,
             key=f"b_aov_{i}"
         )
 
@@ -292,13 +295,13 @@ def get_frequentist_inputs():
         st.markdown(r"""
             ### Protecting Against Real-World Noise
 
-            Standard A/B testing calculators assume your traffic behaves like independent, identical coin flips (a pure **binomial distribution**). In reality, conversion rates fluctuate due to macro trends, marketing blasts, and day-of-week seasonality. 
+            Standard A/B testing calculators assume your traffic behaves like independent, identical coin flips (a pure **binomial distribution**). In reality, conversion rates fluctuate due to macro trends, marketing blasts, and day-of-week seasonality.
 
             Because naive calculators ignore this environmental noise, their confidence intervals are artificially narrow, leading to rampant false positives. This tool uses historical aggregate data to measure your true baseline noise and corrects the math.
 
             **How it works**
 
-            We compare the *observed* day-to-day residual variance of your historical conversion rate (after stripping out typical day-of-week seasonality) to what pure theoretical binomial sampling would predict.
+            We compare the *observed* day-to-day residual variance of your historical conversion rate (after stripping out typical day-of-week seasonality) to what pure theoretical binomial sampling would predict. Because the day-of-week baselines are fit from the same data, a degrees-of-freedom correction is applied so short windows do not understate the noise.
 
             The dispersion ratio is:
             $$\varphi = \frac{\sigma^2_{\text{observed}}}{\sigma^2_{\text{binomial}}}$$
@@ -398,16 +401,19 @@ class BetaPrior:
     alpha: float
     beta: float
 
+
 @dataclass(frozen=True)
 class LiftPrior:
     mean_log_lift: float
     std_log_lift: float
+
 
 _LIFT_PRIOR_STD: dict[str, float] = {
     "skeptical": 0.10,
     "moderate": 0.25,
     "uninformative": 1.00,
 }
+
 
 def calculate_probabilities(
     visitor_counts,
@@ -538,9 +544,11 @@ def plot_uplift_histograms(uplift_distributions, observed_uplifts):
         def calculate_optimal_bins(data):
             n = len(data)
             iqr = np.percentile(data, 75) - np.percentile(data, 25)
-            if iqr == 0: return int(1 + np.log2(n))
-            bin_width_fd = 2 * iqr * (n ** (-1/3))
-            if bin_width_fd == 0: return int(1 + np.log2(n))
+            if iqr == 0:
+                return int(1 + np.log2(n))
+            bin_width_fd = 2 * iqr * (n ** (-1 / 3))
+            if bin_width_fd == 0:
+                return int(1 + np.log2(n))
             return min(int(np.ceil((np.max(data) - np.min(data)) / bin_width_fd)), 200)
 
         num_bins = calculate_optimal_bins(diffs_percentage)
@@ -618,9 +626,9 @@ def sample_aov(mean_aov: float, cv: float, n_samples: int, rng: np.random.Genera
 
     The parameterisation preserves E[AOV] = mean_aov exactly, so predictions
     are not inflated or deflated; only variance is added.
-
-    Typical CV for e-commerce AOV: 0.5 (stable catalogue) to 1.5 (wide price range).
     """
+    if mean_aov <= 0:
+        return np.zeros(n_samples)
     sigma2 = np.log1p(cv ** 2)
     mu = np.log(mean_aov) - sigma2 / 2
     return rng.lognormal(mean=mu, sigma=np.sqrt(sigma2), size=n_samples)
@@ -812,11 +820,19 @@ def display_results_per_variant(
 #
 #   Dispersion φ = observed_variance / expected_binomial_variance
 #     φ < 1  ->  the rate is MORE stable than binomial theory assumes
-#               -> SE is defensibly shrunk -> reduction_factor = φ
 #     φ ≈ 1  ->  binomial assumption is accurate -> no adjustment
 #     φ > 1  ->  the rate is NOISIER than binomial -> SE is inflated (conservative)
-#               -> reduction_factor = φ, shown as a WARNING in the UI
+#
+#   The day-of-week baseline is fit from the same rows whose residuals
+#   we then measure. Fitting k DoW means from n days shrinks each in-sample
+#   residual, biasing φ DOWNWARD on short windows (the anti-conservative
+#   direction). A degrees-of-freedom correction n/(n-k) restores an unbiased
+#   estimate of the residual variance under the null.
 # ─────────────────────────────────────────────────────────────────────────────
+
+PHI_LOWER_CLIP = 0.10
+PHI_UPPER_CLIP = 5.0  # Guard a single bad data day from spiking SE unboundedly.
+
 
 def get_timeseries_template() -> str:
     """
@@ -827,7 +843,7 @@ def get_timeseries_template() -> str:
     template_df = pd.DataFrame({
         "date": pd.date_range("2024-01-01", periods=14).strftime("%Y-%m-%d"),
         "visitors": [1200, 980, 1100, 1350, 900, 800, 1050,
-                    1180, 1020, 1090, 1300, 950, 820, 1070],
+                     1180, 1020, 1090, 1300, 950, 820, 1070],
         "conversions": [48, 39, 44, 54, 36, 32, 42,
                         47, 41, 43, 52, 38, 33, 43],
     })
@@ -852,6 +868,13 @@ def validate_timeseries_data(
         n_periods int - number of rows (days) in the upload
     """
     n_periods = len(df)
+
+    # A valid mapping requires three distinct, explicitly chosen columns.
+    chosen = [visitors_col, conversions_col, date_col]
+    if any(c is None for c in chosen):
+        return False, "Please select the date, visitors and conversions columns.", n_periods
+    if len(set(chosen)) < 3:
+        return False, "Date, visitors and conversions must be three different columns.", n_periods
 
     if n_periods < 14:
         return (
@@ -886,10 +909,12 @@ def calculate_timeseries_reduction_factor(
     visitors_col: str,
     conversions_col: str,
     date_col: str
-) -> Tuple[float, float, str]:
+) -> Tuple[float, float, str, bool]:
     """
     Estimates a variance scaling factor (φ) from aggregate historical
     time-series data, controlling for day-of-week seasonality.
+
+    Returns (reduction_factor, phi, regime, was_clipped).
     """
     df = df.copy()
 
@@ -913,11 +938,23 @@ def calculate_timeseries_reduction_factor(
     observed_var = (weights * (rates - df['expected_dow_rate']) ** 2).sum()
     expected_binomial_var = (weights * rates * (1 - rates) / visitors).sum()
 
+    # Correct the in-sample DoW fit. n rows minus the number of
+    # distinct day-of-week baselines estimated gives the residual dof.
+    n_periods = len(df)
+    n_dow_params = int(df['dow'].nunique())
+    residual_dof = n_periods - n_dow_params
+    if residual_dof > 0:
+        dof_correction = n_periods / residual_dof
+        observed_var *= dof_correction
+
     if expected_binomial_var == 0:
-        return 1.0, 1.0, "clean"
+        return 1.0, 1.0, "clean", False
 
     phi = observed_var / expected_binomial_var
-    reduction_factor = float(np.clip(phi, 0.10, None))
+
+    # Clip on both ends and report whether clipping occurred.
+    reduction_factor = float(np.clip(phi, PHI_LOWER_CLIP, PHI_UPPER_CLIP))
+    was_clipped = phi > PHI_UPPER_CLIP or phi < PHI_LOWER_CLIP
 
     if phi < 0.90:
         regime = "textbook"
@@ -928,7 +965,15 @@ def calculate_timeseries_reduction_factor(
     else:
         regime = "highly_overdispersed"
 
-    return reduction_factor, phi, regime
+    return reduction_factor, phi, regime, was_clipped
+
+
+def parse_uploaded_timeseries(uploaded_file) -> pd.DataFrame:
+    """
+    Pure parsing step, separated from the Streamlit rendering logic so
+    it can be unit-tested without a Streamlit runtime.
+    """
+    return pd.read_csv(uploaded_file)
 
 
 def render_variance_reduction_ui() -> float:
@@ -976,31 +1021,46 @@ def render_variance_reduction_ui() -> float:
     if not uploaded_file:
         return reduction_factor
 
-    df_hist = pd.read_csv(uploaded_file)
+    df_hist = parse_uploaded_timeseries(uploaded_file)
     cols = df_hist.columns.tolist()
 
-    st.write("### Map your columns")
-    c1, c2 = st.columns(2)
-    with c1:
-        default_visitors = next(
-            (i for i, c in enumerate(cols) if "visit" in c.lower() or "session" in c.lower()), 0
+    # Detect a sensible default where possible, but use index=None +
+    # placeholder when nothing matches so we never silently grab column 0.
+    def detect(col_keywords) -> Optional[int]:
+        match = next(
+            (i for i, c in enumerate(cols)
+             if any(k in c.lower() for k in col_keywords)),
+            None
         )
-        visitors_col = st.selectbox("Visitors column", cols, index=default_visitors, key="ts_visitors")
-    with c2:
-        default_conv = next(
-            (i for i, c in enumerate(cols) if "conv" in c.lower() or "purchas" in c.lower()), 0
-        )
-        conversions_col = st.selectbox("Conversions column", cols, index=default_conv, key="ts_conversions")
-    
-    date_col = st.selectbox("Date column", cols, index=0, key="ts_date")
+        return match
 
-    is_valid, message, n_periods = validate_timeseries_data(df_hist, visitors_col, conversions_col, date_col)
+    st.write("### Map your columns")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        date_col = st.selectbox(
+            "Date column", cols, index=detect(["date", "day", "period"]),
+            placeholder="Select date column…", key="ts_date"
+        )
+    with c2:
+        visitors_col = st.selectbox(
+            "Visitors column", cols, index=detect(["visit", "session", "traffic"]),
+            placeholder="Select visitors column…", key="ts_visitors"
+        )
+    with c3:
+        conversions_col = st.selectbox(
+            "Conversions column", cols, index=detect(["conv", "purchas", "order"]),
+            placeholder="Select conversions column…", key="ts_conversions"
+        )
+
+    is_valid, message, n_periods = validate_timeseries_data(
+        df_hist, visitors_col, conversions_col, date_col
+    )
 
     if not is_valid:
         st.warning(message)
         return reduction_factor
 
-    reduction_factor, phi, regime = calculate_timeseries_reduction_factor(
+    reduction_factor, phi, regime, was_clipped = calculate_timeseries_reduction_factor(
         df_hist, visitors_col, conversions_col, date_col
     )
 
@@ -1009,7 +1069,7 @@ def render_variance_reduction_ui() -> float:
             "textbook": ("**Textbook / Underdispersed**", "green", "Your conversion rate is mathematically pristine, rarely seen in the wild."),
             "clean": ("**Clean**", "blue", "Your conversion rate behaves very closely to pure binomial theory."),
             "overdispersed": ("**Overdispersed**", "orange", "Typical real-world noise detected. SE safely inflated to protect your false positive rate."),
-            "highly_overdispersed": ("**Highly Overdispersed**","red", "Strong environmental noise detected. SE inflated substantially. Ensure no tracking errors are present."),
+            "highly_overdispersed": ("**Highly Overdispersed**", "red", "Strong environmental noise detected. SE inflated substantially. Ensure no tracking errors are present."),
         }
         label, color, advice = regime_labels[regime]
 
@@ -1017,15 +1077,25 @@ def render_variance_reduction_ui() -> float:
         | Metric | Value |
         | :--- | :--- |
         | **Historical periods** | {n_periods} days |
-        | **Dispersion φ** | `{phi:.3f}` |
+        | **Dispersion φ (raw)** | `{phi:.3f}` |
+        | **φ applied (clipped)** | `{reduction_factor:.3f}` |
         | **Process regime** | {label} |
         | **Advice** | {advice} |
         """)
 
         st.caption(
-            "φ = observed residual variance ÷ theoretical binomial minimum. "
+            "φ = observed residual variance ÷ theoretical binomial minimum, "
+            "after a degrees-of-freedom correction for the day-of-week fit. "
             "φ > 1 indicates real-world noise and triggers an honest inflation of confidence intervals."
         )
+
+        if was_clipped:
+            st.warning(
+                f"Raw φ = {phi:.2f} fell outside the safe range "
+                f"[{PHI_LOWER_CLIP}, {PHI_UPPER_CLIP}] and was clipped to "
+                f"{reduction_factor:.2f}. Check for outlier days (tracking gaps, "
+                f"campaign spikes) before relying on this adjustment."
+            )
 
     if regime in ("textbook", "clean"):
         pct_change = abs(1 - reduction_factor) * 100
@@ -1049,6 +1119,53 @@ def render_variance_reduction_ui() -> float:
         )
 
     return reduction_factor
+
+
+def calculate_non_inferiority(
+    cr_control: float,
+    cr_challenger: float,
+    se_control: float,
+    se_challenger: float,
+    margin: float,
+    confidence_noninf: int = 95,
+) -> Dict[str, Any]:
+    """
+    The non-inferiority test now lives in the computation layer (instead
+    of the display function), so it can be unit-tested and exported. SEs passed
+    in already incorporate the overdispersion reduction_factor.
+
+    One-sided NI test: H0 = "challenger is worse than control by more than the
+    margin". Rejecting H0 means the challenger is non-inferior.
+    """
+    se_unpooled = math.sqrt(se_control ** 2 + se_challenger ** 2)
+    observed_diff = cr_challenger - cr_control
+    alpha_ni = 1 - (confidence_noninf / 100)
+
+    if se_unpooled <= 0:
+        return {
+            "se_unpooled": 0.0,
+            "z_stat": float("nan"),
+            "p_value": float("nan"),
+            "lower_bound_diff": observed_diff,
+            "margin": margin,
+            "alpha": alpha_ni,
+            "passed": False,
+        }
+
+    z_stat = (observed_diff + margin) / se_unpooled
+    p_value = 1 - norm.cdf(z_stat)
+    z_crit = norm.ppf(1 - alpha_ni)
+    lower_bound_diff = observed_diff - (z_crit * se_unpooled)
+
+    return {
+        "se_unpooled": se_unpooled,
+        "z_stat": z_stat,
+        "p_value": p_value,
+        "lower_bound_diff": lower_bound_diff,
+        "margin": margin,
+        "alpha": alpha_ni,
+        "passed": p_value <= alpha_ni,
+    }
 
 
 def plot_variance_adjusted_comparison(results, visitor_counts) -> go.Figure:
@@ -1153,7 +1270,9 @@ def calculate_frequentist_statistics(
     conversion_counts,
     confidence_level,
     tail,
-    reduction_factor=1.0
+    reduction_factor=1.0,
+    non_inferiority_margin: float = 0.01,
+    confidence_noninf: int = 95,
 ) -> Dict[str, Any]:
     if sum(visitor_counts) == 0 or any(v < 0 for v in visitor_counts):
         raise ValueError("Visitor counts must be positive and sum to a non-zero value.")
@@ -1161,7 +1280,8 @@ def calculate_frequentist_statistics(
     num_variants = len(visitor_counts)
     alpha = 1 - (confidence_level / 100)
 
-    sidak_alpha = 1 - (1 - alpha)**(1 / (num_variants - 1)) if num_variants > 2 else alpha
+    # Šidák family-wise alpha for 3+ variants.
+    sidak_alpha = 1 - (1 - alpha) ** (1 / (num_variants - 1)) if num_variants > 2 else alpha
 
     conversion_rates = [c / v if v > 0 else 0 for c, v in zip(conversion_counts, visitor_counts)]
     standard_errors = [
@@ -1169,7 +1289,12 @@ def calculate_frequentist_statistics(
         for cr, v in zip(conversion_rates, visitor_counts)
     ]
 
+    # Keep a nominal critical value for the marginal per-variant CIs,
+    # AND a family-wise critical value for the difference CIs so the CI agrees
+    # with the (Šidák-corrected) significance verdict at 3+ variants.
     z_critical = norm.ppf(1 - (alpha / 2))
+    z_critical_family = norm.ppf(1 - (sidak_alpha / 2))
+
     margins_of_error = [z_critical * se for se in standard_errors]
     confidence_intervals = [
         (cr - moe, cr + moe)
@@ -1184,8 +1309,8 @@ def calculate_frequentist_statistics(
     confidence_intervals_diff = []
     for i in range(1, num_variants):
         diff_cr = conversion_rates[i] - conversion_rates[0]
-        se_diff = np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
-        moe_diff = z_critical * se_diff
+        se_diff = np.sqrt(standard_errors[i] ** 2 + standard_errors[0] ** 2)
+        moe_diff = z_critical_family * se_diff  # Family-wise width.
         ci_diff = (diff_cr - moe_diff, diff_cr + moe_diff)
         confidence_intervals_diff.append(ci_diff)
 
@@ -1193,11 +1318,11 @@ def calculate_frequentist_statistics(
     expected = np.array([sum(observed) / num_variants] * num_variants)
     _, srm_p_value = chisquare(f_obs=observed, f_exp=expected)
 
-    pooled_proportion = sum(conversion_counts) / sum(visitor_counts)
+    # FIX #1: pooled_proportion was dead code and has been removed.
 
     z_stats = [
-        (conversion_rates[i] - conversion_rates[0]) / np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
-        if (standard_errors[i]**2 + standard_errors[0]**2) > 0 else 0
+        (conversion_rates[i] - conversion_rates[0]) / np.sqrt(standard_errors[i] ** 2 + standard_errors[0] ** 2)
+        if (standard_errors[i] ** 2 + standard_errors[0] ** 2) > 0 else 0
         for i in range(1, num_variants)
     ]
 
@@ -1210,15 +1335,28 @@ def calculate_frequentist_statistics(
 
     significant_results = [p <= sidak_alpha for p in p_values]
 
+    # FIX #6: non-inferiority computed here for every challenger and stored.
+    non_inferiority = [
+        calculate_non_inferiority(
+            cr_control=conversion_rates[0],
+            cr_challenger=conversion_rates[i],
+            se_control=standard_errors[0],
+            se_challenger=standard_errors[i],
+            margin=non_inferiority_margin,
+            confidence_noninf=confidence_noninf,
+        )
+        for i in range(1, num_variants)
+    ]
+
     power_method_used = ""
     observed_powers = []
 
-    if all(v > 1000 for v in visitor_counts):
-        power_method_used = "Analytical"
+    def analytical_power():
+        powers = []
         for i in range(1, num_variants):
-            se_diff = np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
+            se_diff = np.sqrt(standard_errors[i] ** 2 + standard_errors[0] ** 2)
             if se_diff == 0:
-                observed_powers.append(1.0)
+                powers.append(1.0)
                 continue
             z_delta = abs(conversion_rates[i] - conversion_rates[0]) / se_diff
             if tail in ['Greater', 'Less']:
@@ -1227,65 +1365,69 @@ def calculate_frequentist_statistics(
             else:
                 z_alpha = norm.ppf(1 - sidak_alpha / 2)
                 power = norm.cdf(z_delta - z_alpha) + norm.cdf(-z_delta - z_alpha)
-            observed_powers.append(power)
+            powers.append(power)
+        return powers
+
+    if all(v > 1000 for v in visitor_counts):
+        power_method_used = "Analytical"
+        observed_powers = analytical_power()
+
+    elif reduction_factor != 1.0:
+        power_method_used = "Analytical"
+        st.warning(
+            "Overdispersion Safety Net is active. Bootstrap power estimation is not compatible "
+            "with adjusted standard errors; falling back to the analytical method."
+        )
+        observed_powers = analytical_power()
 
     else:
-        if reduction_factor != 1.0:
-            power_method_used = "Analytical"
-            st.warning(
-                "Overdispersion Safety Net is active. Bootstrap power estimation is not compatible "
-                "with adjusted standard errors; falling back to the analytical method."
+        power_method_used = "Bootstrap"
+
+        # FIX #3: use the SAME unpooled SE as the reported analytical p-value
+        # so the bootstrap power and the significance decision share variance
+        # assumptions.
+        def bootstrap_sample(data_control, data_variant, threshold_alpha, tail):
+            sample_control = np.random.choice(data_control, size=len(data_control), replace=True)
+            sample_variant = np.random.choice(data_variant, size=len(data_variant), replace=True)
+
+            p_c = np.mean(sample_control)
+            p_v = np.mean(sample_variant)
+            n_c = len(sample_control)
+            n_v = len(sample_variant)
+
+            se_unpooled = np.sqrt(
+                p_c * (1 - p_c) / n_c + p_v * (1 - p_v) / n_v
             )
-            for i in range(1, num_variants):
-                se_diff = np.sqrt(standard_errors[i]**2 + standard_errors[0]**2)
-                if se_diff == 0:
-                    observed_powers.append(1.0)
-                    continue
-                z_delta = abs(conversion_rates[i] - conversion_rates[0]) / se_diff
-                if tail in ['Greater', 'Less']:
-                    z_alpha = norm.ppf(1 - sidak_alpha)
-                    power = norm.cdf(z_delta - z_alpha)
-                else:
-                    z_alpha = norm.ppf(1 - sidak_alpha / 2)
-                    power = norm.cdf(z_delta - z_alpha) + norm.cdf(-z_delta - z_alpha)
-                observed_powers.append(power)
+            z_stat = 0 if se_unpooled == 0 else (p_v - p_c) / se_unpooled
 
-        else:
-            power_method_used = "Bootstrap"
+            if tail == 'Greater':
+                return (1 - norm.cdf(z_stat)) < threshold_alpha
+            elif tail == 'Less':
+                return norm.cdf(z_stat) < threshold_alpha
+            else:
+                return (2 * (1 - norm.cdf(abs(z_stat)))) < threshold_alpha
 
-            def bootstrap_sample(data_control, data_variant, alpha, tail):
-                sample_control = np.random.choice(data_control, size=len(data_control), replace=True)
-                sample_variant = np.random.choice(data_variant, size=len(data_variant), replace=True)
-                pooled_p = (np.sum(sample_control) + np.sum(sample_variant)) / (len(sample_control) + len(sample_variant))
-                se = np.sqrt(pooled_p * (1 - pooled_p) * (1 / len(sample_control) + 1 / len(sample_variant)))
-                z_stat = 0 if se == 0 else (np.mean(sample_variant) - np.mean(sample_control)) / se
-                if tail == 'Greater':
-                    return (1 - norm.cdf(z_stat)) < alpha
-                elif tail == 'Less':
-                    return norm.cdf(z_stat) < alpha
-                else:
-                    return (2 * (1 - norm.cdf(abs(z_stat)))) < alpha
+        def bootstrap_power(data_control, data_variant, threshold_alpha, tail, n_bootstraps=10000):
+            significant_count = 0
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [
+                    executor.submit(bootstrap_sample, data_control, data_variant, threshold_alpha, tail)
+                    for _ in range(n_bootstraps)
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    if future.result():
+                        significant_count += 1
+            return significant_count / n_bootstraps
 
-            def bootstrap_power(data_control, data_variant, alpha, tail, n_bootstraps=10000):
-                significant_count = 0
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    futures = [
-                        executor.submit(bootstrap_sample, data_control, data_variant, alpha, tail)
-                        for _ in range(n_bootstraps)
-                    ]
-                    for future in concurrent.futures.as_completed(futures):
-                        if future.result():
-                            significant_count += 1
-                return significant_count / n_bootstraps
-
-            data_controls = [
-                np.concatenate([np.ones(c), np.zeros(v - c)])
-                for c, v in zip(conversion_counts, visitor_counts)
-            ]
-            observed_powers = [
-                bootstrap_power(data_controls[0], data_controls[i], alpha, tail)
-                for i in range(1, num_variants)
-            ]
+        data_controls = [
+            np.concatenate([np.ones(c), np.zeros(v - c)])
+            for c, v in zip(conversion_counts, visitor_counts)
+        ]
+        # Use the same threshold the significance decision uses (sidak_alpha).
+        observed_powers = [
+            bootstrap_power(data_controls[0], data_controls[i], sidak_alpha, tail)
+            for i in range(1, num_variants)
+        ]
 
     results = {
         "num_variants": num_variants,
@@ -1299,13 +1441,14 @@ def calculate_frequentist_statistics(
         "z_stats": z_stats,
         "p_values": p_values,
         "is_significant": significant_results,
+        "non_inferiority": non_inferiority,
         "observed_powers": observed_powers,
         "power_method": power_method_used,
         "srm_p_value": srm_p_value,
         "sidak_alpha": sidak_alpha,
         "alpha": alpha,
         "confidence_level": confidence_level,
-        "reduction_factor": reduction_factor
+        "reduction_factor": reduction_factor,
     }
 
     return results
@@ -1333,7 +1476,8 @@ def plot_conversion_distributions(results, reduction_factor=1.0):
     plot_max = np.max(all_means + 4 * np.maximum(all_ses, 1e-9))
     x_min = max(0, plot_min)
     x_max = min(1, plot_max)
-    if x_max <= x_min: x_max = x_min + 1e-6
+    if x_max <= x_min:
+        x_max = x_min + 1e-6
     x_range = np.linspace(x_min, x_max, 1000)
 
     colors = ['#808080', '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
@@ -1373,7 +1517,7 @@ def plot_conversion_distributions(results, reduction_factor=1.0):
             control_label_char = string.ascii_uppercase[0]
 
             mean_diff = variant_cr - control_cr
-            se_diff = math.sqrt(variant_se**2 + control_se**2)
+            se_diff = math.sqrt(variant_se ** 2 + control_se ** 2)
             prob_variant_better = 0.5
             if se_diff > 1e-9:
                 z_score = mean_diff / se_diff
@@ -1413,8 +1557,6 @@ def plot_conversion_distributions(results, reduction_factor=1.0):
     ax.set_xlabel('Conversion rate (%)')
     ax.set_ylabel('Probability density')
 
-    # Build a dynamic title that incorporates the variance adjustment so a
-    # separate Plotly chart is no longer needed to communicate phi.
     if reduction_factor < 1.0:
         pct = (1 - reduction_factor) * 100
         adjustment_note = f" | SE reduced {pct:.1f}% (φ = {reduction_factor:.2f})"
@@ -1456,10 +1598,10 @@ def calculate_fpr(alpha, power, prior):
 
 def calculate_fndr(alpha, power, prior):
     p1, p0 = prior, 1 - prior
-    beta = 1 - power
+    beta_err = 1 - power
     specificity = 1 - alpha
-    numerator = beta * p1
-    denominator = (beta * p1) + (specificity * p0)
+    numerator = beta_err * p1
+    denominator = (beta_err * p1) + (specificity * p0)
     return numerator / denominator if denominator else 0.0
 
 
@@ -1467,8 +1609,6 @@ def display_frequentist_summary(
     results,
     visitor_counts,
     conversion_counts,
-    non_inferiority_margin=0.01,
-    confidence_noninf=95,
     reduction_factor=1.0,
     prior=0.5
 ):
@@ -1485,6 +1625,7 @@ def display_frequentist_summary(
     sidak_alpha = results['sidak_alpha']
     alpha_unadjusted = results['alpha']
     tail = results['tail']
+    non_inferiority = results['non_inferiority']
     alphabet = string.ascii_uppercase
 
     st.write("### SRM Check")
@@ -1495,7 +1636,7 @@ def display_frequentist_summary(
 
     if num_variants >= 3:
         st.write("### Šidák Correction applied")
-        st.info(f"The Šidák correction was applied due to 3 or more variants in the test. The alpha threshold has been set to **{results['sidak_alpha']:.4f}** instead of {alpha_unadjusted:.4f}.")
+        st.info(f"The Šidák correction was applied due to 3 or more variants in the test. The alpha threshold has been set to **{results['sidak_alpha']:.4f}** instead of {alpha_unadjusted:.4f}. Difference confidence intervals use this same family-wise level.")
 
     st.write("## Results summary")
     st.write("---")
@@ -1537,10 +1678,16 @@ def display_frequentist_summary(
                 help=f"The {results['confidence_level']}% confidence interval is [{challenger_ci[0]*100:.2f}% - {challenger_ci[1]*100:.2f}%]"
             )
         with col3:
+            ci_help = (
+                f"The confidence interval for the uplift is from "
+                f"{ci_difference[0]*100:+.2f}% to {ci_difference[1]*100:+.2f}%."
+            )
+            if num_variants >= 3:
+                ci_help += " (Šidák family-wise level.)"
             st.metric(
                 label=f"Uplift CI ({alphabet[i]} vs {alphabet[0]})",
                 value=f"{observed_diff*100:+.2f}%",
-                help=f"The {results['confidence_level']}% confidence interval for the uplift is from {ci_difference[0]*100:+.2f}% to {ci_difference[1]*100:+.2f}%."
+                help=ci_help
             )
 
         st.write("#### Confidence Interval Comparison")
@@ -1550,7 +1697,9 @@ def display_frequentist_summary(
 
         if is_significant[challenger_index_in_lists]:
             st.markdown(f" * **Statistically significant result** for {alphabet[i]} with p-value: {p_values[challenger_index_in_lists]:.4f}!")
-            st.markdown(f" * **Conversion rate change** for {alphabet[i]}: {((conversion_rates[i] - conversion_rates[0]) / conversion_rates[0]) * 100:.2f}%")
+            if conversion_rates[0] > 0:
+                rel_change = ((conversion_rates[i] - conversion_rates[0]) / conversion_rates[0]) * 100
+                st.markdown(f" * **Conversion rate change** for {alphabet[i]}: {rel_change:.2f}%")
             if conversion_rates[i] > conversion_rates[0]:
                 st.success(f"Variant **{alphabet[i]}** is a **winner**, congratulations!")
             else:
@@ -1558,29 +1707,22 @@ def display_frequentist_summary(
 
         else:
             st.markdown(f" * The Z-test is not statistically significant (p = {p_values[challenger_index_in_lists]:.4f}).")
-            st.markdown(f" * **Conversion rate change for {alphabet[i]}:** {((conversion_rates[i] - conversion_rates[0]) / conversion_rates[0]) * 100:.2f}%")
+            if conversion_rates[0] > 0:
+                rel_change = ((conversion_rates[i] - conversion_rates[0]) / conversion_rates[0]) * 100
+                st.markdown(f" * **Conversion rate change for {alphabet[i]}:** {rel_change:.2f}%")
 
-            if tail == 'Greater' or tail == 'Two-sided':
-                se_unpooled = np.sqrt(
-                    (conversion_rates[0] * (1 - conversion_rates[0]) * reduction_factor / visitor_counts[0]) +
-                    (conversion_rates[i] * (1 - conversion_rates[i]) * reduction_factor / visitor_counts[i])
-                )
+            if tail in ('Greater', 'Two-sided'):
+                # FIX #6: read the pre-computed non-inferiority result.
+                ni = non_inferiority[challenger_index_in_lists]
+                st.markdown(f" * **P-value (non-inferiority test):** {ni['p_value']:.4f} (margin: {ni['margin']*100:.1f}%)")
+                st.markdown(f" * **Lower Bound of Difference:** {ni['lower_bound_diff']*100:.2f}% (Limit: {-ni['margin']*100:.2f}%)")
 
-                z_stat_noninf = (conversion_rates[i] - conversion_rates[0] + non_inferiority_margin) / se_unpooled
-                p_value_noninf = 1 - norm.cdf(z_stat_noninf)
-                alpha_noninf = 1 - (confidence_noninf / 100)
-                z_crit_ni = norm.ppf(1 - alpha_noninf)
-                lower_bound_diff = (conversion_rates[i] - conversion_rates[0]) - (z_crit_ni * se_unpooled)
-
-                st.markdown(f" * **P-value (non-inferiority test):** {p_value_noninf:.4f} (margin: {non_inferiority_margin*100:.1f}%)")
-                st.markdown(f" * **Lower Bound of Difference:** {lower_bound_diff*100:.2f}% (Limit: {-non_inferiority_margin*100:.2f}%)")
-
-                if p_value_noninf <= alpha_noninf:
+                if ni['passed']:
                     st.success(f"Although not a winner, the non-inferiority test suggests that {alphabet[i]} is **not significantly worse** than {alphabet[0]} within the predefined margin.")
                 else:
                     st.warning(f"The non-inferiority test does not provide sufficient evidence to conclude that {alphabet[i]} performs at least as well as {alphabet[0]}.")
             else:
-                st.info(f"There is no strong evidence of a difference, and the effect size remains uncertain.")
+                st.info("There is no strong evidence of a difference, and the effect size remains uncertain.")
 
         st.write("#### False Positive / Negative Risk")
         power = observed_powers[challenger_index_in_lists]
@@ -1647,9 +1789,9 @@ def run():
     display_dynamic_documentation(analysis_method)
     st.write("---")
 
-    # ==============================================================================
+    # ==========================================================================
     #                             BAYESIAN ANALYSIS FLOW
-    # ==============================================================================
+    # ==========================================================================
     if analysis_method == "Bayesian Analysis":
         st.header("Bayesian Analysis Inputs")
 
@@ -1699,12 +1841,20 @@ def run():
                 except Exception as e:
                     st.error(f"An error occurred during calculation: {e}")
 
-    # ==============================================================================
+    # ==========================================================================
     #                           FREQUENTIST ANALYSIS FLOW
-    # ==============================================================================
+    # ==========================================================================
     elif analysis_method == "Frequentist Analysis":
         st.header("Frequentist Analysis Inputs")
-        visitor_counts, conversion_counts, confidence_level, reduction_factor, test_duration, sensitivity_mode, custom_prior = get_frequentist_inputs()
+        (
+            visitor_counts,
+            conversion_counts,
+            confidence_level,
+            reduction_factor,
+            test_duration,
+            sensitivity_mode,
+            custom_prior
+        ) = get_frequentist_inputs()
         st.write("---")
         st.session_state.tail = st.radio(
             "Select the test hypothesis (tail):",
@@ -1731,13 +1881,12 @@ def run():
                             confidence_level,
                             st.session_state.tail,
                             reduction_factor=reduction_factor,
+                            non_inferiority_margin=non_inferiority_margin,
+                            confidence_noninf=confidence_level,
                         )
 
                     rf = test_results['reduction_factor']
 
-                    # -- Variance adjustment feedback (metrics + prose only) ----------
-                    # The φ value is now embedded in the density chart title, so no
-                    # separate Plotly chart is needed here.
                     if rf < 1.0:
                         pct_reduced = (1 - rf) * 100
                         days_saved = calculate_time_savings(rf, test_duration)
@@ -1778,13 +1927,13 @@ def run():
                             test_results,
                             visitor_counts,
                             conversion_counts,
-                            non_inferiority_margin=non_inferiority_margin,
                             reduction_factor=reduction_factor,
                             prior=prior,
                         )
 
                 except Exception as e:
                     st.error(f"Analysis failed: {e}")
+
 
 if __name__ == "__main__":
     run()
