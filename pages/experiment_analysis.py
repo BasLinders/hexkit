@@ -1,24 +1,5 @@
 """
 Experiment Analysis — Streamlit app (Bayesian + Frequentist A/B testing).
-
-This revision applies the code-review fixes that survived a second pass:
-
-  FIX #1  Remove dead `pooled_proportion`.
-  FIX #2  Difference CIs use the Šidák family-wise alpha so the CI and the
-          significance call agree at 3+ variants.
-  FIX #3  Bootstrap power uses the SAME unpooled SE as the reported p-value.
-  FIX #4b Overdispersion φ corrected for the in-sample day-of-week fit
-          (degrees-of-freedom correction) so it is not biased downward on
-          short windows.
-  FIX #5  φ is clipped on BOTH ends (0.10 .. 5.0) with a UI warning on clip.
-  FIX #6  Non-inferiority test moved into the computation layer and stored in
-          the results dict (testable, exportable).
-  FIX #7  Time-series file parsing/computation split out of the UI function.
-  FIX #8  Column auto-detect no longer falls back silently to column 0;
-          unresolved columns must be chosen explicitly and must be distinct.
-
-The "retracted" item from the review (a supposed weighted-variance error) was
-verified correct and is therefore left unchanged.
 """
 
 import streamlit as st
@@ -842,7 +823,7 @@ def display_results_per_variant(
 #     φ ≈ 1  ->  binomial assumption is accurate -> no adjustment
 #     φ > 1  ->  the rate is NOISIER than binomial -> SE is inflated (conservative)
 #
-#   FIX #4b: the day-of-week baseline is fit from the same rows whose residuals
+#   The day-of-week baseline is fit from the same rows whose residuals
 #   we then measure. Fitting k DoW means from n days shrinks each in-sample
 #   residual, biasing φ DOWNWARD on short windows (the anti-conservative
 #   direction). A degrees-of-freedom correction n/(n-k) restores an unbiased
@@ -850,7 +831,7 @@ def display_results_per_variant(
 # ─────────────────────────────────────────────────────────────────────────────
 
 PHI_LOWER_CLIP = 0.10
-PHI_UPPER_CLIP = 5.0  # FIX #5: guard a single bad data day from spiking SE unboundedly.
+PHI_UPPER_CLIP = 5.0  # Guard a single bad data day from spiking SE unboundedly.
 
 
 def get_timeseries_template() -> str:
@@ -888,7 +869,7 @@ def validate_timeseries_data(
     """
     n_periods = len(df)
 
-    # FIX #8: a valid mapping requires three distinct, explicitly chosen columns.
+    # A valid mapping requires three distinct, explicitly chosen columns.
     chosen = [visitors_col, conversions_col, date_col]
     if any(c is None for c in chosen):
         return False, "Please select the date, visitors and conversions columns.", n_periods
@@ -957,7 +938,7 @@ def calculate_timeseries_reduction_factor(
     observed_var = (weights * (rates - df['expected_dow_rate']) ** 2).sum()
     expected_binomial_var = (weights * rates * (1 - rates) / visitors).sum()
 
-    # FIX #4b: correct the in-sample DoW fit. n rows minus the number of
+    # Correct the in-sample DoW fit. n rows minus the number of
     # distinct day-of-week baselines estimated gives the residual dof.
     n_periods = len(df)
     n_dow_params = int(df['dow'].nunique())
@@ -971,7 +952,7 @@ def calculate_timeseries_reduction_factor(
 
     phi = observed_var / expected_binomial_var
 
-    # FIX #5: clip on both ends and report whether clipping occurred.
+    # Clip on both ends and report whether clipping occurred.
     reduction_factor = float(np.clip(phi, PHI_LOWER_CLIP, PHI_UPPER_CLIP))
     was_clipped = phi > PHI_UPPER_CLIP or phi < PHI_LOWER_CLIP
 
@@ -989,7 +970,7 @@ def calculate_timeseries_reduction_factor(
 
 def parse_uploaded_timeseries(uploaded_file) -> pd.DataFrame:
     """
-    FIX #7: pure parsing step, separated from the Streamlit rendering logic so
+    Pure parsing step, separated from the Streamlit rendering logic so
     it can be unit-tested without a Streamlit runtime.
     """
     return pd.read_csv(uploaded_file)
@@ -1043,7 +1024,7 @@ def render_variance_reduction_ui() -> float:
     df_hist = parse_uploaded_timeseries(uploaded_file)
     cols = df_hist.columns.tolist()
 
-    # FIX #8: detect a sensible default where possible, but use index=None +
+    # Detect a sensible default where possible, but use index=None +
     # placeholder when nothing matches so we never silently grab column 0.
     def detect(col_keywords) -> Optional[int]:
         match = next(
@@ -1149,7 +1130,7 @@ def calculate_non_inferiority(
     confidence_noninf: int = 95,
 ) -> Dict[str, Any]:
     """
-    FIX #6: the non-inferiority test now lives in the computation layer (instead
+    The non-inferiority test now lives in the computation layer (instead
     of the display function), so it can be unit-tested and exported. SEs passed
     in already incorporate the overdispersion reduction_factor.
 
@@ -1308,7 +1289,7 @@ def calculate_frequentist_statistics(
         for cr, v in zip(conversion_rates, visitor_counts)
     ]
 
-    # FIX #2: keep a nominal critical value for the marginal per-variant CIs,
+    # Keep a nominal critical value for the marginal per-variant CIs,
     # AND a family-wise critical value for the difference CIs so the CI agrees
     # with the (Šidák-corrected) significance verdict at 3+ variants.
     z_critical = norm.ppf(1 - (alpha / 2))
@@ -1329,7 +1310,7 @@ def calculate_frequentist_statistics(
     for i in range(1, num_variants):
         diff_cr = conversion_rates[i] - conversion_rates[0]
         se_diff = np.sqrt(standard_errors[i] ** 2 + standard_errors[0] ** 2)
-        moe_diff = z_critical_family * se_diff  # FIX #2: family-wise width.
+        moe_diff = z_critical_family * se_diff  # Family-wise width.
         ci_diff = (diff_cr - moe_diff, diff_cr + moe_diff)
         confidence_intervals_diff.append(ci_diff)
 
