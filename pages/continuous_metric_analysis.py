@@ -43,13 +43,47 @@ def render_documentation():
         * It compares models using a **Likelihood Ratio Test (LRT)** to determine if the differences in means are statistically significant.
         """)
 
-    # --- Expander 2: How to use the app ---
+    # --- Expander 2: Analysis unit (per visitor vs per transaction) ---
+    with st.expander("Analysis unit: per visitor vs per transaction"):
+        st.markdown(r"""
+        Before testing, choose **what one row represents** for the comparison. This must
+        match how you plan the experiment (and how you size it in the pre-test tool).
+
+        ### Revenue per transaction (positive rows only)
+        * The unit is a **transaction**; the metric is e.g. average order value.
+        * Rows with a value of **0 are excluded** — they aren't orders.
+        * Gamma path: a single Gamma per variant (strictly positive data).
+        * Answers *"did the value of an order change?"* It does **not** capture a change
+          in how many people buy, and carries a mild selection effect (the set of orders
+          is itself influenced by the treatment).
+
+        ### Revenue per visitor (includes zero rows)
+        * The unit is a **visitor**; non-buyers count as **0**.
+        * **All rows are kept**, including the zeros.
+        * This is usually the real business outcome, and the unit you randomise on, so it
+          captures both *more people buying* and *buyers spending more*.
+        * Gamma path: a **two-part (hurdle) model** — a Bernoulli component for the
+          probability of converting, multiplied by a Gamma component for the spend of
+          those who do. The log-likelihoods of both parts are added, and the Likelihood
+          Ratio Test uses the combined model. This is how the Gamma approach is made to
+          *accept zeros* instead of dropping them.
+
+        **Note:** the per-visitor option needs zero-value rows in your file (the
+        non-converting visitors). If your CSV only contains orders, the two units are
+        equivalent and you should upload visitor-level data to use per-visitor analysis.
+        """)
+
+    # --- Expander 3: How to use the app ---
     with st.expander("How to use the app"):
         st.markdown(r"""
         ### Data Prerequisites
         Your CSV must be in "long format" and contain at least two columns:
         1.  **Variant Label:** A categorical column (e.g., `experience_variant_label`) identifying the group (Control, Treatment A, etc.).
         2.  **KPI:** A numeric column (e.g., `purchase_revenue`, `profit`) containing the metric to test.
+
+        For **per-visitor** analysis, include one row per visitor, with `0` in the KPI
+        column for visitors who didn't buy. For **per-transaction** analysis, one row per
+        order is enough.
 
         ### Outlier Handling
         Before running tests, you can choose how to handle extreme values:
@@ -62,7 +96,7 @@ def render_documentation():
         * Use **Gamma GLM** for monetary values or any metric where the data cannot be negative and has a long right-hand tail.
         """)
 
-    # --- Expander 3: How to read the results ---
+    # --- Expander 4: How to read the results ---
     with st.expander("How to read the results"):
         st.markdown(r"""
         ### 1. The P-Value
@@ -87,6 +121,7 @@ def render_documentation():
         * **Deviance:** A measure of the error in the model. When comparing variants, we look for a significant reduction in deviance.
         * **Likelihood Ratio Test (LRT):** This is the p-value source for Gamma. It tests the "Null Model" (one mean for all variants) against the "Alternative Model" (separate means for each variant). 
             * If **p < 0.05**, we conclude that at least one variant's mean is statistically different from the others under the Gamma assumption.
+            * For **per-visitor** analysis the model is the two-part hurdle (Bernoulli × Gamma), so each variant carries one extra parameter (the conversion rate) and the test has correspondingly more degrees of freedom.
         * **Scale Parameter ($\theta$):** Indicates the "spread" or "dispersion" of the revenue. High scale parameters often point to high-variance "Whale" customers in revenue data.
         """)
     st.write("---")
@@ -163,72 +198,128 @@ def fit_gamma(data):
     k_mle, theta_mle = res.x
     return k_mle, theta_mle, -res.fun
 
-def perform_gamma_test(df, kpi):
-    # 1. Null Model: Fit one Gamma to all data
+
+def fit_unit_model(data, unit):
+    """
+    Fit the likelihood model for the chosen analysis unit and return
+    (log_likelihood, num_parameters).
+
+    * per_transaction -> a single Gamma on the positive values (2 params: k, theta).
+    * per_visitor     -> a two-part hurdle model that *accepts zeros*:
+                         a Bernoulli on P(value > 0) plus a Gamma on the positive
+                         values. The log-likelihoods add; parameters are
+                         (p, k, theta) = 3.
+
+    The per-visitor model is what lets the Gamma approach handle non-converting
+    visitors (zeros) instead of silently discarding them.
+    """
+    data = np.asarray(data, dtype=float)
+    data = data[~np.isnan(data)]
+
+    if unit == "per_visitor":
+        n = len(data)
+        positives = data[data > 0]
+        n_pos = len(positives)
+        if n == 0:
+            return np.nan, 3
+
+        # Bernoulli (conversion) part, evaluated at its MLE p = n_pos / n.
+        p = n_pos / n
+        if 0.0 < p < 1.0:
+            ll_bern = n_pos * np.log(p) + (n - n_pos) * np.log(1.0 - p)
+        else:
+            # p == 0 (no buyers) or p == 1 (no zeros): Bernoulli LL is 0 at the MLE.
+            ll_bern = 0.0
+
+        # Gamma (spend among buyers) part.
+        if n_pos >= 2 and np.var(positives) > 0:
+            _, _, ll_gamma = fit_gamma(positives)
+        else:
+            ll_gamma = 0.0
+
+        return ll_bern + ll_gamma, 3
+
+    # per_transaction
+    positives = data[data > 0]
+    if len(positives) < 2 or np.var(positives) == 0:
+        return np.nan, 2
+    _, _, ll_gamma = fit_gamma(positives)
+    return ll_gamma, 2
+
+
+def perform_gamma_test(df, kpi, unit="per_transaction"):
+    # 1. Null Model: one model fit to all data
     all_data = df[kpi].values
-    _, _, ll_null = fit_gamma(all_data)
-    
-    # 2. Alternative Model: Fit Gamma to each variant separately
-    ll_alt = 0
+    ll_null, n_params_per_model = fit_unit_model(all_data, unit)
+
+    # 2. Alternative Model: a separate model fit to each variant
     variants = df['experience_variant_label'].unique()
     num_variants = len(variants)
-    
+
+    ll_alt = 0.0
     for v in variants:
         variant_data = df[df['experience_variant_label'] == v][kpi].values
-        _, _, ll_v = fit_gamma(variant_data)
+        ll_v, _ = fit_unit_model(variant_data, unit)
         ll_alt += ll_v
-        
+
+    if np.isnan(ll_null) or np.isnan(ll_alt):
+        return np.nan, np.nan
+
     # 3. Likelihood Ratio Test
-    # Degrees of freedom = (params in Alt) - (params in Null)
-    # Alt has 2 parameters (k, theta) per variant. Null has 2.
-    df_diff = (2 * num_variants) - 2
-    lr_stat = 2 * (ll_alt - ll_null)
-    p_value = 1 - stats.chi2.cdf(lr_stat, df=df_diff)
-    
+    #    df = (params in Alt) - (params in Null)
+    #       = n_params_per_model * num_variants - n_params_per_model
+    df_diff = n_params_per_model * (num_variants - 1)
+    lr_stat = max(2.0 * (ll_alt - ll_null), 0.0)
+    p_value = stats.chi2.sf(lr_stat, df=df_diff)
+
     return p_value, lr_stat
 
-def run_gamma_posthoc(df, kpi, group_col, control_label):
+def run_gamma_posthoc(df, kpi, group_col, control_label, unit="per_transaction"):
     st.write("### Pairwise Post-Hoc Comparisons (Gamma LRT)")
-    st.markdown("_Comparison of each treatment variant against the control using Likelihood Ratio Tests._")
-    
+    model_desc = "two-part hurdle" if unit == "per_visitor" else "Gamma"
+    st.markdown(f"_Each treatment variant is compared against the control using "
+                f"{model_desc} Likelihood Ratio Tests._")
+
     variants = [v for v in df[group_col].unique() if v != control_label]
     posthoc_data = []
-    
+
     # Bonferroni correction factor
     num_comparisons = len(variants)
-    
+
     for variant in variants:
         # Filter data for pairwise comparison
         pair_df = df[df[group_col].isin([control_label, variant])]
-        
-        # 1. Fit Null Model (Single Gamma for both groups combined)
-        k_null, theta_null, null_log_lik = fit_gamma(pair_df[kpi].values)
-        
-        # 2. Fit Alternative Model (Separate Gammas for control and variant)
+
+        # 1. Null Model (single model for both groups combined)
+        null_log_lik, n_params_per_model = fit_unit_model(pair_df[kpi].values, unit)
+
+        # 2. Alternative Model (separate models for control and variant)
         ctrl_data = pair_df[pair_df[group_col] == control_label][kpi].values
         var_data = pair_df[pair_df[group_col] == variant][kpi].values
-        
-        k_ctrl, theta_ctrl, ll_ctrl = fit_gamma(ctrl_data)
-        k_var, theta_var, ll_var = fit_gamma(var_data)
-        
+        ll_ctrl, _ = fit_unit_model(ctrl_data, unit)
+        ll_var, _ = fit_unit_model(var_data, unit)
         alt_log_lik = ll_ctrl + ll_var
-        
-        # 3. Likelihood Ratio Test
-        # df=2 because Alt Model has 4 parameters and Null Model has 2 parameters.
-        lrt_stat = 2 * (alt_log_lik - null_log_lik)
-        p_val = stats.chi2.sf(lrt_stat, df=2) 
-        
-        # 4. Adjusted P-Value
-        adj_p = min(p_val * num_comparisons, 1.0)
-        
+
+        if np.isnan(null_log_lik) or np.isnan(alt_log_lik):
+            p_val = np.nan
+            lrt_stat = np.nan
+            adj_p = np.nan
+            sig = "—"
+        else:
+            # df = params(Alt) - params(Null) = 2*k - k = k (2 or 3)
+            lrt_stat = max(2.0 * (alt_log_lik - null_log_lik), 0.0)
+            p_val = stats.chi2.sf(lrt_stat, df=n_params_per_model)
+            adj_p = min(p_val * num_comparisons, 1.0)
+            sig = "✅" if adj_p < 0.05 else "❌"
+
         posthoc_data.append({
             "Comparison": f"{variant} vs {control_label}",
-            "LRT Stat": np.round(lrt_stat, 4),
-            "p-value": np.round(p_val, 4),
-            "p-adj (Bonferroni)": np.round(adj_p, 4),
-            "Significant": "✅" if adj_p < 0.05 else "❌"
+            "LRT Stat": np.round(lrt_stat, 4) if not np.isnan(lrt_stat) else "N/A",
+            "p-value": np.round(p_val, 4) if not np.isnan(p_val) else "N/A",
+            "p-adj (Bonferroni)": np.round(adj_p, 4) if not np.isnan(adj_p) else "N/A",
+            "Significant": sig
         })
-    
+
     st.dataframe(pd.DataFrame(posthoc_data))
 
 # Detect outliers
@@ -335,9 +426,11 @@ def log_transform_data(df, kpi):
 
 # Perform statistical tests and provide conclusions
 
-def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
+def perform_stat_tests_and_conclusions(df, kpi, model_after, approach, unit="per_transaction"):
     st.write("---") # Separator
     st.write("## Statistical Test Results")
+    unit_label = "revenue per visitor" if unit == "per_visitor" else "revenue per transaction"
+    st.write(f"_Analysis unit: **{unit_label}**._")
     st.write("_(Based on Normality of Residuals and Homogeneity of Variance)_")
 
     # --- Input Validation ---
@@ -411,7 +504,10 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
 
     elif approach == "Gamma GLM (Best for Revenue/Items)":
         # Skip diagnostics and go straight to GLM
-        st.info("Diagnostic tests (Shapiro/Levene) skipped. Gamma GLM is robust to non-normal, skewed data.")
+        if unit == "per_visitor":
+            st.info("Diagnostic tests (Shapiro/Levene) skipped. Using a two-part hurdle model (Bernoulli × Gamma) that includes non-converting visitors (zeros).")
+        else:
+            st.info("Diagnostic tests (Shapiro/Levene) skipped. Gamma GLM is robust to non-normal, skewed data.")
         is_normal = False
         is_homogeneous = False
 
@@ -427,30 +523,36 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
 
     try:
         if approach == "Gamma GLM (Best for Revenue/Items)":
-            st.info("Native Gamma Likelihood Ratio Test")
+            if unit == "per_visitor":
+                st.info("Native two-part (hurdle) Likelihood Ratio Test")
+            else:
+                st.info("Native Gamma Likelihood Ratio Test")
             try:
-                # Fixed the function call name here to match your definition
-                p_value, lr_stat = perform_gamma_test(df_clean, kpi)
-                
-                st.write(f"* Likelihood Ratio Statistic: {lr_stat:.4f}")
-                st.write(f"* p-value: {p_value:.4g}")
-                
-                is_significant = p_value < 0.05
-                test_name = "Native Gamma MLE"
+                p_value, lr_stat = perform_gamma_test(df_clean, kpi, unit)
 
-                if is_significant and num_groups > 2:
-                    control_label = st.selectbox("Select Control Variant for Post-Hoc", df_clean['experience_variant_label'].unique())
-                    
-                    run_gamma_posthoc(
-                        df=df_clean, 
-                        kpi=kpi, 
-                        group_col='experience_variant_label', 
-                        control_label=control_label
-                    )
+                if pd.isna(p_value):
+                    st.warning("The likelihood model could not be fit (check that each variant has enough positive values).")
+                else:
+                    st.write(f"* Likelihood Ratio Statistic: {lr_stat:.4f}")
+                    st.write(f"* p-value: {p_value:.4g}")
 
-                elif not is_significant and num_groups > 2:
-                    st.info("Global test is not significant; pairwise comparisons are not required.")
-                
+                    is_significant = p_value < 0.05
+                    test_name = "Two-Part Hurdle MLE" if unit == "per_visitor" else "Native Gamma MLE"
+
+                    if is_significant and num_groups > 2:
+                        control_label = st.selectbox("Select Control Variant for Post-Hoc", df_clean['experience_variant_label'].unique())
+
+                        run_gamma_posthoc(
+                            df=df_clean,
+                            kpi=kpi,
+                            group_col='experience_variant_label',
+                            control_label=control_label,
+                            unit=unit,
+                        )
+
+                    elif not is_significant and num_groups > 2:
+                        st.info("Global test is not significant; pairwise comparisons are not required.")
+
             except Exception as e:
                 st.error(f"Native Gamma Fit failed: {e}")
                 p_value = np.nan
@@ -555,6 +657,7 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
 
     # --- Summary Statistics ---
     st.write("### 3. Descriptive Statistics")
+    st.caption(f"Means and standard deviations are computed per {unit_label.split(' per ')[-1]} (analysis unit: {unit_label}).")
     try:
         summary_stats = df_clean.groupby('experience_variant_label', observed=True)[kpi].agg(['mean', 'std', 'count'])
         st.dataframe(summary_stats)
@@ -667,21 +770,57 @@ def run():
 
         kpi = st.selectbox("Select the KPI to analyze:", available_kpis)
 
-        filter_zero_profit = False
-        
-        # Only show this checkbox if the user SELECTED profit AND the column actually has zeros
-        if kpi == 'profit' and (df['profit'] == 0).any():
-             filter_zero_profit = st.checkbox("Exclude rows where profit is zero (recommended for ANOVA)", value=True)
-            
-        # Select how to handle outliers
-        outlier_handling = st.selectbox("Select how to handle outliers:", ['None', 'Winsorizing (STD/Percentile)', 'Log Transform', 'Removal'], help='Choose the method for handling outliers. "None" uses a default > 5 standard deviation definition for detection purposes. Only use Log Transform when your data does not contain negative numbers.')
+        # --- Analysis unit selector (per visitor vs per transaction) ---
+        unit_choice = st.selectbox(
+            "Select the analysis unit:",
+            [
+                "Revenue per visitor (includes zero-value rows)",
+                "Revenue per transaction (positive rows only)",
+            ],
+            help=(
+                "Per visitor averages over every visitor, counting non-buyers as 0 "
+                "(captures conversion-rate and spend effects together; needs zero rows "
+                "in your file). Per transaction looks at order value among buyers only."
+            ),
+        )
+        unit = "per_visitor" if unit_choice.startswith("Revenue per visitor") else "per_transaction"
+
+        # Inspect the zero structure of the chosen KPI to guide the user.
+        kpi_series = df[kpi].dropna()
+        n_zeros = int((kpi_series == 0).sum())
+        n_neg = int((kpi_series < 0).sum())
+
+        if unit == "per_visitor":
+            if n_zeros == 0:
+                st.info(
+                    "No zero-value rows were found for this KPI, so per-visitor and "
+                    "per-transaction analysis are equivalent here. To capture "
+                    "non-converting visitors, upload visitor-level data with 0 for non-buyers."
+                )
+            else:
+                st.success(f"Per-visitor analysis will include all rows, "
+                           f"of which {n_zeros:,} are non-converting (zero-value) visitors.")
+        else:  # per_transaction
+            if n_zeros > 0:
+                st.info(f"Per-transaction analysis will exclude {n_zeros:,} zero-value row(s) (non-orders).")
 
         # Select analysis approach (Gamma model for revenue/items per transaction, heuristic framework for e.g. profit
         analysis_approach = st.selectbox(
             "Select Statistical Approach:",
             ["Heuristic (Auto-detect)", "Gamma GLM (Best for Revenue/Items)"],
-            help="Heuristic follows a Normality/Variance decision tree. Gamma GLM is optimized for strictly positive, right-skewed continuous data."
+            help="Heuristic follows a Normality/Variance decision tree. Gamma GLM is optimized for strictly positive, right-skewed continuous data. For per-visitor analysis, Gamma GLM uses a two-part hurdle model so zeros are included."
         )
+
+        # Guard: the Gamma family needs non-negative data.
+        if analysis_approach == "Gamma GLM (Best for Revenue/Items)" and n_neg > 0:
+            st.warning(
+                f"The Gamma model requires non-negative values, but '{kpi}' contains "
+                f"{n_neg:,} negative value(s). Use the Heuristic approach for this metric, "
+                "or pick a non-negative KPI."
+            )
+
+        # Select how to handle outliers
+        outlier_handling = st.selectbox("Select how to handle outliers:", ['None', 'Winsorizing (STD/Percentile)', 'Log Transform', 'Removal'], help='Choose the method for handling outliers. "None" uses a default > 5 standard deviation definition for detection purposes. Only use Log Transform when your data does not contain negative numbers.')
 
         method = None
         outlier_stdev = None
@@ -726,12 +865,19 @@ def run():
 
         if st.button("Calculate my test results", type="primary"):
             processed_df = df.copy()
-            
-            if kpi == 'profit' and filter_zero_profit:
+
+            # --- Analysis-unit zero handling ---
+            # Per transaction: a row must be an actual order, so drop zero-value rows.
+            # Per visitor: keep all rows (the zeros are non-converting visitors).
+            if unit == "per_transaction":
                 initial_rows = len(processed_df)
-                processed_df = processed_df[processed_df['profit'] > 0]
+                processed_df = processed_df[processed_df[kpi] != 0]
                 rows_removed = initial_rows - len(processed_df)
-                st.info(f"Filtered out {rows_removed} rows where profit was zero.")
+                if rows_removed > 0:
+                    st.info(f"Per-transaction analysis: filtered out {rows_removed:,} zero-value (non-order) rows.")
+            else:
+                if (processed_df[kpi] == 0).any():
+                    st.info("Per-visitor analysis: zero-value (non-converting) rows are kept.")
 
             # --- Outlier Handling ---
             if outlier_handling == 'Winsorizing (STD/Percentile)':
@@ -755,8 +901,10 @@ def run():
                     * **Back-transformation:** The reported means will represent the **Geometric Mean** of your data, which is less sensitive to extreme right-skewed outliers.
                 """)
             elif outlier_handling == 'Removal':
-                processed_df = processed_df[~outliers_mask]
-                st.write(f"Outliers removed: {outliers_mask.sum()} rows affected.")
+                # Align the precomputed mask to the (possibly zero-filtered) rows.
+                mask_aligned = outliers_mask.reindex(processed_df.index, fill_value=False)
+                processed_df = processed_df[~mask_aligned]
+                st.write(f"Outliers removed: {int(mask_aligned.sum())} rows affected.")
             else:
                 st.warning("No outlier handling applied.")
 
@@ -813,7 +961,7 @@ def run():
                 st.pyplot(fig_hist)
                 plt.clf()
 
-            perform_stat_tests_and_conclusions(processed_df, kpi, model_after, analysis_approach)
+            perform_stat_tests_and_conclusions(processed_df, kpi, model_after, analysis_approach, unit)
             
 if __name__ == "__main__":
     run()
