@@ -273,7 +273,7 @@ def perform_mde_calculation_forecast(
         * Continuous -> mean = sum(pred_kpi_total) / sum(pred_visitors)
                         variance = (kpi_cv * mean)**2
 
-    Here `pred_visitors` is the forecasted count of the analysis unit — visitors
+    Here `pred_visitors` is the forecasted count of the analysis unit; visitors
     for a per-visitor metric, transactions for a per-transaction metric (the
     caller standardises the chosen count column to this name before forecasting).
     The continuous variance uses the user-supplied coefficient of variation,
@@ -715,12 +715,12 @@ def _continuous_metric_inputs(
             label = "Mean revenue per visitor (averaged over all visitors, incl. non-buyers):"
             cv_help = (
                 "Per-visitor revenue is very dispersed because most visitors "
-                "contribute 0; a CV of 3–6+ is common. CV = std ÷ mean."
+                "contribute 0; a CV of 3-6+ is common. CV = std ÷ mean."
             )
         else:
             label = "Mean per transaction (e.g. average order value):"
             cv_help = (
-                "Order values are right-skewed; a CV of roughly 1–3 is common. "
+                "Order values are right-skewed; a CV of roughly 1-3 is common. "
                 "CV = std ÷ mean."
             )
         c1, c2 = st.columns(2)
@@ -798,7 +798,7 @@ def _continuous_metric_inputs(
     d1, d2, d3 = st.columns(3)
     d1.metric("Per-visitor mean", f"{mean_r:,.2f}")
     d2.metric("Per-visitor std dev", f"{np.sqrt(var_r):,.2f}")
-    d3.metric("Per-visitor CV", f"{np.sqrt(var_r) / mean_r:.2f}" if mean_r > 0 else "—")
+    d3.metric("Per-visitor CV", f"{np.sqrt(var_r) / mean_r:.2f}" if mean_r > 0 else "-")
     st.caption(
         f"Derived from average order value {m:,.2f}, order-value variance "
         f"{v:,.1f}, and a {cr_pct:.1f}% conversion rate."
@@ -829,7 +829,7 @@ def get_baseline_inputs(
             key="cont_analysis_unit",
             help=(
                 "**Per visitor** averages the metric over every visitor, counting "
-                "non-buyers as 0 — the usual business outcome and the unit you "
+                "non-buyers as 0; the usual business outcome and the unit you "
                 "randomise on. Volume is counted in **visitors**.\n\n"
                 "**Per transaction** measures average order value among buyers only. "
                 "Volume is counted in **transactions** (≈ visitors × conversion rate)."
@@ -962,7 +962,7 @@ def _display_mde_table(inputs: BaselineInputs, results: list[MDERow]) -> None:
     st.write("## MDE Calculation Results")
     st.write(
         "This table shows the smallest relative effect detectable each week. "
-        "An MDE below 5% is generally testworthy; 5–10% is debatable."
+        "An MDE below 5% is generally testworthy; 5-10% is debatable."
     )
     if inputs.num_variants > 2:
         st.info(
@@ -986,7 +986,7 @@ def _display_mde_table(inputs: BaselineInputs, results: list[MDERow]) -> None:
         st.write(
             "**How would traffic spikes or drops affect your MDE?**  "
             "Each cell shows the Relative MDE (%) for a given week and traffic scenario. "
-            "Colors: 🟢 <5% · 🟡 5–10% · 🔴 >10%."
+            "Colors: 🟢 <5% · 🟡 5-10% · 🔴 >10%."
         )
 
         multipliers = [0.50, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30, 1.50]
@@ -1160,7 +1160,7 @@ def render_power_mode(kpi_type: str) -> None:
         st.write(f"### Results for {weeks_to_run}-Week Test with {inputs.num_variants} Variants")
 
         st.metric(
-            label=f"Statistical Power — probability of detecting a {mde}% lift if it truly exists",
+            label=f"Statistical Power: probability of detecting a {mde}% lift if it truly exists",
             value=f"{result.power:.1%}",
         )
         st.write(
@@ -1193,15 +1193,15 @@ def _seasonal_data_expander(kpi_type: str, analysis_unit: str = "per_transaction
     supply for seasonal forecasting."""
     with st.expander("What data do I need to upload?", expanded=False):
         st.markdown(
-            "Provide **daily historical data** — ideally **1–2 years** so Prophet "
+            "Provide **daily historical data**: ideally **1-2 years** so Prophet "
             "can learn weekly and yearly seasonality. One row per day, no gaps."
         )
         if kpi_type == "Binomial":
             st.markdown("""
             **Required columns (binomial KPI):**
-            * `date` — the day, as `YYYY-MM-DD` (a `ds` column is also accepted).
-            * `visitors` — number of visitors that day (the denominator).
-            * `conversions` — number of converting visitors that day (the count of 1's).
+            * `date`: the day, as `YYYY-MM-DD` (a `ds` column is also accepted).
+            * `visitors`: number of visitors that day (the denominator).
+            * `conversions`: number of converting visitors that day (the count of 1's).
 
             The per-day conversion rate is reconstructed as `conversions ÷ visitors`,
             and its variance follows directly from the rate, so **no extra input is needed**.
@@ -1214,10 +1214,10 @@ def _seasonal_data_expander(kpi_type: str, analysis_unit: str = "per_transaction
         elif analysis_unit == "per_visitor":
             st.markdown("""
             **Required columns (revenue per visitor):**
-            * `date` — the day, as `YYYY-MM-DD` (a `ds` column is also accepted).
-            * `visitors` — number of visitors that day (the denominator and the
+            * `date`: the day, as `YYYY-MM-DD` (a `ds` column is also accepted).
+            * `visitors`: number of visitors that day (the denominator and the
               sample-size unit; non-buyers are included).
-            * `kpi_total` — the **sum** of your KPI across all visitors that day
+            * `kpi_total`: the **sum** of your KPI across all visitors that day
               (e.g. total daily revenue). *Not* the average. If your column has
               another name, you'll be able to pick it after upload.
 
@@ -1234,12 +1234,12 @@ def _seasonal_data_expander(kpi_type: str, analysis_unit: str = "per_transaction
         else:  # per_transaction
             st.markdown("""
             **Required columns (revenue per transaction):**
-            * `date` — the day, as `YYYY-MM-DD` (a `ds` column is also accepted).
-            * `transactions` — number of **orders** that day (the denominator and the
-              sample-size unit). Use the actual transaction count from your data —
+            * `date` : the day, as `YYYY-MM-DD` (a `ds` column is also accepted).
+            * `transactions` : number of **orders** that day (the denominator and the
+              sample-size unit). Use the actual transaction count from your data;
               don't derive it from visitors × conversion rate, since that ratio
               drifts day to day and the two counts come from different GA4 tables.
-            * `kpi_total` — the **sum** of your KPI across those orders that day
+            * `kpi_total` : the **sum** of your KPI across those orders that day
               (e.g. total daily revenue). *Not* the average. If your column has
               another name, you'll be able to pick it after upload.
 
@@ -1305,9 +1305,9 @@ def render_seasonal_mode(kpi_type: str) -> None:
             )
             cv_help = (
                 "Per-visitor revenue is very dispersed because most visitors "
-                "contribute 0; a CV of 3–6+ is common."
+                "contribute 0; a CV of 3-6+ is common."
                 if analysis_unit == "per_visitor"
-                else "Order values are right-skewed; a CV of roughly 1–3 is common."
+                else "Order values are right-skewed; a CV of roughly 1-3 is common."
             ) + " Estimate it in the non-seasonal Continuous mode via the Gamma fit if unsure."
             st.number_input(
                 cv_label,
@@ -1502,15 +1502,15 @@ def run() -> None:
     with st.expander("How to choose the right method", expanded=False):
         st.markdown("""
         **KPI type**
-        * *Binomial:* a yes/no outcome per visitor — conversion rate, signup rate, bounce.
-        * *Continuous:* a real-valued outcome per unit — revenue per visitor, items per
+        * *Binomial:* a yes/no outcome per visitor; conversion rate, signup rate, bounce.
+        * *Continuous:* a real-valued outcome per unit; revenue per visitor, items per
           order, time on site. A Gamma model captures the positive, right-skewed shape
           of these metrics and supplies the mean and variance the calculations need.
 
         **1. MDE Projection (Fixed Duration)**
         * *Best for:* Strict deadlines.
         * *Scenario:* "We only have 4 weeks. What's the smallest effect we can reliably detect?"
-        * *Output:* MDE for Weeks 1–6, plus a sensitivity matrix for traffic scenarios.
+        * *Output:* MDE for Weeks 1-6, plus a sensitivity matrix for traffic scenarios.
 
         **2. Sample Size Calculation (Target Effect)**
         * *Best for:* Specific improvement goals.
