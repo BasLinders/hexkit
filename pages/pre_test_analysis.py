@@ -50,6 +50,7 @@ class BaselineInputs:
     kpi_variance: float = 0.0       # continuous only (variance of one observation)
     variance_scaling: str = "equal" # continuous only: 'equal' | 'cv_constant'
     kpi_cv: float = 0.0             # continuous + seasonal only: coefficient of variation
+    analysis_unit: str = "per_transaction"  # continuous only: 'per_visitor' | 'per_transaction'
 
 
 @dataclass
@@ -272,6 +273,9 @@ def perform_mde_calculation_forecast(
         * Continuous -> mean = sum(pred_kpi_total) / sum(pred_visitors)
                         variance = (kpi_cv * mean)**2
 
+    Here `pred_visitors` is the forecasted count of the analysis unit — visitors
+    for a per-visitor metric, transactions for a per-transaction metric (the
+    caller standardises the chosen count column to this name before forecasting).
     The continuous variance uses the user-supplied coefficient of variation,
     assumed stationary even as seasonal volume (and hence the weekly mean)
     shifts. Aggregated daily data cannot reveal the per-observation spread on
@@ -508,8 +512,31 @@ def run_prophet_forecast(
 # UI helpers
 # ---------------------------------------------------------------------------
 
-def _unit_label(kpi_type: str) -> str:
-    return "Observations" if kpi_type == "Continuous" else "Visitors"
+def _unit_label(kpi_type: str, analysis_unit: str = "per_transaction") -> str:
+    """Plural noun for the experiment unit, used in labels and table headers."""
+    if kpi_type != "Continuous":
+        return "Visitors"
+    return "Visitors" if analysis_unit == "per_visitor" else "Transactions"
+
+
+def compound_per_visitor_moments(
+    txn_mean: float, txn_variance: float, conversion_rate: float
+) -> tuple[float, float]:
+    """Per-visitor mean and variance of a revenue-style metric, built from the
+    per-transaction (buyer) distribution and the conversion rate.
+
+    With conversion rate p, and spend among buyers having mean m and variance v,
+    the per-visitor value R = B * S (B ~ Bernoulli(p), S = spend) satisfies:
+        E[R]   = p * m
+        Var[R] = p * v + m**2 * p * (1 - p)
+    The variance term has two parts: within-buyer spend variance (p*v) and the
+    extra variance from buyers-vs-non-buyers (m^2 * p(1-p)). This is the exact
+    moment-matched zero-inflated model; n is then counted in visitors.
+    """
+    p = conversion_rate
+    mean_r = p * txn_mean
+    var_r = p * txn_variance + (txn_mean ** 2) * p * (1 - p)
+    return float(mean_r), float(var_r)
 
 
 def _mde_color_scale() -> list[list[float | str]]:
@@ -599,13 +626,58 @@ def _render_gamma_fit(fit: GammaFit, values: np.ndarray) -> None:
     st.plotly_chart(fig, width="stretch")
 
 
-def _continuous_metric_inputs(show_variance_toggle: bool = False) -> tuple[float, float, str]:
-    """Render continuous-KPI distribution inputs.
+def _read_continuous_values(key_prefix: str) -> np.ndarray | None:
+    """Shared paste/upload widget returning a numeric array (or None)."""
+    src = st.radio(
+        "Data source:",
+        ["Paste values", "Upload CSV"],
+        horizontal=True,
+        key=f"{key_prefix}_src",
+    )
+    values: np.ndarray | None = None
+    if src == "Paste values":
+        raw = st.text_area(
+            "Paste values (comma-, space-, or newline-separated):",
+            key=f"{key_prefix}_raw",
+            height=120,
+            placeholder="12.50, 41.20, 8.75, 102.00, ...",
+        )
+        if raw and raw.strip():
+            values = _parse_numeric(raw)
+    else:
+        uploaded = st.file_uploader("Upload CSV", type=["csv"], key=f"{key_prefix}_csv")
+        if uploaded is not None:
+            try:
+                dfc = pd.read_csv(uploaded)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not read CSV: {exc}")
+                return None
+            numeric_cols = dfc.select_dtypes(include="number").columns.tolist()
+            if not numeric_cols:
+                st.error("No numeric columns found in the uploaded CSV.")
+                return None
+            col = st.selectbox(
+                "Which column holds the values?",
+                numeric_cols,
+                key=f"{key_prefix}_col",
+            )
+            values = dfc[col].dropna().to_numpy()
+    return values
 
-    Returns (mean, variance, variance_scaling). Returns (0.0, 0.0, scaling)
-    when the distribution is not yet specified, which the validator treats as
-    an error so calculations don't run on empty inputs.
+
+def _continuous_metric_inputs(
+    analysis_unit: str,
+    show_variance_toggle: bool = False,
+) -> tuple[float, float, str]:
+    """Render continuous-KPI distribution inputs for the chosen analysis unit.
+
+    Returns (mean, variance, variance_scaling) of the *per-unit* metric, where
+    the unit is a visitor (`per_visitor`, zeros included) or a transaction
+    (`per_transaction`, positive values only). Returns (0.0, 0.0, scaling) when
+    the distribution is not yet specified.
     """
+    per_visitor = analysis_unit == "per_visitor"
+
     scaling = "equal"
     if show_variance_toggle:
         choice = st.radio(
@@ -617,11 +689,9 @@ def _continuous_metric_inputs(show_variance_toggle: bool = False) -> tuple[float
                 "**Equal variance** keeps the treatment group's spread the same "
                 "as the control's (the standard two-sample default). "
                 "**Scale with mean** assumes the lift multiplies the mean while "
-                "holding the coefficient of variation constant, so the standard "
-                "deviation grows with the mean — often more realistic for "
-                "revenue-type metrics. For a positive lift this is the more "
-                "conservative choice (larger treatment variance → more sample "
-                "needed / lower power)."
+                "holding the coefficient of variation constant. For a positive "
+                "lift this is the more conservative choice (larger treatment "
+                "variance → more sample needed / lower power)."
             ),
         )
         scaling = "cv_constant" if choice.startswith("Scale") else "equal"
@@ -632,89 +702,60 @@ def _continuous_metric_inputs(show_variance_toggle: bool = False) -> tuple[float
         horizontal=True,
         key="cont_method",
         help=(
-            "A Gamma model is fitted by maximum likelihood to positive "
-            "observations of your KPI. If you only have summary numbers, "
-            "enter the mean and coefficient of variation directly."
+            "Fit a Gamma model to a sample of individual transaction values, or "
+            "enter summary numbers directly. For a per-visitor metric you also "
+            "supply the conversion rate, which folds the non-converting (zero) "
+            "visitors into the mean and variance."
         ),
     )
 
+    # ---- Summary-statistics path ------------------------------------------
     if method == "Enter summary statistics":
+        if per_visitor:
+            label = "Mean revenue per visitor (averaged over all visitors, incl. non-buyers):"
+            cv_help = (
+                "Per-visitor revenue is very dispersed because most visitors "
+                "contribute 0; a CV of 3–6+ is common. CV = std ÷ mean."
+            )
+        else:
+            label = "Mean per transaction (e.g. average order value):"
+            cv_help = (
+                "Order values are right-skewed; a CV of roughly 1–3 is common. "
+                "CV = std ÷ mean."
+            )
         c1, c2 = st.columns(2)
         with c1:
             mean = st.number_input(
-                "Mean of the KPI (e.g. average revenue per visitor):",
-                min_value=0.0, step=1.0,
-                value=st.session_state.get("cont_mean", 50.0),
-                key="cont_mean",
+                label, min_value=0.0, step=1.0,
+                value=st.session_state.get("cont_mean", 50.0), key="cont_mean",
             )
         with c2:
             cv = st.number_input(
                 "Coefficient of variation (std ÷ mean):",
                 min_value=0.0, step=0.1,
                 value=st.session_state.get("cont_cv", 1.0),
-                key="cont_cv",
-                help=(
-                    "Spend metrics are highly variable; a CV of roughly 1–3 is "
-                    "common for revenue per visitor. CV = std / mean."
-                ),
+                key="cont_cv", help=cv_help,
             )
         if mean <= 0 or cv <= 0:
             st.info("Enter a positive mean and coefficient of variation.")
             return 0.0, 0.0, scaling
         variance = (cv * mean) ** 2
-        k = 1.0 / cv ** 2
-        theta = mean * cv ** 2
-        st.caption(
-            f"Implied Gamma model — shape k = {k:.3f}, scale θ = {theta:.3f}, "
-            f"variance = {variance:,.2f}."
-        )
         return float(mean), float(variance), scaling
 
-    # --- Fit from data -----------------------------------------------------
-    src = st.radio(
-        "Data source:",
-        ["Paste values", "Upload CSV"],
-        horizontal=True,
-        key="cont_src",
+    # ---- Fit-from-data path -----------------------------------------------
+    st.caption(
+        "Paste or upload a sample of **individual transaction values** "
+        "(positive amounts; one per order)."
     )
-
-    values: np.ndarray | None = None
-    if src == "Paste values":
-        raw = st.text_area(
-            "Paste KPI values (comma-, space-, or newline-separated):",
-            key="cont_raw",
-            height=120,
-            placeholder="12.50, 0, 41.20, 8.75, 0, 102.00, ...",
-        )
-        if raw and raw.strip():
-            values = _parse_numeric(raw)
-    else:
-        uploaded = st.file_uploader("Upload CSV", type=["csv"], key="cont_csv")
-        if uploaded is not None:
-            try:
-                dfc = pd.read_csv(uploaded)
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Could not read CSV: {exc}")
-                return 0.0, 0.0, scaling
-            numeric_cols = dfc.select_dtypes(include="number").columns.tolist()
-            if not numeric_cols:
-                st.error("No numeric columns found in the uploaded CSV.")
-                return 0.0, 0.0, scaling
-            col = st.selectbox(
-                "Which column holds the KPI values?",
-                numeric_cols,
-                key="cont_col",
-            )
-            values = dfc[col].dropna().to_numpy()
-
+    values = _read_continuous_values("cont")
     if values is None or values.size == 0:
-        st.info("Provide KPI observations to fit the Gamma model.")
+        st.info("Provide transaction values to fit the Gamma model.")
         return 0.0, 0.0, scaling
 
     positive = values[values > 0]
     n_zeros = int(values.size - positive.size)
     if positive.size < 2:
-        st.warning("Need at least two positive observations to fit a Gamma model.")
+        st.warning("Need at least two positive values to fit a Gamma model.")
         return 0.0, 0.0, scaling
 
     try:
@@ -726,10 +767,43 @@ def _continuous_metric_inputs(show_variance_toggle: bool = False) -> tuple[float
     if n_zeros > 0:
         st.caption(
             f"{n_zeros:,} non-positive value(s) were excluded from the Gamma fit "
-            "(the Gamma distribution is defined for x > 0)."
+            "(the Gamma is defined for x > 0; zeros are handled via the "
+            "conversion rate below for per-visitor metrics)."
         )
     _render_gamma_fit(fit, values)
-    return fit.mean, fit.variance, scaling
+
+    # Transaction-level moments from the fit.
+    m, v = fit.mean, fit.variance
+
+    if not per_visitor:
+        return float(m), float(v), scaling
+
+    # Per-visitor: combine the buyer distribution with the conversion rate.
+    cr_pct = st.number_input(
+        "Conversion rate (% of visitors who transact):",
+        min_value=0.0, max_value=100.0, step=0.1,
+        value=st.session_state.get("cont_conv_rate", 5.0),
+        key="cont_conv_rate",
+        help=(
+            "Used to fold non-converting visitors into the per-visitor mean and "
+            "variance: mean = p·m, variance = p·v + m²·p(1−p)."
+        ),
+    )
+    p = cr_pct / 100.0
+    if p <= 0:
+        st.info("Enter a conversion rate above 0% for a per-visitor metric.")
+        return 0.0, 0.0, scaling
+
+    mean_r, var_r = compound_per_visitor_moments(m, v, p)
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Per-visitor mean", f"{mean_r:,.2f}")
+    d2.metric("Per-visitor std dev", f"{np.sqrt(var_r):,.2f}")
+    d3.metric("Per-visitor CV", f"{np.sqrt(var_r) / mean_r:.2f}" if mean_r > 0 else "—")
+    st.caption(
+        f"Derived from average order value {m:,.2f}, order-value variance "
+        f"{v:,.1f}, and a {cr_pct:.1f}% conversion rate."
+    )
+    return float(mean_r), float(var_r), scaling
 
 
 def get_baseline_inputs(
@@ -740,7 +814,33 @@ def get_baseline_inputs(
     """Render common input widgets and return a BaselineInputs dataclass.
     Widget state is read from / persisted in st.session_state."""
     st.write("### Baseline Data")
-    unit = _unit_label(kpi_type).lower()
+
+    # Analysis unit is chosen first for a continuous KPI, because it determines
+    # what the weekly-volume field counts (visitors vs transactions).
+    analysis_unit = "per_transaction"
+    if kpi_type == "Continuous":
+        unit_choice = st.radio(
+            "Analysis unit:",
+            [
+                "Revenue per visitor (includes non-converting visitors)",
+                "Revenue per transaction (converting units only)",
+            ],
+            horizontal=True,
+            key="cont_analysis_unit",
+            help=(
+                "**Per visitor** averages the metric over every visitor, counting "
+                "non-buyers as 0 — the usual business outcome and the unit you "
+                "randomise on. Volume is counted in **visitors**.\n\n"
+                "**Per transaction** measures average order value among buyers only. "
+                "Volume is counted in **transactions** (≈ visitors × conversion rate)."
+            ),
+        )
+        analysis_unit = (
+            "per_visitor" if unit_choice.startswith("Revenue per visitor")
+            else "per_transaction"
+        )
+
+    unit = _unit_label(kpi_type, analysis_unit).lower()
     st.write(f"Enter weekly {unit}, the KPI baseline, and the test parameters.")
 
     col1, col2 = st.columns(2)
@@ -757,9 +857,9 @@ def get_baseline_inputs(
             value=st.session_state.get("baseline_visitors", 0),
             key="baseline_visitors",
             help=(
-                "The combined weekly volume across every variant. Each "
-                "calculation divides this by the number of variants to get a "
-                "per-variant figure."
+                f"The combined weekly number of {unit} across every variant. "
+                "Each calculation divides this by the number of variants to get a "
+                "per-variant figure. This must match the analysis unit above."
             ),
         )
         if kpi_type == "Binomial":
@@ -817,7 +917,7 @@ def get_baseline_inputs(
         # is present (sample-size and power modes set include_mde=True). MDE
         # projection uses the baseline variance only, so the toggle is hidden.
         kpi_mean, kpi_variance, variance_scaling = _continuous_metric_inputs(
-            show_variance_toggle=include_mde
+            analysis_unit, show_variance_toggle=include_mde
         )
 
     return BaselineInputs(
@@ -831,6 +931,7 @@ def get_baseline_inputs(
         kpi_mean=kpi_mean,
         kpi_variance=kpi_variance,
         variance_scaling=variance_scaling,
+        analysis_unit=analysis_unit,
     )
 
 
@@ -857,7 +958,7 @@ def render_mde_mode(kpi_type: str) -> None:
 
 
 def _display_mde_table(inputs: BaselineInputs, results: list[MDERow]) -> None:
-    unit = _unit_label(inputs.kpi_type)
+    unit = _unit_label(inputs.kpi_type, inputs.analysis_unit)
     st.write("## MDE Calculation Results")
     st.write(
         "This table shows the smallest relative effect detectable each week. "
@@ -1000,7 +1101,7 @@ def render_sample_size_mode(kpi_type: str) -> None:
 
     if "ss_result" in st.session_state:
         sample_size, estimated_days, inputs, mde = st.session_state["ss_result"]
-        unit = _unit_label(inputs.kpi_type).lower()
+        unit = _unit_label(inputs.kpi_type, inputs.analysis_unit).lower()
 
         st.write("## Sample Size Calculation Results")
         st.write(f"Required sample size for a desired relative MDE of **{mde}%**.")
@@ -1087,7 +1188,7 @@ def render_power_mode(kpi_type: str) -> None:
             )
 
 
-def _seasonal_data_expander(kpi_type: str) -> None:
+def _seasonal_data_expander(kpi_type: str, analysis_unit: str = "per_transaction") -> None:
     """Explain the CSV schema (and the CV input for continuous) the user must
     supply for seasonal forecasting."""
     with st.expander("What data do I need to upload?", expanded=False):
@@ -1110,26 +1211,45 @@ def _seasonal_data_expander(kpi_type: str) -> None:
                 "visitors": [5120, 4880, 6010],
                 "conversions": [262, 244, 331],
             })
-        else:
+        elif analysis_unit == "per_visitor":
             st.markdown("""
-            **Required columns (continuous KPI):**
+            **Required columns (revenue per visitor):**
             * `date` — the day, as `YYYY-MM-DD` (a `ds` column is also accepted).
-            * `visitors` — number of units that day (visitors, sessions, or transactions —
-              the denominator the KPI is averaged over).
-            * `kpi_total` — the **sum** of your KPI across those units that day
-              (e.g. total daily revenue, total items sold). *Not* the average.
-              If your column has another name, you'll be able to pick it after upload.
+            * `visitors` — number of visitors that day (the denominator and the
+              sample-size unit; non-buyers are included).
+            * `kpi_total` — the **sum** of your KPI across all visitors that day
+              (e.g. total daily revenue). *Not* the average. If your column has
+              another name, you'll be able to pick it after upload.
 
-            The per-unit mean for each forecast week is reconstructed as
-            `kpi_total ÷ visitors`. Daily aggregates can't reveal how *spread out*
-            individual values are, so you also supply the **coefficient of variation**
-            (CV = std ÷ mean), assumed roughly stable over time. You can estimate the CV
-            in the non-seasonal **Continuous** mode by fitting a Gamma model to a sample
-            of individual KPI values.
+            The per-visitor mean for each forecast week is `kpi_total ÷ visitors`.
+            Daily aggregates can't reveal how spread out individual values are, so
+            you also supply the **coefficient of variation** of revenue *per visitor*
+            (CV = std ÷ mean), assumed roughly stable over time.
             """)
             example = pd.DataFrame({
                 "date": ["2024-01-01", "2024-01-02", "2024-01-03"],
                 "visitors": [5120, 4880, 6010],
+                "kpi_total": [41230.50, 39870.00, 52110.75],
+            })
+        else:  # per_transaction
+            st.markdown("""
+            **Required columns (revenue per transaction):**
+            * `date` — the day, as `YYYY-MM-DD` (a `ds` column is also accepted).
+            * `transactions` — number of **orders** that day (the denominator and the
+              sample-size unit). Use the actual transaction count from your data —
+              don't derive it from visitors × conversion rate, since that ratio
+              drifts day to day and the two counts come from different GA4 tables.
+            * `kpi_total` — the **sum** of your KPI across those orders that day
+              (e.g. total daily revenue). *Not* the average. If your column has
+              another name, you'll be able to pick it after upload.
+
+            The per-order mean (average order value) for each forecast week is
+            `kpi_total ÷ transactions`. You also supply the **coefficient of
+            variation** of *order value* (CV = std ÷ mean), assumed roughly stable.
+            """)
+            example = pd.DataFrame({
+                "date": ["2024-01-01", "2024-01-02", "2024-01-03"],
+                "transactions": [262, 244, 331],
                 "kpi_total": [41230.50, 39870.00, 52110.75],
             })
         st.caption("Example of the expected shape:")
@@ -1138,10 +1258,35 @@ def _seasonal_data_expander(kpi_type: str) -> None:
 
 def render_seasonal_mode(kpi_type: str) -> None:
     is_binomial = kpi_type == "Binomial"
-    unit = _unit_label(kpi_type)
 
     st.write("### Upload Historical Data")
-    _seasonal_data_expander(kpi_type)
+
+    analysis_unit = "per_transaction"
+    if not is_binomial:
+        unit_choice = st.radio(
+            "Analysis unit:",
+            [
+                "Revenue per visitor (includes non-converting visitors)",
+                "Revenue per transaction (converting units only)",
+            ],
+            horizontal=True,
+            key="seas_analysis_unit",
+            help=(
+                "Determines the denominator and the sample-size unit. Per visitor "
+                "uses the `visitors` column; per transaction uses the `transactions` "
+                "column. Provide the matching count column in your CSV."
+            ),
+        )
+        analysis_unit = (
+            "per_visitor" if unit_choice.startswith("Revenue per visitor")
+            else "per_transaction"
+        )
+
+    unit = _unit_label(kpi_type, analysis_unit)
+    # Internal name for the denominator/sample-size count column.
+    count_col = "visitors" if (is_binomial or analysis_unit == "per_visitor") else "transactions"
+
+    _seasonal_data_expander(kpi_type, analysis_unit)
 
     uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
@@ -1153,16 +1298,23 @@ def render_seasonal_mode(kpi_type: str) -> None:
             key="seas_variants",
         )
         if not is_binomial:
+            cv_label = (
+                "CV of revenue per visitor (std ÷ mean):"
+                if analysis_unit == "per_visitor"
+                else "CV of order value (std ÷ mean):"
+            )
+            cv_help = (
+                "Per-visitor revenue is very dispersed because most visitors "
+                "contribute 0; a CV of 3–6+ is common."
+                if analysis_unit == "per_visitor"
+                else "Order values are right-skewed; a CV of roughly 1–3 is common."
+            ) + " Estimate it in the non-seasonal Continuous mode via the Gamma fit if unsure."
             st.number_input(
-                "Coefficient of variation (std ÷ mean):",
+                cv_label,
                 min_value=0.0, step=0.1,
                 value=st.session_state.get("seas_cv", 1.0),
                 key="seas_cv",
-                help=(
-                    "Spread of an individual KPI value relative to its mean, assumed "
-                    "stable across the forecast horizon. Estimate it in the non-seasonal "
-                    "Continuous mode via the Gamma fit if unsure."
-                ),
+                help=cv_help,
             )
     with col2:
         st.number_input(
@@ -1191,8 +1343,14 @@ def render_seasonal_mode(kpi_type: str) -> None:
         if "date" in df.columns:
             df = df.rename(columns={"date": "ds"})
 
-        if "ds" not in df.columns or "visitors" not in df.columns:
-            st.error("CSV must contain a 'date' (or 'ds') column and a 'visitors' column.")
+        if "ds" not in df.columns:
+            st.error("CSV must contain a 'date' (or 'ds') column.")
+            return
+        if count_col not in df.columns:
+            st.error(
+                f"CSV must contain a '{count_col}' column for "
+                f"{'a binomial KPI' if is_binomial else _unit_label(kpi_type, analysis_unit).lower() + ' analysis'}."
+            )
             return
 
         if is_binomial:
@@ -1206,7 +1364,7 @@ def render_seasonal_mode(kpi_type: str) -> None:
                 # Let the user pick which numeric column is the daily KPI total.
                 candidates = [
                     c for c in df.select_dtypes(include="number").columns
-                    if c not in ("visitors",)
+                    if c not in ("visitors", "transactions")
                 ]
                 if not candidates:
                     st.error(
@@ -1237,20 +1395,24 @@ def render_seasonal_mode(kpi_type: str) -> None:
                 trust=st.session_state["seas_trust"],
                 tails=st.session_state["seas_tails"],
                 kpi_cv=cv,
+                analysis_unit=analysis_unit,
             )
             forecast_confidence = seasonal_inputs.risk / 100
 
-            # Internally standardise the chosen value column to the name the
-            # forecast/MDE helpers expect.
-            forecast_col = "conversions" if is_binomial else "kpi_total"
-            if not is_binomial and value_col != "kpi_total":
-                fit_df = df.rename(columns={value_col: "kpi_total"})
-            else:
-                fit_df = df
+            # Standardise the chosen count column to 'visitors' and the value
+            # column to the name the forecast/MDE helpers expect, then forecast
+            # only those two series. For a per-transaction KPI the real visitors
+            # column (if any) is dropped to avoid a name collision.
+            forecast_value = "conversions" if is_binomial else "kpi_total"
+            keep = ["ds", count_col, value_col]
+            fit_df = df[keep].rename(columns={
+                count_col: "visitors",
+                value_col: forecast_value,
+            })
 
             with st.spinner("Running Prophet Forecast…"):
                 forecast_data = run_prophet_forecast(
-                    fit_df, value_col=forecast_col,
+                    fit_df, value_col=forecast_value,
                     periods=42, interval_width=forecast_confidence,
                 )
 
@@ -1313,9 +1475,14 @@ def render_seasonal_mode(kpi_type: str) -> None:
                     "specific week, accounting for seasonality."
                 )
             else:
+                denom = "visitors" if analysis_unit == "per_visitor" else "transactions"
+                mean_name = (
+                    "revenue per visitor" if analysis_unit == "per_visitor"
+                    else "average order value"
+                )
                 st.write(
-                    "MDE calculated using **predicted** volume and per-unit mean for each "
-                    "specific week, with variance from your coefficient of variation "
+                    f"MDE calculated using **predicted** {denom} and {mean_name} for each "
+                    f"specific week, with variance from your coefficient of variation "
                     f"(CV = {cv:.2f}), accounting for seasonality."
                 )
             st.table(res_df)
