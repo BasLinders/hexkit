@@ -1,3 +1,5 @@
+httpx>=0.26.0,<0.29.0
+httpcore>=1.0.0,<2.0.0
 streamlit
 st_supabase_connection
 scikit-learn==1.7.0
