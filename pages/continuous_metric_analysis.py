@@ -5,7 +5,7 @@ from statsmodels.formula.api import ols
 import statsmodels.formula.api as smf
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 import scipy.stats as stats
-from scipy.stats import shapiro, levene, kruskal, mannwhitneyu
+from scipy.stats import normaltest, levene, kruskal, mannwhitneyu
 from scipy.optimize import minimize
 from scipy.special import gammaln
 import seaborn as sns
@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 from pingouin import welch_anova, qqplot, pairwise_gameshowell
 import scikit_posthocs as sp
 import streamlit as st
+import itertools
 
 st.set_page_config(
     page_title="Continuous metric analysis",
@@ -29,7 +30,7 @@ def render_documentation():
 
         ### 1. The Heuristic Framework
         This is a decision-engine that evaluates the underlying distribution of your data to pick the most mathematically sound test. It is particularly useful when evaluating metrics with negative values (i.e. profit).
-        * **Normality Check:** Uses the Shapiro-Wilk test to see if residuals follow a normal distribution.
+        * **Normality Check:** Uses D'Agostino's K² omnibus test (skewness + kurtosis) to see if residuals follow a normal distribution.
         * **Homogeneity Check:** Uses Levene’s test to verify if groups have equal variances.
         * **The Branches:**
             * *Standard ANOVA:* Used when data is normal and variances are equal.
@@ -43,13 +44,47 @@ def render_documentation():
         * It compares models using a **Likelihood Ratio Test (LRT)** to determine if the differences in means are statistically significant.
         """)
 
-    # --- Expander 2: How to use the app ---
+    # --- Expander 2: Analysis unit (per visitor vs per transaction) ---
+    with st.expander("Analysis unit: per visitor vs per transaction"):
+        st.markdown(r"""
+        Before testing, choose **what one row represents** for the comparison. This must
+        match how you plan the experiment (and how you size it in the pre-test tool).
+
+        ### Revenue per transaction (positive rows only)
+        * The unit is a **transaction**; the metric is e.g. average order value.
+        * Rows with a value of **0 are excluded** — they aren't orders.
+        * Gamma path: a single Gamma per variant (strictly positive data).
+        * Answers *"did the value of an order change?"* It does **not** capture a change
+          in how many people buy, and carries a mild selection effect (the set of orders
+          is itself influenced by the treatment).
+
+        ### Revenue per visitor (includes zero rows)
+        * The unit is a **visitor**; non-buyers count as **0**.
+        * **All rows are kept**, including the zeros.
+        * This is usually the real business outcome, and the unit you randomise on, so it
+          captures both *more people buying* and *buyers spending more*.
+        * Gamma path: a **two-part (hurdle) model** — a Bernoulli component for the
+          probability of converting, multiplied by a Gamma component for the spend of
+          those who do. The log-likelihoods of both parts are added, and the Likelihood
+          Ratio Test uses the combined model. This is how the Gamma approach is made to
+          *accept zeros* instead of dropping them.
+
+        **Note:** the per-visitor option needs zero-value rows in your file (the
+        non-converting visitors). If your CSV only contains orders, the two units are
+        equivalent and you should upload visitor-level data to use per-visitor analysis.
+        """)
+
+    # --- Expander 3: How to use the app ---
     with st.expander("How to use the app"):
         st.markdown(r"""
         ### Data Prerequisites
         Your CSV must be in "long format" and contain at least two columns:
         1.  **Variant Label:** A categorical column (e.g., `experience_variant_label`) identifying the group (Control, Treatment A, etc.).
         2.  **KPI:** A numeric column (e.g., `purchase_revenue`, `profit`) containing the metric to test.
+
+        For **per-visitor** analysis, include one row per visitor, with `0` in the KPI
+        column for visitors who didn't buy. For **per-transaction** analysis, one row per
+        order is enough.
 
         ### Outlier Handling
         Before running tests, you can choose how to handle extreme values:
@@ -62,7 +97,7 @@ def render_documentation():
         * Use **Gamma GLM** for monetary values or any metric where the data cannot be negative and has a long right-hand tail.
         """)
 
-    # --- Expander 3: How to read the results ---
+    # --- Expander 4: How to read the results ---
     with st.expander("How to read the results"):
         st.markdown(r"""
         ### 1. The P-Value
@@ -87,6 +122,7 @@ def render_documentation():
         * **Deviance:** A measure of the error in the model. When comparing variants, we look for a significant reduction in deviance.
         * **Likelihood Ratio Test (LRT):** This is the p-value source for Gamma. It tests the "Null Model" (one mean for all variants) against the "Alternative Model" (separate means for each variant). 
             * If **p < 0.05**, we conclude that at least one variant's mean is statistically different from the others under the Gamma assumption.
+            * For **per-visitor** analysis the model is the two-part hurdle (Bernoulli × Gamma), so each variant carries one extra parameter (the conversion rate) and the test has correspondingly more degrees of freedom.
         * **Scale Parameter ($\theta$):** Indicates the "spread" or "dispersion" of the revenue. High scale parameters often point to high-variance "Whale" customers in revenue data.
         """)
     st.write("---")
@@ -163,73 +199,141 @@ def fit_gamma(data):
     k_mle, theta_mle = res.x
     return k_mle, theta_mle, -res.fun
 
-def perform_gamma_test(df, kpi):
-    # 1. Null Model: Fit one Gamma to all data
+
+def fit_unit_model(data, unit):
+    """
+    Fit the likelihood model for the chosen analysis unit and return
+    (log_likelihood, num_parameters).
+
+    * per_transaction -> a single Gamma on the positive values (2 params: k, theta).
+    * per_visitor     -> a two-part hurdle model that *accepts zeros*:
+                         a Bernoulli on P(value > 0) plus a Gamma on the positive
+                         values. The log-likelihoods add; parameters are
+                         (p, k, theta) = 3.
+
+    The per-visitor model is what lets the Gamma approach handle non-converting
+    visitors (zeros) instead of silently discarding them.
+    """
+    data = np.asarray(data, dtype=float)
+    data = data[~np.isnan(data)]
+
+    if unit == "per_visitor":
+        n = len(data)
+        positives = data[data > 0]
+        n_pos = len(positives)
+        if n == 0:
+            return np.nan, 3
+
+        # Bernoulli (conversion) part, evaluated at its MLE p = n_pos / n.
+        p = n_pos / n
+        if 0.0 < p < 1.0:
+            ll_bern = n_pos * np.log(p) + (n - n_pos) * np.log(1.0 - p)
+        else:
+            # p == 0 (no buyers) or p == 1 (no zeros): Bernoulli LL is 0 at the MLE.
+            ll_bern = 0.0
+
+        # Gamma (spend among buyers) part.
+        if n_pos >= 2 and np.var(positives) > 0:
+            _, _, ll_gamma = fit_gamma(positives)
+        else:
+            ll_gamma = 0.0
+
+        return ll_bern + ll_gamma, 3
+
+    # per_transaction
+    positives = data[data > 0]
+    if len(positives) < 2 or np.var(positives) == 0:
+        return np.nan, 2
+    _, _, ll_gamma = fit_gamma(positives)
+    return ll_gamma, 2
+
+
+def perform_gamma_test(df, kpi, unit="per_transaction"):
+    # 1. Null Model: one model fit to all data
     all_data = df[kpi].values
-    _, _, ll_null = fit_gamma(all_data)
-    
-    # 2. Alternative Model: Fit Gamma to each variant separately
-    ll_alt = 0
+    ll_null, n_params_per_model = fit_unit_model(all_data, unit)
+
+    # 2. Alternative Model: a separate model fit to each variant
     variants = df['experience_variant_label'].unique()
     num_variants = len(variants)
-    
+
+    ll_alt = 0.0
     for v in variants:
         variant_data = df[df['experience_variant_label'] == v][kpi].values
-        _, _, ll_v = fit_gamma(variant_data)
+        ll_v, _ = fit_unit_model(variant_data, unit)
         ll_alt += ll_v
-        
+
+    if np.isnan(ll_null) or np.isnan(ll_alt):
+        return np.nan, np.nan
+
     # 3. Likelihood Ratio Test
-    # Degrees of freedom = (params in Alt) - (params in Null)
-    # Alt has 2 parameters (k, theta) per variant. Null has 2.
-    df_diff = (2 * num_variants) - 2
-    lr_stat = 2 * (ll_alt - ll_null)
-    p_value = 1 - stats.chi2.cdf(lr_stat, df=df_diff)
-    
+    #    df = (params in Alt) - (params in Null)
+    #       = n_params_per_model * num_variants - n_params_per_model
+    df_diff = n_params_per_model * (num_variants - 1)
+    lr_stat = max(2.0 * (ll_alt - ll_null), 0.0)
+    p_value = stats.chi2.sf(lr_stat, df=df_diff)
+
     return p_value, lr_stat
 
-def run_gamma_posthoc(df, kpi, group_col, control_label):
+def _fmt_pair(a, b, p=None):
+    """Format a post-hoc pair for the conclusion, e.g. 'B vs A (p=0.0012)'."""
+    label = f"{a} vs {b}"
+    if p is not None and pd.notna(p):
+        label += f" (p={p:.4g})"
+    return label
+
+
+def run_gamma_posthoc(df, kpi, group_col, control_label, unit="per_transaction"):
     st.write("### Pairwise Post-Hoc Comparisons (Gamma LRT)")
-    st.markdown("_Comparison of each treatment variant against the control using Likelihood Ratio Tests._")
-    
+    model_desc = "two-part hurdle" if unit == "per_visitor" else "Gamma"
+    st.markdown(f"_Each treatment variant is compared against the control using "
+                f"{model_desc} Likelihood Ratio Tests._")
+
     variants = [v for v in df[group_col].unique() if v != control_label]
     posthoc_data = []
-    
+    significant_pairs = []
+
     # Bonferroni correction factor
     num_comparisons = len(variants)
-    
+
     for variant in variants:
         # Filter data for pairwise comparison
         pair_df = df[df[group_col].isin([control_label, variant])]
-        
-        # 1. Fit Null Model (Single Gamma for both groups combined)
-        k_null, theta_null, null_log_lik = fit_gamma(pair_df[kpi].values)
-        
-        # 2. Fit Alternative Model (Separate Gammas for control and variant)
+
+        # 1. Null Model (single model for both groups combined)
+        null_log_lik, n_params_per_model = fit_unit_model(pair_df[kpi].values, unit)
+
+        # 2. Alternative Model (separate models for control and variant)
         ctrl_data = pair_df[pair_df[group_col] == control_label][kpi].values
         var_data = pair_df[pair_df[group_col] == variant][kpi].values
-        
-        k_ctrl, theta_ctrl, ll_ctrl = fit_gamma(ctrl_data)
-        k_var, theta_var, ll_var = fit_gamma(var_data)
-        
+        ll_ctrl, _ = fit_unit_model(ctrl_data, unit)
+        ll_var, _ = fit_unit_model(var_data, unit)
         alt_log_lik = ll_ctrl + ll_var
-        
-        # 3. Likelihood Ratio Test
-        # df=2 because Alt Model has 4 parameters and Null Model has 2 parameters.
-        lrt_stat = 2 * (alt_log_lik - null_log_lik)
-        p_val = stats.chi2.sf(lrt_stat, df=2) 
-        
-        # 4. Adjusted P-Value
-        adj_p = min(p_val * num_comparisons, 1.0)
-        
+
+        if np.isnan(null_log_lik) or np.isnan(alt_log_lik):
+            p_val = np.nan
+            lrt_stat = np.nan
+            adj_p = np.nan
+            sig = "—"
+        else:
+            # df = params(Alt) - params(Null) = 2*k - k = k (2 or 3)
+            lrt_stat = max(2.0 * (alt_log_lik - null_log_lik), 0.0)
+            p_val = stats.chi2.sf(lrt_stat, df=n_params_per_model)
+            adj_p = min(p_val * num_comparisons, 1.0)
+            sig = "✅" if adj_p < 0.05 else "❌"
+            if adj_p < 0.05:
+                significant_pairs.append(_fmt_pair(variant, control_label, adj_p))
+
         posthoc_data.append({
             "Comparison": f"{variant} vs {control_label}",
-            "LRT Stat": np.round(lrt_stat, 4),
-            "p-value": np.round(p_val, 4),
-            "p-adj (Bonferroni)": np.round(adj_p, 4),
-            "Significant": "✅" if adj_p < 0.05 else "❌"
+            "LRT Stat": np.round(lrt_stat, 4) if not np.isnan(lrt_stat) else "N/A",
+            "p-value": np.round(p_val, 4) if not np.isnan(p_val) else "N/A",
+            "p-adj (Bonferroni)": np.round(adj_p, 4) if not np.isnan(adj_p) else "N/A",
+            "Significant": sig
         })
-    
+
     st.dataframe(pd.DataFrame(posthoc_data))
+    return significant_pairs
 
 # Detect outliers
 
@@ -335,9 +439,11 @@ def log_transform_data(df, kpi):
 
 # Perform statistical tests and provide conclusions
 
-def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
+def perform_stat_tests_and_conclusions(df, kpi, model_after, approach, unit="per_transaction"):
     st.write("---") # Separator
     st.write("## Statistical Test Results")
+    unit_label = "revenue per visitor" if unit == "per_visitor" else "revenue per transaction"
+    st.write(f"_Analysis unit: **{unit_label}**._")
     st.write("_(Based on Normality of Residuals and Homogeneity of Variance)_")
 
     # --- Input Validation ---
@@ -369,16 +475,28 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
 
     if approach == "Heuristic (Auto-detect)":
         st.write("### 1. Assumption Checks")
-        # Normality Test (Shapiro-Wilk on Residuals)
+        # Normality of residuals via D'Agostino's K^2 omnibus test (skewness +
+        # kurtosis). Unlike Shapiro-Wilk it is reliable for large samples and
+        # emits no N > 5000 warning, so we use the full residual vector. Its
+        # kurtosis component is only valid for N >= 20, so very small samples
+        # fall back to non-parametric handling.
         try:
-            shapiro_stat, shapiro_p_val = shapiro(model_after.resid)
-            st.write("**Normality of Residuals (Shapiro-Wilk Test):**")
-            st.write(f"* Statistic = {shapiro_stat:.4f}")
-            st.write(f"* p-value = {shapiro_p_val:.4f}")
-            is_normal = shapiro_p_val >= 0.05
-            st.write(f"* _Conclusion: Residuals are likely {'normally distributed' if is_normal else 'NOT normally distributed'}._")
+            resid_for_test = model_after.resid.dropna()
+            st.write("**Normality of Residuals (D'Agostino's K² Test):**")
+            if len(resid_for_test) >= 20:
+                norm_stat, norm_p_val = normaltest(resid_for_test)
+                st.write(f"* Statistic (K²) = {norm_stat:.4f}")
+                st.write(f"* p-value = {norm_p_val:.4f}")
+                is_normal = norm_p_val >= 0.05
+                st.write(f"* _Conclusion: Residuals are likely {'normally distributed' if is_normal else 'NOT normally distributed'}._")
+            else:
+                is_normal = False
+                st.caption(
+                    "Fewer than 20 residuals — too few for a reliable omnibus "
+                    "normality test; defaulting to non-parametric handling."
+                )
         except Exception as e:
-            st.error(f"Error during Shapiro-Wilk test: {e}")
+            st.error(f"Error during normality test: {e}")
             st.write("_Skipping further analysis due to normality test error._")
             return
 
@@ -411,7 +529,10 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
 
     elif approach == "Gamma GLM (Best for Revenue/Items)":
         # Skip diagnostics and go straight to GLM
-        st.info("Diagnostic tests (Shapiro/Levene) skipped. Gamma GLM is robust to non-normal, skewed data.")
+        if unit == "per_visitor":
+            st.info("Diagnostic tests (normality/Levene) skipped. Using a two-part hurdle model (Bernoulli × Gamma) that includes non-converting visitors (zeros).")
+        else:
+            st.info("Diagnostic tests (normality/Levene) skipped. Gamma GLM is robust to non-normal, skewed data.")
         is_normal = False
         is_homogeneous = False
 
@@ -423,34 +544,41 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
     test_statistic = np.nan
     effect_size = None
     posthoc_results = None
+    significant_pairs = []
     is_significant = False # Initialize
 
     try:
         if approach == "Gamma GLM (Best for Revenue/Items)":
-            st.info("Native Gamma Likelihood Ratio Test")
+            if unit == "per_visitor":
+                st.info("Native two-part (hurdle) Likelihood Ratio Test")
+            else:
+                st.info("Native Gamma Likelihood Ratio Test")
             try:
-                # Fixed the function call name here to match your definition
-                p_value, lr_stat = perform_gamma_test(df_clean, kpi)
-                
-                st.write(f"* Likelihood Ratio Statistic: {lr_stat:.4f}")
-                st.write(f"* p-value: {p_value:.4g}")
-                
-                is_significant = p_value < 0.05
-                test_name = "Native Gamma MLE"
+                p_value, lr_stat = perform_gamma_test(df_clean, kpi, unit)
 
-                if is_significant and num_groups > 2:
-                    control_label = st.selectbox("Select Control Variant for Post-Hoc", df_clean['experience_variant_label'].unique())
-                    
-                    run_gamma_posthoc(
-                        df=df_clean, 
-                        kpi=kpi, 
-                        group_col='experience_variant_label', 
-                        control_label=control_label
-                    )
+                if pd.isna(p_value):
+                    st.warning("The likelihood model could not be fit (check that each variant has enough positive values).")
+                else:
+                    st.write(f"* Likelihood Ratio Statistic: {lr_stat:.4f}")
+                    st.write(f"* p-value: {p_value:.4g}")
 
-                elif not is_significant and num_groups > 2:
-                    st.info("Global test is not significant; pairwise comparisons are not required.")
-                
+                    is_significant = p_value < 0.05
+                    test_name = "Two-Part Hurdle MLE" if unit == "per_visitor" else "Native Gamma MLE"
+
+                    if is_significant and num_groups > 2:
+                        control_label = st.selectbox("Select Control Variant for Post-Hoc", df_clean['experience_variant_label'].unique())
+
+                        significant_pairs = run_gamma_posthoc(
+                            df=df_clean,
+                            kpi=kpi,
+                            group_col='experience_variant_label',
+                            control_label=control_label,
+                            unit=unit,
+                        )
+
+                    elif not is_significant and num_groups > 2:
+                        st.info("Global test is not significant; pairwise comparisons are not required.")
+
             except Exception as e:
                 st.error(f"Native Gamma Fit failed: {e}")
                 p_value = np.nan
@@ -474,6 +602,12 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
                     tukey_results = pairwise_tukeyhsd(df_clean[kpi], df_clean['experience_variant_label'], alpha=0.05)
                     st.write(tukey_results.summary())
                     posthoc_results = tukey_results
+                    tukey_groups = [str(g) for g in tukey_results.groupsunique]
+                    tukey_combos = list(itertools.combinations(tukey_groups, 2))
+                    tukey_pvals = getattr(tukey_results, "pvalues", [None] * len(tukey_combos))
+                    for (a, b), reject, pv in zip(tukey_combos, tukey_results.reject, tukey_pvals):
+                        if reject:
+                            significant_pairs.append(_fmt_pair(a, b, pv))
 
             elif is_normal and not is_homogeneous: 
                 # Normal, but Heterogeneous Variances (This is where Welch's belongs)
@@ -493,6 +627,9 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
                     st.markdown("_Reason: Welch's ANOVA was significant, identifying which specific groups differ (suitable for unequal variances)._")
                     posthoc_results = pairwise_gameshowell(data=df_clean, dv=kpi, between='experience_variant_label')
                     st.dataframe(posthoc_results)
+                    for _, gh_row in posthoc_results.iterrows():
+                        if pd.notna(gh_row['pval']) and gh_row['pval'] < 0.05:
+                            significant_pairs.append(_fmt_pair(gh_row['A'], gh_row['B'], gh_row['pval']))
     
             else: 
                 # Non-Normal Data -> Drop to Non-parametric tests regardless of variance
@@ -525,6 +662,12 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
                             
                             st.write("_(p-values adjusted using Bonferroni method)_")
                             st.dataframe(posthoc_results_df)
+                            dunn_cols = list(posthoc_results_df.columns)
+                            for i in range(len(dunn_cols)):
+                                for j in range(i + 1, len(dunn_cols)):
+                                    pv = posthoc_results_df.iloc[i, j]
+                                    if pd.notna(pv) and pv < 0.05:
+                                        significant_pairs.append(_fmt_pair(dunn_cols[i], dunn_cols[j], pv))
                         except Exception as posthoc_e:
                              st.error(f"Error during Dunn's post-hoc test: {posthoc_e}")
     
@@ -555,6 +698,7 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
 
     # --- Summary Statistics ---
     st.write("### 3. Descriptive Statistics")
+    st.caption(f"Means and standard deviations are computed per {unit_label.split(' per ')[-1]} (analysis unit: {unit_label}).")
     try:
         summary_stats = df_clean.groupby('experience_variant_label', observed=True)[kpi].agg(['mean', 'std', 'count'])
         st.dataframe(summary_stats)
@@ -584,9 +728,16 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
         st.success(f"**A statistically significant difference was detected between the groups (p = {p_value:.4g}, using {test_name}).**")
         
         if num_groups > 2:
-            if approach == "Gamma GLM (Best for Revenue/Items)":
+            if significant_pairs:
+                st.write("**Significant pairwise differences** (after multiple-comparison correction):")
+                for pair in significant_pairs:
+                    st.markdown(f"* {pair}")
+                st.markdown("_Refer to the summary statistics above to see which side of each pair is higher._")
+            elif approach == "Gamma GLM (Best for Revenue/Items)":
                 st.write("The Likelihood Ratio Test indicates that variant means differ significantly. See the **Pairwise Post-Hoc Comparisons** above to identify which treatments outperformed the control.")
             elif posthoc_results is not None:
+                st.write("The global test is significant, but no individual pair remained significant after multiple-comparison correction. See the post-hoc table above.")
+            else:
                 st.write("See the post-hoc test results above to determine which specific groups differ significantly.")
         
         elif num_groups == 2:
@@ -609,11 +760,44 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach):
 
     st.write("---")
 
-@st.cache_data
-def load_and_preprocess_cached(file_contents):
-    df = pd.read_csv(file_contents)
-    df, errors = preprocess_data(df)
-    return df, errors
+@st.cache_data(show_spinner=False)
+def _read_csv_cached(file_contents):
+    """Cached raw CSV read (the expensive step). Preprocessing is run separately
+    in run() so the progress bar can report reading and cleaning as two phases."""
+    return pd.read_csv(file_contents)
+
+
+def _distribution_plot_frame(frame, kpi, unit):
+    """Pick the rows and y-axis window for the distribution charts.
+
+    Per-visitor revenue is heavily zero-inflated (most visitors don't convert),
+    which crushes the box plot to a flat line at 0 and the histogram to a single
+    spike — no axis scaling fixes that, because the quartiles really are 0. In
+    per-visitor mode we therefore chart only the converting (non-zero) rows so
+    the spend distribution is legible, and return a note saying how many zeros
+    were set aside (they remain in the statistical test). The window is +/- 3.5
+    std around the mean of the plotted rows, floored at 0 only for non-negative
+    data so genuine negatives (e.g. profit) stay visible.
+    """
+    if unit == "per_visitor":
+        plot_frame = frame[frame[kpi] != 0]
+        n_zero = len(frame) - len(plot_frame)
+        note = (
+            f"Showing the {len(plot_frame):,} converting (non-zero) rows; "
+            f"{n_zero:,} zero-value visitors are omitted from this chart for "
+            f"readability (they remain included in the statistical test)."
+        ) if n_zero else None
+    else:
+        plot_frame = frame
+        note = None
+
+    series = plot_frame[kpi]
+    if len(series) < 2:
+        return plot_frame, None, None, note
+    mean, std = series.mean(), series.std()
+    lower = mean - 3.5 * std
+    low = lower if series.min() < 0 else max(0, lower)
+    return plot_frame, low, mean + 3.5 * std, note
 
 # Main Streamlit app
 def run():
@@ -641,16 +825,21 @@ def run():
 
     uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
     if uploaded_file is not None:
-        # Pass the uploaded file to the cached function
-        df, errors = load_and_preprocess_cached(uploaded_file)
-        
+        # --- Preprocessing progress bar ---
+        prep_bar = st.progress(0, text="Reading the uploaded file…")
+        raw_df = _read_csv_cached(uploaded_file)
+        prep_bar.progress(55, text="Cleaning and validating columns…")
+        df, errors = preprocess_data(raw_df.copy())
+        prep_bar.progress(100, text="Preprocessing complete.")
+        prep_bar.empty()
+
         if errors:
             for error in errors:
                 st.error(error)
             return
 
         st.write("### A random sample of your data:")
-        st.write(df.sample(10))
+        st.write(df.sample(min(10, len(df))))
 
         possible_kpis = ['purchase_revenue', 'total_item_quantity', 'profit']
         available_kpis = [col for col in possible_kpis if col in df.columns]
@@ -667,21 +856,57 @@ def run():
 
         kpi = st.selectbox("Select the KPI to analyze:", available_kpis)
 
-        filter_zero_profit = False
-        
-        # Only show this checkbox if the user SELECTED profit AND the column actually has zeros
-        if kpi == 'profit' and (df['profit'] == 0).any():
-             filter_zero_profit = st.checkbox("Exclude rows where profit is zero (recommended for ANOVA)", value=True)
-            
-        # Select how to handle outliers
-        outlier_handling = st.selectbox("Select how to handle outliers:", ['None', 'Winsorizing (STD/Percentile)', 'Log Transform', 'Removal'], help='Choose the method for handling outliers. "None" uses a default > 5 standard deviation definition for detection purposes. Only use Log Transform when your data does not contain negative numbers.')
+        # --- Analysis unit selector (per visitor vs per transaction) ---
+        unit_choice = st.selectbox(
+            "Select the analysis unit:",
+            [
+                "Revenue per visitor (includes zero-value rows)",
+                "Revenue per transaction (positive rows only)",
+            ],
+            help=(
+                "Per visitor averages over every visitor, counting non-buyers as 0 "
+                "(captures conversion-rate and spend effects together; needs zero rows "
+                "in your file). Per transaction looks at order value among buyers only."
+            ),
+        )
+        unit = "per_visitor" if unit_choice.startswith("Revenue per visitor") else "per_transaction"
+
+        # Inspect the zero structure of the chosen KPI to guide the user.
+        kpi_series = df[kpi].dropna()
+        n_zeros = int((kpi_series == 0).sum())
+        n_neg = int((kpi_series < 0).sum())
+
+        if unit == "per_visitor":
+            if n_zeros == 0:
+                st.info(
+                    "No zero-value rows were found for this KPI, so per-visitor and "
+                    "per-transaction analysis are equivalent here. To capture "
+                    "non-converting visitors, upload visitor-level data with 0 for non-buyers."
+                )
+            else:
+                st.success(f"Per-visitor analysis will include all rows, "
+                           f"of which {n_zeros:,} are non-converting (zero-value) visitors.")
+        else:  # per_transaction
+            if n_zeros > 0:
+                st.info(f"Per-transaction analysis will exclude {n_zeros:,} zero-value row(s) (non-orders).")
 
         # Select analysis approach (Gamma model for revenue/items per transaction, heuristic framework for e.g. profit
         analysis_approach = st.selectbox(
             "Select Statistical Approach:",
             ["Heuristic (Auto-detect)", "Gamma GLM (Best for Revenue/Items)"],
-            help="Heuristic follows a Normality/Variance decision tree. Gamma GLM is optimized for strictly positive, right-skewed continuous data."
+            help="Heuristic follows a Normality/Variance decision tree. Gamma GLM is optimized for strictly positive, right-skewed continuous data. For per-visitor analysis, Gamma GLM uses a two-part hurdle model so zeros are included."
         )
+
+        # Guard: the Gamma family needs non-negative data.
+        if analysis_approach == "Gamma GLM (Best for Revenue/Items)" and n_neg > 0:
+            st.warning(
+                f"The Gamma model requires non-negative values, but '{kpi}' contains "
+                f"{n_neg:,} negative value(s). Use the Heuristic approach for this metric, "
+                "or pick a non-negative KPI."
+            )
+
+        # Select how to handle outliers
+        outlier_handling = st.selectbox("Select how to handle outliers:", ['None', 'Winsorizing (STD/Percentile)', 'Log Transform', 'Removal'], help='Choose the method for handling outliers. "None" uses a default > 5 standard deviation definition for detection purposes. Only use Log Transform when your data does not contain negative numbers.')
 
         method = None
         outlier_stdev = None
@@ -694,44 +919,64 @@ def run():
             elif method == 'Percentile':
                 percentile = st.selectbox("Select percentile for Winsorization:", [90, 95, 99])
 
-        outliers_mask, initial_model, large_file_threshold = detect_outliers(df, kpi, outlier_stdev if method == 'Standard Deviation' else 5)  # Default 5 STD for detection purposes
+        with st.spinner("Scanning for outliers…"):
+            outliers_mask, initial_model, large_file_threshold = detect_outliers(df, kpi, outlier_stdev if method == 'Standard Deviation' else 5)  # Default 5 STD for detection purposes
         #st.write(f"Number of detected outliers: {outliers_mask.sum()}")
         if (len(df) >= large_file_threshold) and (outliers_mask.sum() > 0):
             st.warning(f"{outliers_mask.sum()} Outliers detected in a large dataset. The IQR method was used for outlier detection for efficient computation. You can adjust the outlier handling method in the options above.")
         elif (len(df) < large_file_threshold) and (outliers_mask.sum() > 0):
             st.warning(f"{outliers_mask.sum()} Outliers detected in a relatively small dataset. The OLS method was used for outlier detection. You can adjust the outlier handling method in the options above.")
 
-        # Show raw data plots before any processing
-        data_mean = df[kpi].mean()
-        data_std = df[kpi].std()
-        raw_min = max(0, data_mean - 3.5 * data_std) 
-        raw_max = data_mean + 3.5 * data_std
+        # Distribution charts. For zero-inflated per-visitor data, chart the
+        # converting (non-zero) rows so the zero spike doesn't crush the scale.
         num_variants = len(df['experience_variant_label'].unique())
+        raw_plot_df, raw_min, raw_max, raw_note = _distribution_plot_frame(df, kpi, unit)
 
         st.write("### Raw Data Box Plot")
         fig_box, ax_box = plt.subplots()
-        sns.boxplot(x='experience_variant_label', y=kpi, data=df, palette=sns.color_palette("hls", num_variants), hue='experience_variant_label', legend=False)
-        ax_box.set_ylim(raw_min, raw_max)
+        sns.boxplot(x='experience_variant_label', y=kpi, data=raw_plot_df, palette=sns.color_palette("hls", num_variants), hue='experience_variant_label', legend=False)
+        if raw_min is not None:
+            ax_box.set_ylim(raw_min, raw_max)
         st.pyplot(fig_box)
+        if raw_note:
+            st.caption(raw_note)
         plt.clf()
 
         st.write("### Raw Data Histogram with KDE")
         fig_hist, ax_hist = plt.subplots()
-        sns.histplot(df[kpi], kde=True, bins=30, ax=ax_hist)
-        ax_hist.set_xlim(raw_min, raw_max)
+        hist_kwargs = {"kde": True, "bins": 30, "ax": ax_hist}
+        if raw_min is not None:
+            # Bin within the visible window so a long tail/outlier doesn't make
+            # the bins so wide the data collapses into one bar.
+            hist_kwargs["binrange"] = (raw_min, raw_max)
+        sns.histplot(raw_plot_df[kpi], **hist_kwargs)
+        if raw_min is not None:
+            ax_hist.set_xlim(raw_min, raw_max)
         plt.title("Raw Data Histogram with KDE")
         st.pyplot(fig_hist)
+        if raw_note:
+            st.caption(raw_note)
         plt.clf()
 
 
         if st.button("Calculate my test results", type="primary"):
+            action_bar = st.progress(0, text="Preparing data…")
             processed_df = df.copy()
-            
-            if kpi == 'profit' and filter_zero_profit:
+
+            # --- Analysis-unit zero handling ---
+            # Per transaction: a row must be an actual order, so drop zero-value rows.
+            # Per visitor: keep all rows (the zeros are non-converting visitors).
+            if unit == "per_transaction":
                 initial_rows = len(processed_df)
-                processed_df = processed_df[processed_df['profit'] > 0]
+                processed_df = processed_df[processed_df[kpi] != 0]
                 rows_removed = initial_rows - len(processed_df)
-                st.info(f"Filtered out {rows_removed} rows where profit was zero.")
+                if rows_removed > 0:
+                    st.info(f"Per-transaction analysis: filtered out {rows_removed:,} zero-value (non-order) rows.")
+            else:
+                if (processed_df[kpi] == 0).any():
+                    st.info("Per-visitor analysis: zero-value (non-converting) rows are kept.")
+
+            action_bar.progress(20, text="Applying outlier handling…")
 
             # --- Outlier Handling ---
             if outlier_handling == 'Winsorizing (STD/Percentile)':
@@ -755,26 +1000,32 @@ def run():
                     * **Back-transformation:** The reported means will represent the **Geometric Mean** of your data, which is less sensitive to extreme right-skewed outliers.
                 """)
             elif outlier_handling == 'Removal':
-                processed_df = processed_df[~outliers_mask]
-                st.write(f"Outliers removed: {outliers_mask.sum()} rows affected.")
+                # Align the precomputed mask to the (possibly zero-filtered) rows.
+                mask_aligned = outliers_mask.reindex(processed_df.index, fill_value=False)
+                processed_df = processed_df[~mask_aligned]
+                st.write(f"Outliers removed: {int(mask_aligned.sum())} rows affected.")
             else:
                 st.warning("No outlier handling applied.")
+
+            action_bar.progress(45, text="Fitting model…")
 
             # --- Refit the model after outlier handling ---
             model_after = smf.ols(f'{kpi} ~ C(experience_variant_label)', data=processed_df).fit()
 
+            action_bar.progress(60, text="Rendering diagnostic charts…")
+
             # --- Processed Data Plots (using the processed data) ---
-            data_mean = processed_df[kpi].mean()
-            data_std = processed_df[kpi].std()
-            processed_min = max(0, data_mean - 3.5 * data_std)
-            processed_max = data_mean + 3.5 * data_std
             num_variants = len(processed_df['experience_variant_label'].unique())
-            
+            proc_plot_df, processed_min, processed_max, proc_note = _distribution_plot_frame(processed_df, kpi, unit)
+
             st.write("### Refitted Data Box Plot")
             fig_box, ax_box = plt.subplots()
-            sns.boxplot(x='experience_variant_label', y=kpi, data=processed_df, palette=sns.color_palette("hls", num_variants), hue='experience_variant_label', legend=False)
-            ax_box.set_ylim(processed_min, processed_max)
+            sns.boxplot(x='experience_variant_label', y=kpi, data=proc_plot_df, palette=sns.color_palette("hls", num_variants), hue='experience_variant_label', legend=False)
+            if processed_min is not None:
+                ax_box.set_ylim(processed_min, processed_max)
             st.pyplot(fig_box)
+            if proc_note:
+                st.caption(proc_note)
             plt.clf()
             
             if analysis_approach != "Gamma GLM (Best for Revenue/Items)":
@@ -803,17 +1054,33 @@ def run():
                 plt.clf()
 
                 st.write("### Refitted Data Histogram with KDE")
-                resid_std = model_after.resid.std()
-                resid_min = -3.5 * resid_std
-                resid_max = 3.5 * resid_std
+                resid_series = model_after.resid
+                resid_note = None
+                if unit == "per_visitor":
+                    # Residuals are zero-inflated too; show converting rows so the
+                    # zero spike doesn't collapse the histogram into a single bar.
+                    resid_series = resid_series[processed_df[kpi] != 0]
+                    resid_note = "Residuals shown for converting (non-zero) rows only."
+                resid_mean, resid_std = resid_series.mean(), resid_series.std()
+                resid_min = resid_mean - 3.5 * resid_std
+                resid_max = resid_mean + 3.5 * resid_std
                 fig_hist, ax_hist = plt.subplots()
-                sns.histplot(model_after.resid, kde=True, bins=30, ax=ax_hist) # Use residuals from the new model
-                ax_hist.set_xlim(resid_min, resid_max)
+                hist_kwargs = {"kde": True, "bins": 30, "ax": ax_hist}
+                if pd.notna(resid_std) and resid_std > 0:
+                    hist_kwargs["binrange"] = (resid_min, resid_max)
+                sns.histplot(resid_series, **hist_kwargs)  # residuals from the refit
+                if pd.notna(resid_std) and resid_std > 0:
+                    ax_hist.set_xlim(resid_min, resid_max)
                 plt.title("Histogram of Residuals with KDE")
                 st.pyplot(fig_hist)
+                if resid_note:
+                    st.caption(resid_note)
                 plt.clf()
 
-            perform_stat_tests_and_conclusions(processed_df, kpi, model_after, analysis_approach)
+            action_bar.progress(80, text="Running statistical tests…")
+            perform_stat_tests_and_conclusions(processed_df, kpi, model_after, analysis_approach, unit)
+            action_bar.progress(100, text="Analysis complete.")
+            action_bar.empty()
             
 if __name__ == "__main__":
     run()
