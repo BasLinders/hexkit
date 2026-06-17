@@ -1,10 +1,10 @@
 # Roadmap toolkit (lange termijn)
 - Frequentist calculator: Integratie CUPED (Controlled experiment Using Pre-Experiment Data) variantiereductiemethode in frequentist calculator
-  - Lastig wanneer we met aggregaat data blijven werken. Over nadenken.
+  - DONE!
 - Bayesian calculator: Bayesiaanse calculator multi-arm maken (kansberekening, bar chart, business case)
-  - Work in progress.
+  - DONE!
 - mSPRT app: mixture Sequential Probability Ratio Test kaders vaststellen (of user laten bepalen) en in Colaboratory operationeel maken voor dagelijkse runs (Maarten Kaaij voor meer info vragen)
-  - To do
+  - DONE!
 - Continuous: Winsorizing (capping) mogelijkheden onderzoeken i.p.v. huidige outlier-removal oplossing voor variantiereductie om geen bias te introduceren
   - DONE!
 
