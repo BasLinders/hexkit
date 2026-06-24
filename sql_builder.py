@@ -1,6 +1,7 @@
 """
 sql_builder.py
 Generates BigQuery SQL for each export mode from structured user inputs.
+No hardcoded limits on variants or experiments.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -29,14 +30,14 @@ def _suffix_filter(start: str, end: str, alias: str = "") -> str:
 
 @dataclass
 class VariantPair:
-    label: str # 'A', 'B', 'C', …
-    string: str # the actual variant ID string
+    label: str        # 'A', 'B', 'C', …
+    string: str       # the actual variant ID string
 
 
 @dataclass
 class ExperimentConfig:
     experiment_id: str
-    prefix: str  # for LIKE matching
+    prefix: str           # for LIKE matching
     variants: list[VariantPair] = field(default_factory=list)
 
 
@@ -56,9 +57,9 @@ class BinomialParams:
     dataset: str
     start_date: str
     end_date: str
-    param_key: str  # e.g. 'exp_variant_string'
+    param_key: str                          # e.g. 'exp_variant_string'
     match_strategy: Literal["exact", "like"]
-    experiments: list[ExperimentConfig]  # ≥1; multi-experiment = len > 1
+    experiments: list[ExperimentConfig]    # ≥1; multi-experiment = len > 1
     post_exposure_filter: bool = True
     # KPI toggles — zero-cost group
     kpi_transactions: bool = True
@@ -95,7 +96,7 @@ class SequentialParams:
     experiments: list[ExperimentConfig]
     use_persistence: bool = True
     reset_cumulative_data: bool = False
-    cumulative_table: str = ""  # project.dataset.table_name
+    cumulative_table: str = ""            # project.dataset.table_name
     kpi_transactions: bool = True
     kpi_add_to_cart: bool = True
     kpi_aov: bool = True
@@ -155,18 +156,18 @@ dummy AS (SELECT 1)  -- placeholder when no page filter
 
 SELECT
   -- All devices
-  COUNT(DISTINCT main.user_pseudo_id) AS total_visitors,
-  COUNTIF(main.event_name = 'add_to_cart') AS total_add_to_cart,
+  COUNT(DISTINCT main.user_pseudo_id)                                                         AS total_visitors,
+  COUNTIF(main.event_name = 'add_to_cart')                                                    AS total_add_to_cart,
   SUM(CASE WHEN main.event_name = 'purchase' THEN main.ecommerce.total_item_quantity ELSE 0 END) AS total_items_purchased,
   COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' THEN main.ecommerce.transaction_id END)  AS total_transactions,
   -- Mobile
-  COUNT(DISTINCT CASE WHEN main.device.category = 'mobile' THEN main.user_pseudo_id END)  AS mobile_visitors,
-  COUNTIF(main.event_name = 'add_to_cart' AND main.device.category = 'mobile')  AS mobile_add_to_cart,
+  COUNT(DISTINCT CASE WHEN main.device.category = 'mobile' THEN main.user_pseudo_id END)     AS mobile_visitors,
+  COUNTIF(main.event_name = 'add_to_cart' AND main.device.category = 'mobile')               AS mobile_add_to_cart,
   SUM(CASE WHEN main.event_name = 'purchase' AND main.device.category = 'mobile' THEN main.ecommerce.total_item_quantity ELSE 0 END) AS mobile_items_purchased,
   COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' AND main.device.category = 'mobile' THEN main.ecommerce.transaction_id END)  AS mobile_transactions,
   -- Desktop
-  COUNT(DISTINCT CASE WHEN main.device.category = 'desktop' THEN main.user_pseudo_id END) AS desktop_visitors,
-  COUNTIF(main.event_name = 'add_to_cart' AND main.device.category = 'desktop')  AS desktop_add_to_cart,
+  COUNT(DISTINCT CASE WHEN main.device.category = 'desktop' THEN main.user_pseudo_id END)    AS desktop_visitors,
+  COUNTIF(main.event_name = 'add_to_cart' AND main.device.category = 'desktop')              AS desktop_add_to_cart,
   SUM(CASE WHEN main.event_name = 'purchase' AND main.device.category = 'desktop' THEN main.ecommerce.total_item_quantity ELSE 0 END) AS desktop_items_purchased,
   COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' AND main.device.category = 'desktop' THEN main.ecommerce.transaction_id END)  AS desktop_transactions
 FROM {table} AS main
@@ -193,12 +194,11 @@ def _variant_case_block(exp: ExperimentConfig, strategy: str, param_key: str) ->
 def build_binomial(p: BinomialParams, limit: int = 0) -> str:
     table = _table_ref(p.project, p.dataset)
     suffix = _suffix_filter(p.start_date, p.end_date)
-    exp = p.experiments[0]  # single-experiment path; multi handled separately
+    exp = p.experiments[0]
 
     all_variant_strings = [v.string for v in exp.variants]
     variant_in_list = ", ".join(f"'{s}'" for s in all_variant_strings)
 
-    # Exposure detection
     if p.match_strategy == "like":
         exp_filter = f"AND params.value.string_value LIKE '{exp.prefix}'"
     else:
@@ -206,10 +206,46 @@ def build_binomial(p: BinomialParams, limit: int = 0) -> str:
 
     case_block = _variant_case_block(exp, p.match_strategy, p.param_key)
 
-    # Optional CTEs
-    optional_ctes = ""
+    # -----------------------------------------------------------------------
+    # Build CTEs and joins conditionally
+    # -----------------------------------------------------------------------
+    ecommerce_cte  = ""
+    ecommerce_join = ""
+    device_cte     = ""
+    device_join    = ""
+    optional_ctes  = ""
     optional_joins = ""
-    optional_selects = ""
+
+    need_ecommerce = p.kpi_transactions or p.kpi_aov
+    if need_ecommerce:
+        ecommerce_cte = f"""
+ecommerce_data AS (
+  SELECT
+    user_pseudo_id AS ecommerce_user_pseudo_id,
+    SUM(ecommerce.purchase_revenue)          AS purchase_revenue,
+    COUNT(DISTINCT ecommerce.transaction_id) AS transaction_id
+  FROM {table}
+  WHERE {suffix}
+    AND event_name = 'purchase'
+    AND user_pseudo_id IS NOT NULL
+  GROUP BY user_pseudo_id
+),
+"""
+        ecommerce_join = "  LEFT JOIN ecommerce_data ed ON vd.variant_user_pseudo_id = ed.ecommerce_user_pseudo_id\n"
+
+    if p.kpi_device_split:
+        device_cte = f"""
+device_data AS (
+  SELECT
+    user_pseudo_id AS device_user_pseudo_id,
+    MAX(CASE WHEN device.category = 'mobile'  THEN 1 ELSE 0 END) AS is_mobile_user,
+    MAX(CASE WHEN device.category = 'desktop' THEN 1 ELSE 0 END) AS is_desktop_user
+  FROM {table}
+  WHERE {suffix}
+  GROUP BY user_pseudo_id
+),
+"""
+        device_join = "  LEFT JOIN device_data dd ON vd.variant_user_pseudo_id = dd.device_user_pseudo_id\n"
 
     if p.kpi_add_to_cart:
         optional_ctes += f"""
@@ -264,80 +300,89 @@ ideal_users AS (
 """
         optional_joins += "  LEFT JOIN ideal_users iu ON vd.variant_user_pseudo_id = iu.user_pseudo_id\n"
 
-    # Build SELECT columns
-    select_cols = ["  experience_variant_label"]
-    select_cols.append("  COUNT(DISTINCT variant_user_pseudo_id) AS visitors")
+    # -----------------------------------------------------------------------
+    # final_data SELECT list — only include columns whose CTEs are present.
+    # All aliases (ed., dd., atc., etc.) are resolved here; the outer SELECT
+    # reads from final_data using plain column names with no table prefix.
+    # -----------------------------------------------------------------------
+    final_cols = [
+        "    vd.variant_user_pseudo_id",
+        "    vd.experience_variant_label",
+    ]
+    if need_ecommerce:
+        final_cols += [
+            "    ed.transaction_id  AS transaction_id",
+            "    ed.purchase_revenue AS purchase_revenue",
+        ]
+    if p.kpi_device_split:
+        final_cols += [
+            "    dd.is_mobile_user",
+            "    dd.is_desktop_user",
+        ]
+    if p.kpi_add_to_cart:
+        final_cols.append(
+            "    CASE WHEN atc.atc_user_pseudo_id IS NOT NULL THEN 1 ELSE 0 END AS has_added_to_cart"
+        )
+    if p.kpi_ideal:
+        final_cols.append(
+            "    CASE WHEN iu.user_pseudo_id IS NOT NULL THEN 1 ELSE 0 END AS paid_with_ideal"
+        )
+    if p.kpi_login:
+        final_cols.append("    COALESCE(ld.has_logged_in, 0) AS has_logged_in")
+    if p.kpi_create_account:
+        final_cols.append("    COALESCE(cd.has_created_account, 0) AS has_created_account")
+
+    final_select = ",\n".join(final_cols)
+
+    # -----------------------------------------------------------------------
+    # Outer aggregated SELECT — plain column names, no table alias prefixes.
+    # -----------------------------------------------------------------------
+    select_cols = [
+        "  experience_variant_label",
+        "  COUNT(DISTINCT variant_user_pseudo_id) AS visitors",
+    ]
 
     if p.kpi_transactions:
-        select_cols.append("  COUNT(DISTINCT CASE WHEN ed.transaction_id IS NOT NULL THEN variant_user_pseudo_id END) AS users_with_transaction")
-        select_cols.append("  COUNT(DISTINCT ed.transaction_id) AS total_transactions")
+        select_cols += [
+            "  COUNT(DISTINCT CASE WHEN transaction_id IS NOT NULL THEN variant_user_pseudo_id END) AS users_with_transaction",
+            "  COUNT(DISTINCT transaction_id) AS total_transactions",
+        ]
 
     if p.kpi_aov:
         select_cols.append(
-            "  ROUND(SUM(ed.purchase_revenue) / NULLIF(COUNT(DISTINCT CASE WHEN ed.transaction_id IS NOT NULL THEN variant_user_pseudo_id END), 0), 2) AS average_order_value"
+            "  ROUND(SUM(purchase_revenue) / NULLIF(COUNT(DISTINCT CASE WHEN transaction_id IS NOT NULL THEN variant_user_pseudo_id END), 0), 2) AS average_order_value"
         )
 
     if p.kpi_device_split:
         select_cols += [
-            "  COUNT(DISTINCT CASE WHEN dd.is_mobile_user = 1 THEN variant_user_pseudo_id END) AS mobile_users",
-            "  COUNT(DISTINCT CASE WHEN dd.is_mobile_user = 1 AND ed.transaction_id IS NOT NULL THEN variant_user_pseudo_id END) AS mobile_buyers",
-            "  COUNT(DISTINCT CASE WHEN dd.is_desktop_user = 1 THEN variant_user_pseudo_id END) AS desktop_users",
-            "  COUNT(DISTINCT CASE WHEN dd.is_desktop_user = 1 AND ed.transaction_id IS NOT NULL THEN variant_user_pseudo_id END) AS desktop_buyers",
+            "  COUNT(DISTINCT CASE WHEN is_mobile_user  = 1 THEN variant_user_pseudo_id END) AS mobile_users",
+            "  COUNT(DISTINCT CASE WHEN is_desktop_user = 1 THEN variant_user_pseudo_id END) AS desktop_users",
         ]
+        # Buyer breakdown only available when transaction data is also present
+        if p.kpi_transactions:
+            select_cols += [
+                "  COUNT(DISTINCT CASE WHEN is_mobile_user  = 1 AND transaction_id IS NOT NULL THEN variant_user_pseudo_id END) AS mobile_buyers",
+                "  COUNT(DISTINCT CASE WHEN is_desktop_user = 1 AND transaction_id IS NOT NULL THEN variant_user_pseudo_id END) AS desktop_buyers",
+            ]
 
     if p.kpi_add_to_cart:
-        select_cols.append("  COUNT(DISTINCT CASE WHEN atc.atc_user_pseudo_id IS NOT NULL THEN variant_user_pseudo_id END) AS add_to_cart")
+        select_cols.append("  SUM(has_added_to_cart) AS add_to_cart")
 
     if p.kpi_ideal:
-        select_cols.append("  COUNT(DISTINCT CASE WHEN iu.user_pseudo_id IS NOT NULL THEN variant_user_pseudo_id END) AS paid_with_ideal")
+        select_cols.append("  SUM(paid_with_ideal) AS paid_with_ideal")
 
     if p.kpi_login:
-        select_cols.append("  SUM(COALESCE(ld.has_logged_in, 0)) AS login_page_visits")
+        select_cols.append("  SUM(has_logged_in) AS login_page_visits")
 
     if p.kpi_create_account:
-        select_cols.append("  SUM(COALESCE(cd.has_created_account, 0)) AS account_creation_page_visits")
+        select_cols.append("  SUM(has_created_account) AS account_creation_page_visits")
 
-    select_block = ",\n".join(select_cols)
-    limit_clause = f"\nLIMIT {limit}" if limit else ""
-
-    ecommerce_cte = ""
-    ecommerce_join = ""
-    device_cte = ""
-    device_join = ""
-
-    if p.kpi_transactions or p.kpi_aov:
-        ecommerce_cte = f"""
-ecommerce_data AS (
-  SELECT
-    user_pseudo_id AS ecommerce_user_pseudo_id,
-    SUM(ecommerce.purchase_revenue) AS purchase_revenue,
-    COUNT(DISTINCT ecommerce.transaction_id) AS transaction_id
-  FROM {table}
-  WHERE {suffix}
-    AND event_name = 'purchase'
-    AND user_pseudo_id IS NOT NULL
-  GROUP BY user_pseudo_id
-),
-"""
-        ecommerce_join = "  LEFT JOIN ecommerce_data ed ON vd.variant_user_pseudo_id = ed.ecommerce_user_pseudo_id\n"
-
-    if p.kpi_device_split:
-        device_cte = f"""
-device_data AS (
-  SELECT
-    user_pseudo_id AS device_user_pseudo_id,
-    MAX(CASE WHEN device.category = 'mobile' THEN 1 ELSE 0 END) AS is_mobile_user,
-    MAX(CASE WHEN device.category = 'desktop' THEN 1 ELSE 0 END) AS is_desktop_user
-  FROM {table}
-  WHERE {suffix}
-  GROUP BY user_pseudo_id
-),
-"""
-        device_join = "  LEFT JOIN device_data dd ON vd.variant_user_pseudo_id = dd.device_user_pseudo_id\n"
+    select_block  = ",\n".join(select_cols)
+    limit_clause  = f"\nLIMIT {limit}" if limit else ""
 
     return f"""-- Binomial experiment export
 DECLARE start_date STRING DEFAULT '{p.start_date}';
-DECLARE end_date  STRING DEFAULT '{p.end_date}';
+DECLARE end_date   STRING DEFAULT '{p.end_date}';
 
 WITH
 variant_data AS (
@@ -356,15 +401,9 @@ variant_data AS (
 {ecommerce_cte}{device_cte}{optional_ctes}
 final_data AS (
   SELECT
-    vd.variant_user_pseudo_id,
-    vd.experience_variant_label,
-    ed.transaction_id,
-    ed.purchase_revenue,
-    dd.is_mobile_user,
-    dd.is_desktop_user
+{final_select}
   FROM variant_data vd
-{ecommerce_join}{device_join}{optional_joins}
-  WHERE vd.experience_variant_label != 'Other'
+{ecommerce_join}{device_join}{optional_joins}  WHERE vd.experience_variant_label != 'Other'
 )
 
 SELECT
@@ -405,8 +444,8 @@ def build_continuous(p: ContinuousParams, limit: int = 0) -> str:
     limit_clause = f"\nLIMIT {limit}" if limit else ""
 
     return f"""-- Continuous experiment export
-DECLARE start_date STRING DEFAULT '{p.start_date}';
-DECLARE end_date STRING DEFAULT '{p.end_date}';
+DECLARE start_date    STRING DEFAULT '{p.start_date}';
+DECLARE end_date      STRING DEFAULT '{p.end_date}';
 DECLARE device_filter STRING DEFAULT '{p.device_filter}';
 
 WITH
@@ -472,7 +511,7 @@ ecommerce_data AS (
   SELECT
     user_pseudo_id,
     ecommerce.transaction_id AS transaction_id,
-    SUM(ecommerce.purchase_revenue) AS purchase_revenue,
+    SUM(ecommerce.purchase_revenue)    AS purchase_revenue,
     SUM(ecommerce.total_item_quantity) AS total_item_quantity
   FROM single_scan
   WHERE event_name = 'purchase'
@@ -482,14 +521,14 @@ ecommerce_data AS (
 )
 
 SELECT
-  vd.user_pseudo_id AS variant_user_pseudo_id,
+  vd.user_pseudo_id        AS variant_user_pseudo_id,
   vd.experience_variant_label,
   ed.purchase_revenue,
   ed.total_item_quantity,
   ed.transaction_id
 FROM variant_data vd
 {join_type} ecommerce_data ed ON vd.user_pseudo_id = ed.user_pseudo_id
-INNER JOIN device_data dd ON vd.user_pseudo_id = dd.device_user_pseudo_id
+INNER JOIN device_data      dd ON vd.user_pseudo_id = dd.device_user_pseudo_id
 WHERE ('{p.device_filter}' = 'all' OR dd.primary_device = '{p.device_filter}')
 ORDER BY ed.purchase_revenue DESC{limit_clause};
 """
@@ -542,7 +581,7 @@ def build_sequential(p: SequentialParams, limit: int = 0) -> str:
         )
     if p.kpi_device_split:
         final_selects += [
-            "  COUNT(DISTINCT CASE WHEN is_mobile_user = 1 THEN variant_user_pseudo_id END) AS mobile_users",
+            "  COUNT(DISTINCT CASE WHEN is_mobile_user  = 1 THEN variant_user_pseudo_id END) AS mobile_users",
             "  COUNT(DISTINCT CASE WHEN is_desktop_user = 1 THEN variant_user_pseudo_id END) AS desktop_users",
         ]
     if p.kpi_add_to_cart:
@@ -554,10 +593,10 @@ def build_sequential(p: SequentialParams, limit: int = 0) -> str:
     limit_clause = f"\nLIMIT {limit}" if limit else ""
 
     return f"""-- Sequential test export
-DECLARE start_date STRING DEFAULT '{p.start_date}';
-DECLARE end_date STRING DEFAULT '{p.end_date}';
-DECLARE use_persistence BOOL DEFAULT {persistence_flag};
-DECLARE reset_cumulative_data BOOL DEFAULT {reset_flag};
+DECLARE start_date           STRING DEFAULT '{p.start_date}';
+DECLARE end_date             STRING DEFAULT '{p.end_date}';
+DECLARE use_persistence      BOOL   DEFAULT {persistence_flag};
+DECLARE reset_cumulative_data BOOL  DEFAULT {reset_flag};
 
 --------------------------------------------------------------------------------
 -- 1. TABLE MANAGEMENT
@@ -611,8 +650,8 @@ variant_data AS (
 ecommerce_data AS (
   SELECT
     user_pseudo_id AS ecommerce_user_pseudo_id,
-    SUM(ecommerce.purchase_revenue) AS purchase_revenue,
-    SUM(ecommerce.total_item_quantity) AS total_item_quantity,
+    SUM(ecommerce.purchase_revenue)          AS purchase_revenue,
+    SUM(ecommerce.total_item_quantity)       AS total_item_quantity,
     COUNT(DISTINCT ecommerce.transaction_id) AS transaction_id
   FROM {table}
   WHERE {suffix}
@@ -633,7 +672,7 @@ add_to_cart_data AS (
 device_data AS (
   SELECT
     user_pseudo_id AS device_user_pseudo_id,
-    MAX(CASE WHEN device.category = 'mobile' THEN 1 ELSE 0 END) AS is_mobile_user,
+    MAX(CASE WHEN device.category = 'mobile'  THEN 1 ELSE 0 END) AS is_mobile_user,
     MAX(CASE WHEN device.category = 'desktop' THEN 1 ELSE 0 END) AS is_desktop_user
   FROM {table}
   WHERE {suffix}
@@ -643,16 +682,16 @@ device_data AS (
 SELECT
   vd.variant_user_pseudo_id,
   vd.experience_variant_label,
-  COALESCE(ed.purchase_revenue, 0) AS purchase_revenue,
+  COALESCE(ed.purchase_revenue, 0)    AS purchase_revenue,
   COALESCE(ed.total_item_quantity, 0) AS total_item_quantity,
   ed.transaction_id,
-  COALESCE(dd.is_mobile_user, 0) AS is_mobile_user,
-  COALESCE(dd.is_desktop_user, 0) AS is_desktop_user,
+  COALESCE(dd.is_mobile_user, 0)      AS is_mobile_user,
+  COALESCE(dd.is_desktop_user, 0)     AS is_desktop_user,
   CASE WHEN atc.atc_user_pseudo_id IS NOT NULL THEN 1 ELSE 0 END AS added_to_cart,
 {optional_cols_extract}  CURRENT_TIMESTAMP() AS processed_at
 FROM variant_data vd
-LEFT JOIN ecommerce_data ed ON vd.variant_user_pseudo_id = ed.ecommerce_user_pseudo_id
-LEFT JOIN device_data dd ON vd.variant_user_pseudo_id = dd.device_user_pseudo_id
+LEFT JOIN ecommerce_data   ed  ON vd.variant_user_pseudo_id = ed.ecommerce_user_pseudo_id
+LEFT JOIN device_data      dd  ON vd.variant_user_pseudo_id = dd.device_user_pseudo_id
 LEFT JOIN add_to_cart_data atc ON vd.variant_user_pseudo_id = atc.atc_user_pseudo_id
 WHERE vd.experience_variant_label != 'Other';
 
@@ -671,7 +710,7 @@ END IF;
 -- 4. FINAL AGGREGATION
 --------------------------------------------------------------------------------
 WITH final_source AS (
-  SELECT * FROM combined_new_data WHERE NOT use_persistence
+  SELECT * FROM combined_new_data       WHERE NOT use_persistence
   UNION ALL
   SELECT * FROM {cumulative_table} WHERE use_persistence
 )
@@ -761,7 +800,7 @@ add_to_cart_data AS (
         atc_join = "  LEFT JOIN add_to_cart_data atc ON cu.variant_user_pseudo_id = atc.atc_user_pseudo_id\n"
 
     return f"""-- Interaction export — {n} experiment(s)
-DECLARE start_date STRING DEFAULT '{p.start_date}';
+DECLARE start_date         STRING DEFAULT '{p.start_date}';
 DECLARE end_date           STRING DEFAULT '{p.end_date}';
 DECLARE event_parameter_key STRING DEFAULT '{p.param_key}';
 
