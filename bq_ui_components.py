@@ -51,42 +51,60 @@ def render_auth_panel() -> bool:
 # ---------------------------------------------------------------------------
 
 def render_connection_selectors() -> tuple[Optional[str], Optional[str]]:
-    """Renders project + dataset dropdowns. Returns (project, dataset)."""
+    """Renders project + dataset dropdowns. Returns (project_id, dataset_id)."""
     st.subheader("BigQuery connection")
 
-    # Project
+    # --- Project -------------------------------------------------------------
     if "projects_cache" not in st.session_state:
         with st.spinner("Loading projects…"):
             st.session_state["projects_cache"] = list_projects()
 
-    projects = st.session_state["projects_cache"]
+    # projects is {project_id: display_name}
+    projects: dict[str, str] = st.session_state["projects_cache"]
     if not projects:
         st.warning("No projects found for this account.")
         return None, None
 
+    project_ids = list(projects.keys())
+
+    def _project_label(pid: str) -> str:
+        name = projects.get(pid, "")
+        return f"{name}  ({pid})" if name else pid
+
+    prior_project = st.session_state.get("selected_project")
     project = st.selectbox(
         "Project",
-        options=projects,
-        index=projects.index(st.session_state.get("selected_project", projects[0]))
-        if st.session_state.get("selected_project") in projects else 0,
+        options=project_ids,
+        index=project_ids.index(prior_project) if prior_project in project_ids else 0,
+        format_func=_project_label,
         key="selected_project",
+        help="GCP project that owns the BigQuery dataset.",
     )
 
-    # Dataset — reload when project changes
+    # --- Dataset -------------------------------------------------------------
     dataset_cache_key = f"datasets_{project}"
     if dataset_cache_key not in st.session_state:
         with st.spinner(f"Loading datasets for {project}…"):
             st.session_state[dataset_cache_key] = list_datasets(project)
 
-    datasets = st.session_state[dataset_cache_key]
+    # datasets is {dataset_id: friendly_name}
+    datasets: dict[str, str] = st.session_state[dataset_cache_key]
     if not datasets:
         st.warning(f"No datasets found in {project}.")
         return project, None
 
+    dataset_ids = list(datasets.keys())
+
+    def _dataset_label(did: str) -> str:
+        name = datasets.get(did, "")
+        return f"{name}  ({did})" if name else did
+
     dataset = st.selectbox(
         "Dataset",
-        options=datasets,
+        options=dataset_ids,
+        format_func=_dataset_label,
         key="selected_dataset",
+        help="BigQuery dataset containing the GA4 events_* tables.",
     )
 
     return project, dataset
