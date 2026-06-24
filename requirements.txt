@@ -1,7 +1,13 @@
 httpx>=0.26.0,<0.29.0
 httpcore>=1.0.0,<2.0.0
-streamlit
+streamlit>=1.35.0
+google-cloud-bigquery>=3.11.0
+google-auth-oauthlib>=1.2.0
+google-cloud-resource-manager>=1.10.0
+gspread>=6.0.0
+gspread-dataframe>=4.0.0
 st_supabase_connection
+pyarrow>=14.0.0
 scikit-learn==1.7.0
 scikit-posthocs==0.11.4
 seaborn==0.13.2
