@@ -20,11 +20,11 @@ from sql_builder import VariantPair, ExperimentConfig
 
 def render_auth_panel() -> bool:
     """Renders sign-in/sign-out. Returns True if authenticated."""
-    # Handle OAuth redirect code
     params = st.query_params
     if "code" in params and not is_authenticated():
         try:
-            exchange_code_for_credentials(params["code"])
+            state = params.get("state", "")
+            exchange_code_for_credentials(params["code"], state)
             st.query_params.clear()
             st.rerun()
         except Exception as e:
