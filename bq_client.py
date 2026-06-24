@@ -195,29 +195,43 @@ def get_bq_client(project: Optional[str] = None) -> "bigquery.Client":
 # Project / dataset discovery
 # ---------------------------------------------------------------------------
 
-def list_projects() -> list[str]:
-    """List GCP projects accessible to the authenticated user."""
+def list_projects() -> dict[str, str]:
+    """
+    List GCP projects accessible to the authenticated user.
+    Returns {project_id: display_name}. display_name may be empty string
+    if the project has no friendly name set.
+    """
     creds = get_credentials()
     if not creds:
-        return []
+        return {}
     try:
         client = resourcemanager_v3.ProjectsClient(credentials=creds)
-        projects = [p.project_id for p in client.search_projects()]
-        return sorted(projects)
+        result = {
+            p.project_id: p.display_name or ""
+            for p in client.search_projects()
+        }
+        return dict(sorted(result.items()))
     except Exception as e:
         st.warning(f"Could not list projects: {e}")
-        return []
+        return {}
 
 
-def list_datasets(project: str) -> list[str]:
-    """List BigQuery datasets in a project."""
+def list_datasets(project: str) -> dict[str, str]:
+    """
+    List BigQuery datasets in a project.
+    Returns {dataset_id: friendly_name}. friendly_name may be empty string
+    if the dataset has no friendly name set — this is common for GA4 exports.
+    """
     try:
         client = get_bq_client(project)
-        datasets = [d.dataset_id for d in client.list_datasets()]
-        return sorted(datasets)
+        result = {
+            d.dataset_id: d.friendly_name or ""
+            for d in client.list_datasets()
+        }
+        return dict(sorted(result.items()))
     except Exception as e:
         st.warning(f"Could not list datasets in {project}: {e}")
-        return []
+        return {}
 
 
 # ---------------------------------------------------------------------------
