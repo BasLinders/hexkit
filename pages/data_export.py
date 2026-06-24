@@ -690,9 +690,8 @@ def run() -> None:
         layout="wide",
     )
 
-    st.title("🗄️ Data export")
+    st.title("Data export")
     st.caption("Export BigQuery experiment data for statistical analysis.")
-    st.warning("⚠️ This tool is in development and in a QA phase.")
 
     # --- Auth ----------------------------------------------------------------
     if not render_auth_panel():
