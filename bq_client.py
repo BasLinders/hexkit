@@ -16,8 +16,11 @@ Streamlit Cloud notes
 """
 from __future__ import annotations
 
+import base64
 import json
+import os
 import time
+import urllib.parse
 from typing import Optional
 
 import streamlit as st
@@ -76,29 +79,63 @@ def _get_redirect_uri() -> str:
 
 
 def get_auth_url() -> str:
-    """Build the Google OAuth authorization URL."""
+    """
+    Build the Google OAuth authorization URL.
+
+    PKCE note: google-auth-oauthlib >= 1.0 automatically generates a
+    code_verifier and embeds the corresponding code_challenge in the URL.
+    The verifier is stored on the flow object but lost when the page
+    reloads after the redirect. We recover it by encoding it into the
+    state parameter — Google returns state unchanged in the callback.
+    """
     config = _get_client_config()
     redirect_uri = _get_redirect_uri()
     flow = Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
+
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
     )
-    # Don't store flow state in session_state — it won't survive the redirect.
+
+    # Embed verifier in state so it survives the redirect
+    verifier: str = getattr(flow, "code_verifier", None) or ""
+    if verifier:
+        encoded = base64.urlsafe_b64encode(verifier.encode()).decode().rstrip("=")
+        parsed = urllib.parse.urlparse(auth_url)
+        qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        qs["state"] = [encoded]
+        new_query = urllib.parse.urlencode({k: v[0] for k, v in qs.items()})
+        auth_url = urllib.parse.urlunparse(parsed._replace(query=new_query))
+
     return auth_url
 
 
-def exchange_code_for_credentials(code: str) -> Credentials:
+def exchange_code_for_credentials(code: str, state: str = "") -> Credentials:
     """
     Exchange an authorization code for credentials.
-    Reconstructs the Flow from secrets (state param is omitted — see module
-    docstring for why this is safe on Streamlit Cloud).
+    Reconstructs the Flow from secrets (no stored session state needed).
+    Recovers the PKCE code_verifier from the state parameter if present.
     """
     config = _get_client_config()
     redirect_uri = _get_redirect_uri()
+
+    # Decode PKCE verifier from state
+    verifier: Optional[str] = None
+    if state:
+        try:
+            padding = 4 - len(state) % 4
+            padded = state + ("=" * (padding % 4))
+            verifier = base64.urlsafe_b64decode(padded).decode()
+        except Exception:
+            verifier = None
+
     flow = Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
-    flow.fetch_token(code=code)
+    fetch_kwargs: dict = {"code": code}
+    if verifier:
+        fetch_kwargs["code_verifier"] = verifier
+    flow.fetch_token(**fetch_kwargs)
+
     creds = flow.credentials
     st.session_state["credentials"] = _creds_to_dict(creds)
     return creds
