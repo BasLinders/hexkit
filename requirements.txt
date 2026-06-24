@@ -21,3 +21,4 @@ statistics
 prophet
 plotly
 patsy
+db-dtypes
