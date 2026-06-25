@@ -5,6 +5,7 @@ Reusable Streamlit UI blocks shared across all export modes.
 from __future__ import annotations
 from typing import Literal, Optional, cast
 import streamlit as st
+import streamlit.components.v1 as components
 from bq_client import (
     is_authenticated, get_auth_url, exchange_code_for_credentials,
     sign_out, list_projects, list_datasets, dry_run, run_preview,
@@ -42,24 +43,38 @@ def render_auth_panel() -> bool:
     else:
         st.info("Sign in with your Google account to access BigQuery.")
         auth_url = get_auth_url()
-        # st.link_button adds target="_blank" for external URLs in Streamlit 1.23+,
-        # which opens Google auth in a new tab and leaves this tab on the sign-in screen.
-        # A markdown anchor with target="_self" keeps everything in the same tab.
-        st.markdown(
-            f"""<a href="{auth_url}" target="_self" style="
-                display: block;
+        # st.link_button adds target="_blank" (new tab) for external URLs.
+        # st.markdown href is stripped by Streamlit's HTML sanitizer (causes 403).
+        # Solution: components.v1.html runs in a sandboxed iframe that includes
+        # allow-top-navigation-by-user-activation — a user click can navigate
+        # the top-level browser window via window.top.location.href.
+        # The URL is passed via a data attribute to avoid JS string escaping issues.
+        components.html(
+            f"""
+            <style>
+              body {{ margin: 0; padding: 0; }}
+              button {{
                 width: 100%;
                 padding: 0.45rem 1rem;
-                background-color: #FF4B4B;
+                background-color: rgb(255, 75, 75);
                 color: white;
-                text-align: center;
+                border: none;
                 border-radius: 0.5rem;
-                text-decoration: none;
-                font-weight: 500;
                 font-size: 1rem;
-                box-sizing: border-box;
-            ">🔐 Sign in with Google</a>""",
-            unsafe_allow_html=True,
+                font-weight: 500;
+                cursor: pointer;
+                font-family: "Source Sans Pro", sans-serif;
+              }}
+              button:hover {{ background-color: rgb(220, 50, 50); }}
+            </style>
+            <button
+              id="oauth-btn"
+              data-url="{auth_url}"
+              onclick="window.top.location.href = this.getAttribute('data-url')">
+              🔐 Sign in with Google
+            </button>
+            """,
+            height=50,
         )
         return False
 
