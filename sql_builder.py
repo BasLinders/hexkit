@@ -180,21 +180,22 @@ WHERE main.{suffix}{limit_clause};
 # BINOMIAL
 # ---------------------------------------------------------------------------
 
-def _variant_case_block(exp: ExperimentConfig, strategy: str, param_key: str) -> str:
+def _variant_case_block(exp: ExperimentConfig, strategy: str, source_col: str = "params.value.string_value") -> str:
     """Builds the CASE WHEN block mapping variant strings to labels."""
     lines = []
     for v in exp.variants:
         if strategy == "exact":
-            lines.append(f"      WHEN params.value.string_value = '{v.string}' THEN '{v.label}'")
+            lines.append(f"      WHEN {source_col} = '{v.string}' THEN '{v.label}'")
         else:
-            lines.append(f"      WHEN params.value.string_value LIKE '{v.string}' THEN '{v.label}'")
+            lines.append(f"      WHEN {source_col} LIKE '%{v.string}%' THEN '{v.label}'")
     return "\n".join(lines)
 
 
 def build_binomial(p: BinomialParams, limit: int = 0) -> str:
-    table = _table_ref(p.project, p.dataset)
+    table  = _table_ref(p.project, p.dataset)
     suffix = _suffix_filter(p.start_date, p.end_date)
-    exp = p.experiments[0]
+    suffix_e = _suffix_filter(p.start_date, p.end_date, alias="e")
+    exp    = p.experiments[0]
 
     all_variant_strings = [v.string for v in exp.variants]
     variant_in_list = ", ".join(f"'{s}'" for s in all_variant_strings)
@@ -204,10 +205,55 @@ def build_binomial(p: BinomialParams, limit: int = 0) -> str:
     else:
         exp_filter = f"AND params.value.string_value IN ({variant_in_list})"
 
-    case_block = _variant_case_block(exp, p.match_strategy, p.param_key)
+    # CASE WHEN in variant_data operates on exp_variant_string (extracted from
+    # user_initial_exposure), not directly on params.value.string_value.
+    case_block = _variant_case_block(exp, p.match_strategy, source_col="exp_variant_string")
 
     # -----------------------------------------------------------------------
-    # Build CTEs and joins conditionally
+    # Exposure CTEs
+    # Always use user_initial_exposure + ROW_NUMBER to guarantee one row per
+    # user (deduplicates repeated exposures, preventing fan-out in downstream
+    # joins). When post_exposure_filter is on, first_exposure_timestamp is
+    # carried into variant_data so event CTEs can filter against it.
+    # -----------------------------------------------------------------------
+    ts_col = "event_timestamp AS first_exposure_timestamp," if p.post_exposure_filter else ""
+
+    exposure_ctes = f"""
+user_initial_exposure AS (
+  SELECT
+    user_pseudo_id,
+    params.value.string_value AS exp_variant_string,
+    event_timestamp,
+    ROW_NUMBER() OVER (
+      PARTITION BY user_pseudo_id
+      ORDER BY event_timestamp ASC
+    ) AS rn
+  FROM {table}, UNNEST(event_params) AS params
+  WHERE {suffix}
+    AND params.key = '{p.param_key}'
+    AND params.value.string_value IS NOT NULL
+    {exp_filter}
+),
+
+variant_data AS (
+  SELECT
+    user_pseudo_id AS variant_user_pseudo_id,
+    {ts_col}
+    CASE
+{case_block}
+      ELSE 'Other'
+    END AS experience_variant_label
+  FROM user_initial_exposure
+  WHERE rn = 1
+),
+"""
+
+    # -----------------------------------------------------------------------
+    # Conditional CTEs — ecommerce, device, optional KPIs
+    # When post_exposure_filter is on: event CTEs join variant_data to filter
+    # purchases/events to those occurring after first exposure.
+    # device_data is exempt — device category is a user attribute, not a
+    # timestamped event.
     # -----------------------------------------------------------------------
     ecommerce_cte  = ""
     ecommerce_join = ""
@@ -217,8 +263,26 @@ def build_binomial(p: BinomialParams, limit: int = 0) -> str:
     optional_joins = ""
 
     need_ecommerce = p.kpi_transactions or p.kpi_aov
+
     if need_ecommerce:
-        ecommerce_cte = f"""
+        if p.post_exposure_filter:
+            ecommerce_cte = f"""
+ecommerce_data AS (
+  SELECT
+    e.user_pseudo_id AS ecommerce_user_pseudo_id,
+    SUM(e.ecommerce.purchase_revenue)          AS purchase_revenue,
+    COUNT(DISTINCT e.ecommerce.transaction_id) AS transaction_id
+  FROM {table} e
+  INNER JOIN variant_data vd ON e.user_pseudo_id = vd.variant_user_pseudo_id
+  WHERE {suffix_e}
+    AND e.event_name = 'purchase'
+    AND e.user_pseudo_id IS NOT NULL
+    AND e.event_timestamp >= vd.first_exposure_timestamp
+  GROUP BY e.user_pseudo_id
+),
+"""
+        else:
+            ecommerce_cte = f"""
 ecommerce_data AS (
   SELECT
     user_pseudo_id AS ecommerce_user_pseudo_id,
@@ -234,6 +298,7 @@ ecommerce_data AS (
         ecommerce_join = "  LEFT JOIN ecommerce_data ed ON vd.variant_user_pseudo_id = ed.ecommerce_user_pseudo_id\n"
 
     if p.kpi_device_split:
+        # Device is a user attribute — no post-exposure filter applied.
         device_cte = f"""
 device_data AS (
   SELECT
@@ -248,19 +313,51 @@ device_data AS (
         device_join = "  LEFT JOIN device_data dd ON vd.variant_user_pseudo_id = dd.device_user_pseudo_id\n"
 
     if p.kpi_add_to_cart:
-        optional_ctes += f"""
+        if p.post_exposure_filter:
+            optional_ctes += f"""
+add_to_cart_data AS (
+  SELECT e.user_pseudo_id AS atc_user_pseudo_id
+  FROM {table} e
+  INNER JOIN variant_data vd ON e.user_pseudo_id = vd.variant_user_pseudo_id
+  WHERE {suffix_e}
+    AND e.event_name = 'add_to_cart'
+    AND e.user_pseudo_id IS NOT NULL
+    AND e.event_timestamp >= vd.first_exposure_timestamp
+  GROUP BY e.user_pseudo_id
+),
+"""
+        else:
+            optional_ctes += f"""
 add_to_cart_data AS (
   SELECT user_pseudo_id AS atc_user_pseudo_id
   FROM {table}
   WHERE {suffix}
     AND event_name = 'add_to_cart'
+    AND user_pseudo_id IS NOT NULL
   GROUP BY user_pseudo_id
 ),
 """
         optional_joins += "  LEFT JOIN add_to_cart_data atc ON vd.variant_user_pseudo_id = atc.atc_user_pseudo_id\n"
 
     if p.kpi_login:
-        optional_ctes += f"""
+        if p.post_exposure_filter:
+            optional_ctes += f"""
+login_data AS (
+  SELECT e.user_pseudo_id AS login_user_pseudo_id, 1 AS has_logged_in
+  FROM {table} e
+  INNER JOIN variant_data vd ON e.user_pseudo_id = vd.variant_user_pseudo_id,
+  UNNEST(e.event_params) AS ep
+  WHERE {suffix_e}
+    AND e.event_name = 'page_view'
+    AND ep.key = 'page_location'
+    AND ep.value.string_value LIKE '%/customer/account/login%'
+    AND e.user_pseudo_id IS NOT NULL
+    AND e.event_timestamp >= vd.first_exposure_timestamp
+  GROUP BY 1
+),
+"""
+        else:
+            optional_ctes += f"""
 login_data AS (
   SELECT user_pseudo_id AS login_user_pseudo_id, 1 AS has_logged_in
   FROM {table}, UNNEST(event_params) AS ep
@@ -268,13 +365,31 @@ login_data AS (
     AND event_name = 'page_view'
     AND ep.key = 'page_location'
     AND ep.value.string_value LIKE '%/customer/account/login%'
+    AND user_pseudo_id IS NOT NULL
   GROUP BY 1
 ),
 """
         optional_joins += "  LEFT JOIN login_data ld ON vd.variant_user_pseudo_id = ld.login_user_pseudo_id\n"
 
     if p.kpi_create_account:
-        optional_ctes += f"""
+        if p.post_exposure_filter:
+            optional_ctes += f"""
+create_account_data AS (
+  SELECT e.user_pseudo_id AS create_user_pseudo_id, 1 AS has_created_account
+  FROM {table} e
+  INNER JOIN variant_data vd ON e.user_pseudo_id = vd.variant_user_pseudo_id,
+  UNNEST(e.event_params) AS ep
+  WHERE {suffix_e}
+    AND e.event_name = 'page_view'
+    AND ep.key = 'page_location'
+    AND ep.value.string_value LIKE '%/customer/account/register%'
+    AND e.user_pseudo_id IS NOT NULL
+    AND e.event_timestamp >= vd.first_exposure_timestamp
+  GROUP BY 1
+),
+"""
+        else:
+            optional_ctes += f"""
 create_account_data AS (
   SELECT user_pseudo_id AS create_user_pseudo_id, 1 AS has_created_account
   FROM {table}, UNNEST(event_params) AS ep
@@ -282,13 +397,30 @@ create_account_data AS (
     AND event_name = 'page_view'
     AND ep.key = 'page_location'
     AND ep.value.string_value LIKE '%/customer/account/register%'
+    AND user_pseudo_id IS NOT NULL
   GROUP BY 1
 ),
 """
         optional_joins += "  LEFT JOIN create_account_data cd ON vd.variant_user_pseudo_id = cd.create_user_pseudo_id\n"
 
     if p.kpi_ideal:
-        optional_ctes += f"""
+        if p.post_exposure_filter:
+            optional_ctes += f"""
+ideal_users AS (
+  SELECT DISTINCT e.user_pseudo_id
+  FROM {table} e
+  INNER JOIN variant_data vd ON e.user_pseudo_id = vd.variant_user_pseudo_id,
+  UNNEST(e.event_params) AS params
+  WHERE {suffix_e}
+    AND e.event_name = 'add_payment_info'
+    AND params.key = 'payment_type'
+    AND params.value.string_value LIKE '%iDEAL%'
+    AND e.user_pseudo_id IS NOT NULL
+    AND e.event_timestamp >= vd.first_exposure_timestamp
+),
+"""
+        else:
+            optional_ctes += f"""
 ideal_users AS (
   SELECT DISTINCT user_pseudo_id
   FROM {table}, UNNEST(event_params) AS params
@@ -296,14 +428,13 @@ ideal_users AS (
     AND event_name = 'add_payment_info'
     AND params.key = 'payment_type'
     AND params.value.string_value LIKE '%iDEAL%'
+    AND user_pseudo_id IS NOT NULL
 ),
 """
         optional_joins += "  LEFT JOIN ideal_users iu ON vd.variant_user_pseudo_id = iu.user_pseudo_id\n"
 
     # -----------------------------------------------------------------------
     # final_data SELECT list — only include columns whose CTEs are present.
-    # All aliases (ed., dd., atc., etc.) are resolved here; the outer SELECT
-    # reads from final_data using plain column names with no table prefix.
     # -----------------------------------------------------------------------
     final_cols = [
         "    vd.variant_user_pseudo_id",
@@ -341,64 +472,43 @@ ideal_users AS (
         "  experience_variant_label",
         "  COUNT(DISTINCT variant_user_pseudo_id) AS visitors",
     ]
-
     if p.kpi_transactions:
         select_cols += [
             "  COUNT(DISTINCT CASE WHEN transaction_id IS NOT NULL THEN variant_user_pseudo_id END) AS users_with_transaction",
             "  SUM(CASE WHEN transaction_id IS NOT NULL THEN transaction_id ELSE 0 END) AS total_transactions",
         ]
-
     if p.kpi_aov:
         select_cols.append(
             "  ROUND(SUM(purchase_revenue) / NULLIF(COUNT(DISTINCT CASE WHEN transaction_id IS NOT NULL THEN variant_user_pseudo_id END), 0), 2) AS average_order_value"
         )
-
     if p.kpi_device_split:
         select_cols += [
             "  COUNT(DISTINCT CASE WHEN is_mobile_user  = 1 THEN variant_user_pseudo_id END) AS mobile_users",
             "  COUNT(DISTINCT CASE WHEN is_desktop_user = 1 THEN variant_user_pseudo_id END) AS desktop_users",
         ]
-        # Buyer breakdown only available when transaction data is also present
         if p.kpi_transactions:
             select_cols += [
                 "  COUNT(DISTINCT CASE WHEN is_mobile_user  = 1 AND transaction_id IS NOT NULL THEN variant_user_pseudo_id END) AS mobile_buyers",
                 "  COUNT(DISTINCT CASE WHEN is_desktop_user = 1 AND transaction_id IS NOT NULL THEN variant_user_pseudo_id END) AS desktop_buyers",
             ]
-
     if p.kpi_add_to_cart:
         select_cols.append("  SUM(has_added_to_cart) AS add_to_cart")
-
     if p.kpi_ideal:
         select_cols.append("  SUM(paid_with_ideal) AS paid_with_ideal")
-
     if p.kpi_login:
         select_cols.append("  SUM(has_logged_in) AS login_page_visits")
-
     if p.kpi_create_account:
         select_cols.append("  SUM(has_created_account) AS account_creation_page_visits")
 
-    select_block  = ",\n".join(select_cols)
-    limit_clause  = f"\nLIMIT {limit}" if limit else ""
+    select_block = ",\n".join(select_cols)
+    limit_clause = f"\nLIMIT {limit}" if limit else ""
 
     return f"""-- Binomial experiment export
 DECLARE start_date STRING DEFAULT '{p.start_date}';
 DECLARE end_date   STRING DEFAULT '{p.end_date}';
 
 WITH
-variant_data AS (
-  SELECT
-    user_pseudo_id AS variant_user_pseudo_id,
-    CASE
-{case_block}
-      ELSE 'Other'
-    END AS experience_variant_label
-  FROM {table}, UNNEST(event_params) AS params
-  WHERE {suffix}
-    AND params.key = '{p.param_key}'
-    AND params.value.string_value IS NOT NULL
-    {exp_filter}
-),
-{ecommerce_cte}{device_cte}{optional_ctes}
+{exposure_ctes}{ecommerce_cte}{device_cte}{optional_ctes}
 final_data AS (
   SELECT
 {final_select}
