@@ -226,17 +226,46 @@ def render_variant_inputs(
 
             detected = st.session_state.get(autodetect_key, [])
             if detected:
-                selected = st.multiselect(
-                    "Detected variant strings — select to use",
-                    options=detected,
-                    key=f"{key_prefix}_exp_{exp_idx}_multiselect",
+                st.caption(
+                    f"{len(detected)} variant string(s) detected. "
+                    "Assign a label to each one. Set unused variants to **Skip**."
                 )
-                # Map selections to labels
-                label_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                variants = [
-                    VariantPair(label=label_chars[i], string=s)
-                    for i, s in enumerate(selected)
-                ]
+                # Label options — A is always control, rest are challengers
+                _label_opts = ["A — Control", "B", "C", "D", "E", "F", "G", "H", "Skip"]
+
+                variants = []
+                seen_labels: set[str] = set()
+                has_control = False
+
+                for vi, variant_str in enumerate(detected):
+                    # Default: first → A, second → B, rest → Skip
+                    default_idx = min(vi, len(_label_opts) - 2)
+                    col_str, col_sel = st.columns([3, 1])
+                    with col_str:
+                        st.text(variant_str)
+                    with col_sel:
+                        assigned = st.selectbox(
+                            "Label",
+                            options=_label_opts,
+                            index=default_idx,
+                            key=f"{key_prefix}_exp_{exp_idx}_assign_{vi}",
+                            label_visibility="collapsed",
+                        )
+
+                    if assigned == "Skip":
+                        continue
+
+                    label = assigned[0]  # "A — Control" → "A", "B" → "B"
+                    if label == "A":
+                        has_control = True
+                    if label in seen_labels:
+                        st.warning(f"Label **{label}** is assigned more than once — each variant needs a unique label.")
+                    seen_labels.add(label)
+                    variants.append(VariantPair(label=label, string=variant_str))
+
+                if not has_control and variants:
+                    st.warning("No variant is assigned as **A (Control)**. Assign at least one variant to A.")
+
             else:
                 # Manual entry
                 n_variants = st.number_input(
