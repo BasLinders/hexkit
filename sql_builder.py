@@ -479,7 +479,7 @@ ideal_users AS (
         ]
     if p.kpi_aov:
         select_cols.append(
-            "  ROUND(SUM(purchase_revenue) / NULLIF(COUNT(DISTINCT CASE WHEN transaction_id IS NOT NULL THEN variant_user_pseudo_id END), 0), 2) AS average_order_value"
+            "  ROUND(SUM(purchase_revenue) / NULLIF(SUM(CASE WHEN transaction_id IS NOT NULL THEN transaction_id ELSE 0 END), 0), 2) AS average_order_value"
         )
     if p.kpi_device_split:
         select_cols += [
