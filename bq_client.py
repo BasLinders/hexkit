@@ -427,13 +427,13 @@ def autodetect_variants(
     from sql_builder import build_autodetect_variants_query
     from datetime import datetime, timedelta
 
-    # Use only the last 2 days of the selected date range to minimise scan cost.
+    # Use only the last day of the selected date range to minimise scan cost.
     # Variant strings are stable — they don't change over the course of an experiment —
-    # so a 2-day window is sufficient to discover all variants.
+    # so a 1-day window is sufficient to discover all variants.
     # The full date range is preserved for the actual export query.
     end_dt   = datetime.strptime(end_date, "%Y-%m-%d")
     start_dt = max(
-        end_dt - timedelta(days=2),
+        end_dt - timedelta(days=1),
         datetime.strptime(start_date, "%Y-%m-%d"),
     )
     sample_start = start_dt.strftime("%Y-%m-%d")
@@ -444,7 +444,7 @@ def autodetect_variants(
     )
     cost = dry_run(project, sql)
     st.caption(
-        f"Auto-detect scanned the last 2 days of your date range "
+        f"Auto-detect scanned the last day of your date range "
         f"({sample_start} → {sample_end}): "
         f"**{cost['display']}** — separate from your export query cost."
     )
