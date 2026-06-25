@@ -42,7 +42,25 @@ def render_auth_panel() -> bool:
     else:
         st.info("Sign in with your Google account to access BigQuery.")
         auth_url = get_auth_url()
-        st.link_button("🔐 Sign in with Google", auth_url, use_container_width=True)
+        # st.link_button adds target="_blank" for external URLs in Streamlit 1.23+,
+        # which opens Google auth in a new tab and leaves this tab on the sign-in screen.
+        # A markdown anchor with target="_self" keeps everything in the same tab.
+        st.markdown(
+            f"""<a href="{auth_url}" target="_self" style="
+                display: block;
+                width: 100%;
+                padding: 0.45rem 1rem;
+                background-color: #FF4B4B;
+                color: white;
+                text-align: center;
+                border-radius: 0.5rem;
+                text-decoration: none;
+                font-weight: 500;
+                font-size: 1rem;
+                box-sizing: border-box;
+            ">🔐 Sign in with Google</a>""",
+            unsafe_allow_html=True,
+        )
         return False
 
 
@@ -137,6 +155,7 @@ def render_variant_inputs(
 ) -> tuple[str, Literal["exact", "like"], str, list[ExperimentConfig]]:
     """
     Returns: (param_key, match_strategy, exp_prefix, experiments)
+    exp_prefix is the ID of the first experiment (or empty for multi-experiment mode).
     """
     st.subheader("Experiment configuration")
 
@@ -155,16 +174,13 @@ def render_variant_inputs(
             format_func=lambda x: "Exact match" if x == "exact" else "Prefix / LIKE match",
             horizontal=True,
             key=f"{key_prefix}_match_strategy",
+            help=(
+                "Exact match: variant strings must equal the entered value exactly. "
+                "Prefix / LIKE match: matches any string starting with the experiment ID — "
+                "recommended for Convert and most tag-based platforms."
+            ),
         ),
     )
-
-    exp_prefix = ""
-    if match_strategy == "like":
-        exp_prefix = st.text_input(
-            "Experiment ID prefix (required for LIKE matching and auto-detect)",
-            placeholder="e.g. EXP-ID- or CONV-",
-            key=f"{key_prefix}_exp_prefix",
-        )
 
     multi_exp = False
     if show_multi_experiment:
@@ -185,31 +201,31 @@ def render_variant_inputs(
         )
 
     experiments: list[ExperimentConfig] = []
+    first_exp_id = ""
 
     for exp_idx in range(int(n_experiments)):
         exp_label = f"Experiment {exp_idx + 1}" if n_experiments > 1 else "Experiment"
         with st.expander(exp_label, expanded=True):
-            exp_id = ""
-            if multi_exp:
-                exp_id = st.text_input(
-                    "Experiment ID",
-                    key=f"{key_prefix}_exp_{exp_idx}_id",
-                )
 
-            this_prefix = exp_prefix  # shared prefix for LIKE, or per-experiment
-            if multi_exp and match_strategy == "like":
-                this_prefix = st.text_input(
-                    "Experiment prefix",
-                    value=exp_prefix,
-                    key=f"{key_prefix}_exp_{exp_idx}_prefix",
-                )
-
-            # Auto-detect button
-            can_autodetect = bool(param_key) and (
-                match_strategy == "exact" or bool(this_prefix)
+            # --- Experiment ID (always first, always required for auto-detect) ---
+            exp_id = st.text_input(
+                "Experiment ID",
+                placeholder="e.g. 1004194641",
+                help=(
+                    "The numerical experiment ID as assigned by your testing tool. "
+                    "Used to filter auto-detect results to only this experiment's variant strings — "
+                    "any variant string containing this ID will be returned, "
+                    "regardless of tool-specific prefixes like 'CONV-' or 'EXP-'."
+                ),
+                key=f"{key_prefix}_exp_{exp_idx}_id",
             )
-            if not can_autodetect and match_strategy == "like":
-                st.caption("ℹ️ Enter a prefix above to enable auto-detect.")
+            if exp_idx == 0:
+                first_exp_id = exp_id
+
+            # Auto-detect button — gated on experiment ID being filled
+            can_autodetect = bool(param_key) and bool(exp_id)
+            if not can_autodetect:
+                st.caption("ℹ️ Enter an experiment ID above to enable auto-detect.")
 
             autodetect_key = f"{key_prefix}_exp_{exp_idx}_detected"
             if st.button(
@@ -220,7 +236,7 @@ def render_variant_inputs(
                 with st.spinner("Querying distinct variant strings…"):
                     found = autodetect_variants(
                         project, dataset, start_date, end_date,
-                        param_key, this_prefix if this_prefix else ""
+                        param_key, exp_id,
                     )
                 st.session_state[autodetect_key] = found
 
@@ -230,7 +246,6 @@ def render_variant_inputs(
                     f"{len(detected)} variant string(s) detected. "
                     "Assign a label to each one. Set unused variants to **Skip**."
                 )
-                # Label options — A is always control, rest are challengers
                 _label_opts = ["A — Control", "B", "C", "D", "E", "F", "G", "H", "Skip"]
 
                 variants = []
@@ -238,7 +253,6 @@ def render_variant_inputs(
                 has_control = False
 
                 for vi, variant_str in enumerate(detected):
-                    # Default: first → A, second → B, rest → Skip
                     default_idx = min(vi, len(_label_opts) - 2)
                     col_str, col_sel = st.columns([3, 1])
                     with col_str:
@@ -267,7 +281,7 @@ def render_variant_inputs(
                     st.warning("No variant is assigned as **A (Control)**. Assign at least one variant to A.")
 
             else:
-                # Manual entry
+                # Manual entry — shown when auto-detect hasn't been run or returned nothing
                 n_variants = st.number_input(
                     "Number of variants",
                     min_value=2,
@@ -287,11 +301,11 @@ def render_variant_inputs(
 
             experiments.append(ExperimentConfig(
                 experiment_id=exp_id or f"exp_{exp_idx + 1}",
-                prefix=this_prefix,
+                prefix=exp_id,
                 variants=variants,
             ))
 
-    return param_key, match_strategy, exp_prefix, experiments
+    return param_key, match_strategy, first_exp_id, experiments
 
 
 # ---------------------------------------------------------------------------
