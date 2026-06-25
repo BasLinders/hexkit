@@ -200,7 +200,7 @@ def build_binomial(p: BinomialParams, limit: int = 0) -> str:
     variant_in_list = ", ".join(f"'{s}'" for s in all_variant_strings)
 
     if p.match_strategy == "like":
-        exp_filter = f"AND params.value.string_value LIKE '{exp.prefix}'"
+        exp_filter = f"AND params.value.string_value LIKE '%{exp.prefix}%'"
     else:
         exp_filter = f"AND params.value.string_value IN ({variant_in_list})"
 
@@ -427,7 +427,7 @@ def build_continuous(p: ContinuousParams, limit: int = 0) -> str:
     variant_in_list = ", ".join(f"'{s}'" for s in all_variant_strings)
 
     if p.match_strategy == "like":
-        exp_filter = f"AND exp_variant_string LIKE '{exp.prefix}'"
+        exp_filter = f"AND exp_variant_string LIKE '%{exp.prefix}%'"
     else:
         exp_filter = f"AND exp_variant_string IN ({variant_in_list})"
 
@@ -857,7 +857,7 @@ SELECT DISTINCT params.value.string_value AS variant_string
 FROM {table}, UNNEST(event_params) AS params
 WHERE {suffix}
   AND params.key = '{param_key}'
-  AND params.value.string_value LIKE '{prefix}%'
+  AND params.value.string_value LIKE '%{prefix}%'
   AND params.value.string_value IS NOT NULL
 ORDER BY variant_string
 LIMIT 500;
