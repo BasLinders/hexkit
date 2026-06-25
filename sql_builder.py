@@ -345,7 +345,7 @@ ideal_users AS (
     if p.kpi_transactions:
         select_cols += [
             "  COUNT(DISTINCT CASE WHEN transaction_id IS NOT NULL THEN variant_user_pseudo_id END) AS users_with_transaction",
-            "  COUNT(DISTINCT transaction_id) AS total_transactions",
+            "  SUM(CASE WHEN transaction_id IS NOT NULL THEN transaction_id ELSE 0 END) AS total_transactions",
         ]
 
     if p.kpi_aov:
