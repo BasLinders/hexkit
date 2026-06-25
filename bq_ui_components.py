@@ -5,7 +5,6 @@ Reusable Streamlit UI blocks shared across all export modes.
 from __future__ import annotations
 from typing import Literal, Optional, cast
 import streamlit as st
-import streamlit.components.v1 as components
 from bq_client import (
     is_authenticated, get_auth_url, exchange_code_for_credentials,
     sign_out, list_projects, list_datasets, dry_run, run_preview,
@@ -41,40 +40,22 @@ def render_auth_panel() -> bool:
                 st.rerun()
         return True
     else:
-        st.info("Sign in with your Google account to access BigQuery.")
+        st.info(
+            "Sign in with your Google account to access BigQuery. "
+            "You'll be taken to Google in a new tab — after signing in, "
+            "continue in that tab."
+        )
         auth_url = get_auth_url()
-        # st.link_button adds target="_blank" (new tab) for external URLs.
-        # st.markdown href is stripped by Streamlit's HTML sanitizer (causes 403).
-        # Solution: components.v1.html runs in a sandboxed iframe that includes
-        # allow-top-navigation-by-user-activation — a user click can navigate
-        # the top-level browser window via window.top.location.href.
-        # The URL is passed via a data attribute to avoid JS string escaping issues.
-        components.html(
-            f"""
-            <style>
-              body {{ margin: 0; padding: 0; }}
-              button {{
-                width: 100%;
-                padding: 0.45rem 1rem;
-                background-color: rgb(255, 75, 75);
-                color: white;
-                border: none;
-                border-radius: 0.5rem;
-                font-size: 1rem;
-                font-weight: 500;
-                cursor: pointer;
-                font-family: "Source Sans Pro", sans-serif;
-              }}
-              button:hover {{ background-color: rgb(220, 50, 50); }}
-            </style>
-            <button
-              id="oauth-btn"
-              data-url="{auth_url}"
-              onclick="window.top.location.href = this.getAttribute('data-url')">
-              🔐 Sign in with Google
-            </button>
-            """,
-            height=50,
+        # Streamlit Cloud sandboxes all content in iframes without allow-top-navigation.
+        # Any attempt to navigate the top window (window.top, target="_self", meta refresh)
+        # either gets blocked by the sandbox or causes Google to refuse loading inside an
+        # iframe (X-Frame-Options: DENY → 403). st.link_button's new-tab behavior is the
+        # correct and only reliable mechanism for external OAuth navigation in Streamlit Cloud.
+        st.link_button(
+            "🔐 Sign in with Google",
+            auth_url,
+            use_container_width=True,
+            type="primary",
         )
         return False
 
