@@ -3,6 +3,7 @@ import altair as alt
 import pandas as pd
 import numpy as np
 import uuid
+from scipy.stats import norm as scipy_norm
 from st_supabase_connection import SupabaseConnection
 
 # --- CONSTANTS & CONFIGURATION ---
@@ -71,6 +72,41 @@ def calculate_msprt_llr(visitors_base, conversions_base, visitors_var, conversio
     # mSPRT LLR Formula
     llr = 0.5 * (np.log(var / (var + tau)) + (diff ** 2 / var) * (tau / (var + tau)))
     return llr
+
+
+def calculate_instantaneous_power(n_var, p0, mde, alpha, n_ctrl=None):
+    """
+    Estimates statistical power at the current sample sizes using a normal approximation.
+
+    For one-sample: n_ctrl is None; variance is computed from the fixed baseline p0.
+    For two-sample: both n_ctrl and n_var are used; variance accounts for both group sizes.
+
+    Returns (power, beta_est) as floats.
+
+    Important: this is a fixed-horizon approximation. mSPRT power is structurally lower
+    due to the always-valid guarantee — treat the result as an optimistic upper bound.
+    """
+    if n_var <= 0 or mde <= 0 or p0 <= 0:
+        return 0.0, 1.0
+
+    p0 = float(np.clip(p0, 0.001, 0.999))
+    p1 = float(np.clip(p0 + mde, 0.001, 0.999))
+    z_alpha = scipy_norm.ppf(1 - alpha)
+
+    if n_ctrl is None:
+        # One-sample: variance under H1 using the alternative proportion
+        se = np.sqrt(p1 * (1 - p1) / n_var)
+    else:
+        # Two-sample: variance of the difference under H1
+        n_ctrl = max(int(n_ctrl), 1)
+        se = np.sqrt(p0 * (1 - p0) / n_ctrl + p1 * (1 - p1) / n_var)
+
+    if se == 0:
+        return 0.0, 1.0
+
+    z_power = mde / se - z_alpha
+    power = float(scipy_norm.cdf(z_power))
+    return power, 1.0 - power
 
 
 # --- DATABASE FUNCTIONS ---
@@ -231,6 +267,64 @@ def show_visualization(chart_df, upper_bound, lower_bound):
     st.altair_chart(chart, width="stretch")
 
 
+def show_power_chart(power_df, target_power):
+    """
+    Shows estimated power over time for all variants, with a reference line at the target.
+    The power values are fixed-horizon approximations — labelled accordingly.
+    """
+    if power_df.empty:
+        return
+
+    y_min = max(power_df["power"].min() - 0.05, 0.0)
+    y_max = 1.05
+
+    power_line = alt.Chart(power_df).mark_line(point=True).encode(
+        x=alt.X("measurement_date:T", title="Date"),
+        y=alt.Y(
+            "power:Q",
+            title="Estimated Power",
+            scale=alt.Scale(domain=[y_min, y_max]),
+            axis=alt.Axis(format="%"),
+        ),
+        color=alt.Color("variant_name:N", title="Variant"),
+    )
+
+    target_rule = (
+        alt.Chart(pd.DataFrame({"y": [target_power]}))
+        .mark_rule(color="orange", strokeDash=[5, 5])
+        .encode(y="y")
+    )
+
+    target_label = (
+        alt.Chart(
+            pd.DataFrame(
+                {"y": [target_power], "label": [f"Target: {target_power:.0%}"]}
+            )
+        )
+        .mark_text(align="left", dx=6, dy=-8, color="orange", fontSize=11)
+        .encode(
+            y=alt.Y("y:Q"),
+            x=alt.value(0),
+            text="label",
+        )
+    )
+
+    chart = (
+        (power_line + target_rule + target_label)
+        .properties(height=220)
+        .interactive()
+    )
+
+    st.markdown("### Power Trajectory")
+    st.caption(
+        "Fixed-horizon normal approximation at current sample sizes. "
+        "mSPRT power is structurally lower — this is an optimistic bound. "
+        "Once the estimated power crosses the target line, you have accumulated enough "
+        "observations that a fixed-horizon test would be sufficiently powered."
+    )
+    st.altair_chart(chart, width="stretch")
+
+
 # --- ANALYSIS ---
 
 def analysis_section(df, params):
@@ -248,6 +342,8 @@ def analysis_section(df, params):
 
     variants_to_test = [v for v in df["variant_name"].unique() if v != "Control"]
     chart_data = []
+    power_data = []
+    mde = np.sqrt(tau_param)
 
     for variant in variants_to_test:
         var_df = df[df["variant_name"] == variant].copy()
@@ -279,6 +375,24 @@ def analysis_section(df, params):
                 axis=1,
             )
 
+            # Per-row power: use observed control CR at each date as the baseline
+            def _power_two_sample(row):
+                p_base = (
+                    row["conversions_ctrl"] / row["visitors_ctrl"]
+                    if row["visitors_ctrl"] > 0
+                    else 0.1
+                )
+                power, _ = calculate_instantaneous_power(
+                    n_var=row["visitors_var"],
+                    p0=p_base,
+                    mde=mde,
+                    alpha=alpha,
+                    n_ctrl=row["visitors_ctrl"],
+                )
+                return power
+
+            merged["power"] = merged.apply(_power_two_sample, axis=1)
+
             latest_vis = merged.iloc[-1]["visitors_var"]
             latest_conv = merged.iloc[-1]["conversions_var"]
             base_vis = merged.iloc[-1]["visitors_ctrl"]
@@ -305,6 +419,17 @@ def analysis_section(df, params):
                 axis=1,
             )
 
+            merged["power"] = merged.apply(
+                lambda row: calculate_instantaneous_power(
+                    n_var=row["visitors"],
+                    p0=p0_param,
+                    mde=mde,
+                    alpha=alpha,
+                    n_ctrl=None,
+                )[0],
+                axis=1,
+            )
+
             latest_vis = merged.iloc[-1]["visitors"]
             latest_conv = merged.iloc[-1]["conversions"]
             base_cr = p0_param
@@ -313,6 +438,9 @@ def analysis_section(df, params):
         vis_col = "visitors_var" if "visitors_var" in merged.columns else "visitors"
         chart_data.append(
             merged[["measurement_date", "variant_name", "llr", vis_col]]
+        )
+        power_data.append(
+            merged[["measurement_date", "variant_name", "power"]]
         )
 
         # --- VARIANT DECISION CARDS ---
@@ -334,6 +462,33 @@ def analysis_section(df, params):
 
             st.write(
                 f"**Observed CR:** {latest_cr:.2%} vs **Baseline CR:** {base_cr:.2%}"
+            )
+
+            # --- POWER METRICS ---
+            latest_power = merged.iloc[-1]["power"]
+            latest_beta_est = 1.0 - latest_power
+            target_power = 1.0 - beta
+
+            pm_col1, pm_col2, pm_col3 = st.columns(3)
+            pm_col1.metric(
+                "Target Power",
+                f"{target_power:.0%}",
+                help="1 − β as set when the experiment was locked.",
+            )
+            pm_col2.metric(
+                "Estimated Power",
+                f"{latest_power:.0%}",
+                delta=f"{latest_power - target_power:+.0%} vs target",
+                delta_color="normal",
+            )
+            pm_col3.metric(
+                "Est. False Negative Risk",
+                f"{latest_beta_est:.0%}",
+                help="1 − estimated power at the current sample size.",
+            )
+            st.caption(
+                "⚠️ Fixed-horizon approximation — mSPRT power is structurally lower. "
+                "Use this as a directional signal, not a guarantee."
             )
 
             # --- PROGRESS BAR ---
@@ -407,6 +562,11 @@ def analysis_section(df, params):
                 columns={"visitors_var": "visitors"}
             )
         show_visualization(final_chart_df, upper_bound, lower_bound)
+
+    if power_data:
+        final_power_df = pd.concat(power_data)
+        target_power = 1.0 - beta
+        show_power_chart(final_power_df, target_power)
 
 
 # --- DOCUMENTATION ---
