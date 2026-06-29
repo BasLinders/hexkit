@@ -8,7 +8,7 @@ if not st.session_state.get("admin_authenticated"):
 # HELPERS
 
 def run():
-  pass
+  st.info("Page for the automation flow. Coming soon.")
 
 if __name__ == "__main__":
   run()
