@@ -28,14 +28,20 @@ client_pages = [
     st.Page("pages/behavioral_analysis.py",         title="Behavioral Analysis",         icon="🧠"),
     st.Page("pages/interaction_analysis.py",        title="Interaction Analysis",        icon="🔀"),
     st.Page("pages/sequential_analysis.py",         title="Sequential Analysis",         icon="⏱️"),
-    st.Page("pages/experimentation_growth.py",      title="Experimentation Growth",      icon="📈"),
 ]
 
 admin_pages = [
     st.Page("pages/automation.py", title="Automation", icon="⚙️"),
+    st.Page("pages/experimentation_growth.py",      title="Experimentation Growth",      icon="📈"),
 ]
 
-pages = (admin_pages + client_pages) if st.session_state.get("admin_authenticated") else client_pages
+if st.session_state.get("admin_authenticated"):
+    pages = {
+        "": client_pages,
+        "Admin": admin_pages,
+    }
+else:
+    pages = {"": client_pages}
 
 pg = st.navigation(pages)
 pg.run()
