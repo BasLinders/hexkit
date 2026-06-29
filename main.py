@@ -19,6 +19,7 @@ with st.sidebar:
 
 # --- Build page list conditionally ---
 client_pages = [
+    st.Page("main.py")                              title="Home"                         icon="🏠"),
     st.Page("pages/data_export.py",                 title="Data Export",                 icon="📤"),
     st.Page("pages/pre_test_analysis.py",           title="Pre-Test Analysis",           icon="🔬"),
     st.Page("pages/srm_calculator.py",              title="SRM Check",                   icon="⚖️"),
