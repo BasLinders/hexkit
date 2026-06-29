@@ -1,5 +1,46 @@
 import streamlit as st
 
+# --- Admin login in sidebar ---
+with st.sidebar:
+    if not st.session_state.get("admin_authenticated"):
+        with st.expander("🔐 Admin"):
+            pwd = st.text_input("Password", type="password", key="admin_pwd")
+            if st.button("Unlock"):
+                if pwd == st.secrets["ADMIN_PASSWORD"]:
+                    st.session_state.admin_authenticated = True
+                    st.rerun()
+                else:
+                    st.error("Wrong password")
+    else:
+        st.caption("Logged in as admin")
+        if st.button("Logout"):
+            st.session_state.admin_authenticated = False
+            st.rerun()
+
+# --- Build page list conditionally ---
+client_pages = [
+    st.Page("pages/01_data_export.py",                 title="Data Export",                 icon="📤"),
+    st.Page("pages/02_behavioral_analysis.py",         title="Behavioral Analysis",         icon="🧠"),
+    st.Page("pages/03_continuous_metric_analysis.py",  title="Continuous Metric Analysis",  icon="📐"),
+    st.Page("pages/04_experiment_analysis.py",         title="Experiment Analysis",         icon="🧪"),
+    st.Page("pages/05_experimentation_growth.py",      title="Experimentation Growth",      icon="📈"),
+    st.Page("pages/06_interaction_analysis.py",        title="Interaction Analysis",        icon="🔀"),
+    st.Page("pages/07_pre_test_analysis.py",           title="Pre-Test Analysis",           icon="🔬"),
+    st.Page("pages/08_sequential_analysis.py",         title="Sequential Analysis",         icon="⏱️"),
+    st.Page("pages/09_srm_calculator.py",              title="SRM Check",                   icon="⚖️"),
+]
+
+admin_pages = [
+    st.Page("pages/00_automation.py", title="Automation", icon="⚙️"),
+]
+
+pages = (admin_pages + client_pages) if st.session_state.get("admin_authenticated") else client_pages
+
+pg = st.navigation(pages)
+pg.run()
+
+# --- Standard Hexkit flow ---
+
 st.set_page_config(
     page_title="HEXKIT",
     page_icon="📈",
