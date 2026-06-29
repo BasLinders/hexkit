@@ -21,15 +21,14 @@ This is the main page for the Happy Horizon Experimentation Toolkit. You can nav
 This toolkit has been created for the purposes of analyzing data from online controlled experiments ('A/B tests') to learn from and better understand user behavior.  
 
 ### Features
-<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Behavioral metric analysis**: Analyze higher-level metrics in your experiments<br>
-<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Continuous metric analysis**: Analyze metrics such as revenue / items per transaction<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Data export**: Connect to BigQuery with OpenAuth and pull experiment data for analysis<br>
-<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Experiment analysis**: Use Frequentist and Bayesian methods to analyze test results<br>
-<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Experimentation growth estimation**: Calculate annual compound growth potential<br>
-<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Interaction analysis**: Verify if your experiments negatively impacted each other or not<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Pre-test analysis**: Calculate the runtime to reach an effect<br>
-<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Sequential analysis**: Get instant feedback about test significance without fixed samples<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**SRM calculator**: Identify if your visitors were distributed as expected in your experiment<br>
+<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Experiment analysis**: Use Frequentist and Bayesian methods to analyze test results<br>
+<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Continuous metric analysis**: Analyze metrics such as revenue / items per transaction<br>
+<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Behavioral metric analysis**: Analyze higher-level metrics in your experiments<br>
+<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Interaction analysis**: Verify if your experiments negatively impacted each other or not<br>
+<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Sequential analysis**: Get instant feedback about test significance without fixed samples<br>
 
 ### How to Use
 - Select a page from the sidebar to view different tools.
