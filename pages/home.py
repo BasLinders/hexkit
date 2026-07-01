@@ -13,7 +13,7 @@ st.sidebar.image(logo_url, width="stretch")
 
 # st.title("HEXKIT")
 # st.image(logo_url)
-st.write("### <span style='color: orange;'>v1.5</span>", unsafe_allow_html=True)
+st.write("### <span style='color: orange;'>v1.5.1</span>", unsafe_allow_html=True)
 st.write("""
 This is the main page for the Happy Horizon Experimentation Toolkit. You can navigate to individual apps using the sidebar.
 
@@ -24,8 +24,8 @@ This toolkit has been created for the purposes of analyzing data from online con
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Data export**: Connect to BigQuery with OpenAuth and pull experiment data for analysis<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Pre-test analysis**: Calculate the runtime to reach an effect<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**SRM calculator**: Identify if your visitors were distributed as expected in your experiment<br>
-<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Experiment analysis**: Use Frequentist and Bayesian methods to analyze test results<br>
-<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Continuous metric analysis**: Analyze metrics such as revenue / items per transaction<br>
+<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Experiment analysis**: Use Frequentist and Bayesian methods to analyze aggregated test data<br>
+<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**User level analysis**: Analyze metrics such as revenue / items per transaction<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Behavioral metric analysis**: Analyze higher-level metrics in your experiments<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Interaction analysis**: Verify if your experiments negatively impacted each other or not<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Sequential analysis**: Get instant feedback about test significance without fixed samples<br>

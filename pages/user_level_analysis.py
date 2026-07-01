@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
+import statsmodels.discrete.discrete_model as dm
 from statsmodels.formula.api import ols
 import statsmodels.formula.api as smf
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
@@ -30,9 +31,11 @@ def render_documentation():
 
         ### 1. The Heuristic Framework
         This is a decision-engine that evaluates the underlying distribution of your data to pick the most mathematically sound test. It is particularly useful when evaluating metrics with negative values (i.e. profit).
+        * **Count-Data Gate:** Before anything else, checks whether the KPI is a discrete, non-negative count (e.g. items or tickets per buyer). If so, routes straight to **Negative Binomial regression** instead of the continuous-data tree below, since count metrics violate the continuous assumptions those tests are built on regardless of what a normality test reports.
         * **Normality Check:** Uses D'Agostino's K² omnibus test (skewness + kurtosis) to see if residuals follow a normal distribution.
         * **Homogeneity Check:** Uses Levene’s test to verify if groups have equal variances.
         * **The Branches:**
+            * *Negative Binomial Regression:* Used when the KPI is a discrete count metric (handles overdispersion natively via its dispersion parameter α).
             * *Standard ANOVA:* Used when data is normal and variances are equal.
             * *Welch's ANOVA:* Used when data is normal but variances are unequal.
             * *Kruskal-Wallis / Mann-Whitney:* Non-parametric alternatives used when data is non-normal.
@@ -49,22 +52,24 @@ def render_documentation():
         st.markdown(r"""
         Before testing, choose **what one row represents** for the comparison. This must
         match how you plan the experiment (and how you size it in the pre-test tool).
+        The same choice applies whatever KPI you're analyzing — revenue, item quantity,
+        profit, etc.
 
-        ### Revenue per transaction (positive rows only)
-        * The unit is a **transaction**; the metric is e.g. average order value.
+        ### Per transaction (positive rows only)
+        * The unit is a **transaction**; the metric is e.g. average order value or items per order.
         * Rows with a value of **0 are excluded** — they aren't orders.
         * Gamma path: a single Gamma per variant (strictly positive data).
-        * Answers *"did the value of an order change?"* It does **not** capture a change
+        * Answers *"did the value/quantity of an order change?"* It does **not** capture a change
           in how many people buy, and carries a mild selection effect (the set of orders
           is itself influenced by the treatment).
 
-        ### Revenue per visitor (includes zero rows)
+        ### Per visitor (includes zero rows)
         * The unit is a **visitor**; non-buyers count as **0**.
         * **All rows are kept**, including the zeros.
         * This is usually the real business outcome, and the unit you randomise on, so it
-          captures both *more people buying* and *buyers spending more*.
+          captures both *more people buying* and *buyers buying/spending more*.
         * Gamma path: a **two-part (hurdle) model** — a Bernoulli component for the
-          probability of converting, multiplied by a Gamma component for the spend of
+          probability of converting, multiplied by a Gamma component for the value of
           those who do. The log-likelihoods of both parts are added, and the Likelihood
           Ratio Test uses the combined model. This is how the Gamma approach is made to
           *accept zeros* instead of dropping them.
@@ -93,7 +98,7 @@ def render_documentation():
         * **Removal:** Entirely deletes rows where the KPI exceeds the $n^{th}$ percentile (or $n$ standard deviations). Use this if you suspect outliers are tracking errors.
 
         ### Choosing an Approach
-        * Use **Heuristic (Auto-detect)** for metrics that can contain negative values (i.e. profit).
+        * Use **Heuristic (Auto-detect)** for metrics that can contain negative values (i.e. profit), or discrete count metrics (i.e. items/tickets per buyer) — the count-data gate inside this path routes those automatically to Negative Binomial regression.
         * Use **Gamma GLM** for monetary values or any metric where the data cannot be negative and has a long right-hand tail.
         """)
 
@@ -109,11 +114,12 @@ def render_documentation():
         While the p-value tells you *if* there is a difference, the effect size tells you *how much it matters*. 
         * For ANOVA, we report **Partial Eta-Squared**.
         * For non-parametric tests, we report **Rank-Biserial Correlation** or **Eta-squared_H**.
+        * For Negative Binomial regression, we report the dispersion parameter **α** and defer to the relative lift in means for practical magnitude.
 
         ### 3. Post-Hoc Analysis
         If you have more than two groups and the main test is significant, look at the **Post-Hoc** table.
         * It performs pairwise comparisons (Group A vs Group B, B vs C, etc.).
-        * It uses corrections (like **Tukey**, **Games-Howell**, or **Bonferroni**) to prevent "p-hacking" or false positives that occur when running multiple simultaneous tests.
+        * It uses corrections (like **Tukey**, **Games-Howell**, **Bonferroni**, or pairwise NB LRTs with Bonferroni) to prevent "p-hacking" or false positives that occur when running multiple simultaneous tests.
         
         ### 4. Gamma GLM Specifics
         When using the Gamma approach, the output focuses on **Model Fit** rather than variance:
@@ -124,6 +130,14 @@ def render_documentation():
             * If **p < 0.05**, we conclude that at least one variant's mean is statistically different from the others under the Gamma assumption.
             * For **per-visitor** analysis the model is the two-part hurdle (Bernoulli × Gamma), so each variant carries one extra parameter (the conversion rate) and the test has correspondingly more degrees of freedom.
         * **Scale Parameter ($\theta$):** Indicates the "spread" or "dispersion" of the revenue. High scale parameters often point to high-variance "Whale" customers in revenue data.
+
+        ### 5. Negative Binomial Specifics
+        Used automatically for discrete count KPIs (e.g. items or tickets per buyer) inside the Heuristic path:
+
+        * **Why not a regular z-test/ANOVA:** Count metrics are typically overdispersed (variance > mean) and, when conditioned on buyers, can have a mean above 1 — the binomial `p(1-p)` variance formula and continuous-data assumptions don't apply.
+        * **Dispersion parameter (α):** Estimated directly from the data. Higher α indicates more overdispersion relative to a Poisson model.
+        * **Likelihood Ratio Test (LRT):** Compares a Null model (one mean for all variants) against an Alternative model (separate means per variant), same logic as the Gamma LRT.
+        * **Post-Hoc:** Pairwise Negative Binomial LRTs against a chosen control, Bonferroni-corrected.
         """)
     st.write("---")
 
@@ -275,6 +289,104 @@ def perform_gamma_test(df, kpi, unit="per_transaction"):
 
     return p_value, lr_stat
 
+
+# ---------------------------------------------------------------------------
+# Negative Binomial model (discrete count KPIs, e.g. items/tickets per buyer)
+# ---------------------------------------------------------------------------
+
+def is_count_kpi(series, max_unique_for_check=50, max_unique_ratio=0.05):
+    """
+    Heuristic gate: treat the KPI as a discrete count metric if all
+    non-null values are non-negative integers (or integer-valued floats,
+    e.g. 3.0), AND the cardinality looks like a true count rather than a
+    continuous KPI that happens to have round values (e.g. revenue
+    rounded to whole euros).
+
+    This check runs BEFORE the normality/homogeneity assumption checks,
+    since a count metric (discrete, often mean > 1, frequently
+    overdispersed) violates the continuous-data assumptions those tests
+    are built on regardless of what a normality test reports on a large
+    sample.
+
+    Both cardinality thresholds are exposed as parameters (rather than
+    hardcoded) because what "looks like a count" varies a lot by business
+    context — a KPI with 40 distinct values might be a clear count metric
+    for a low-volume B2B funnel, or a coincidentally-round continuous KPI
+    for a high-volume consumer funnel. Callers are expected to surface
+    these as UI inputs rather than relying on one global default.
+
+    max_unique_for_check: absolute cap on distinct values to still call it
+        a count metric (e.g. 50 -> KPIs with more than 50 distinct values
+        are treated as continuous unless the ratio check below applies).
+    max_unique_ratio: distinct-values-to-row-count ratio below which the
+        KPI is still treated as a count metric even if it exceeds the
+        absolute cap above (relevant for very large datasets where a
+        genuine count metric can have many distinct values in absolute
+        terms while still being a tiny fraction of total rows).
+    """
+    s = series.dropna()
+    if s.empty:
+        return False
+    if (s < 0).any():
+        return False
+    if not np.allclose(s, np.round(s)):
+        return False
+    n_unique = s.nunique()
+    return n_unique <= max_unique_for_check or (n_unique / len(s)) < max_unique_ratio
+
+
+def fit_negbin(data, exog=None):
+    """
+    Fits a Negative Binomial (NB2) model via MLE.
+    If exog is None, fits an intercept-only model.
+    Returns (log_likelihood, alpha, fitted_results).
+    """
+    data = np.asarray(data, dtype=float)
+    n = len(data)
+    if exog is None:
+        exog = np.ones((n, 1))
+    model = dm.NegativeBinomial(data, exog, loglike_method='nb2')
+    try:
+        res = model.fit(disp=0, maxiter=200)
+    except Exception:
+        start = np.zeros(exog.shape[1] + 1)
+        start[0] = np.log(np.mean(data) + 1e-6)
+        start[-1] = 1.0
+        res = model.fit(disp=0, maxiter=200, start_params=start)
+    return res.llf, res.params[-1], res
+
+
+def perform_negbin_test(df, kpi, group_col='experience_variant_label'):
+    """
+    Likelihood Ratio Test comparing a Null NB model (single mean for all
+    variants) against an Alternative model (separate mean per variant).
+    Mirrors perform_gamma_test's LRT structure.
+
+    Returns (p_value, lr_stat, alpha_estimate, fitted_alt_model).
+    """
+    data = df[kpi].values.astype(float)
+    groups = pd.Categorical(df[group_col])
+    dummies = pd.get_dummies(groups, drop_first=True).values.astype(float)
+    n = len(data)
+
+    # Null model: intercept only
+    exog_null = np.ones((n, 1))
+    ll_null, _, _ = fit_negbin(data, exog_null)
+
+    # Alternative model: intercept + variant dummies
+    exog_alt = np.column_stack([np.ones(n), dummies]) if dummies.shape[1] > 0 else exog_null
+    ll_alt, alpha_alt, res_alt = fit_negbin(data, exog_alt)
+
+    df_diff = exog_alt.shape[1] - exog_null.shape[1]
+    if df_diff <= 0:
+        return np.nan, np.nan, alpha_alt, res_alt
+
+    lr_stat = max(2.0 * (ll_alt - ll_null), 0.0)
+    p_value = stats.chi2.sf(lr_stat, df=df_diff)
+
+    return p_value, lr_stat, alpha_alt, res_alt
+
+
 def _fmt_pair(a, b, p=None):
     """Format a post-hoc pair for the conclusion, e.g. 'B vs A (p=0.0012)'."""
     label = f"{a} vs {b}"
@@ -334,6 +446,49 @@ def run_gamma_posthoc(df, kpi, group_col, control_label, unit="per_transaction")
 
     st.dataframe(pd.DataFrame(posthoc_data))
     return significant_pairs
+
+
+def run_negbin_posthoc(df, kpi, group_col, control_label):
+    """
+    Pairwise Negative Binomial LRTs against a chosen control, Bonferroni
+    corrected. Mirrors run_gamma_posthoc's structure and output format so
+    significant pairs fold into the same conclusion formatting.
+    """
+    st.write("### Pairwise Post-Hoc Comparisons (Negative Binomial LRT)")
+    st.markdown("_Each treatment variant is compared against the control using "
+                "pairwise Negative Binomial Likelihood Ratio Tests._")
+
+    variants = [v for v in df[group_col].unique() if v != control_label]
+    posthoc_data = []
+    significant_pairs = []
+    num_comparisons = len(variants)
+
+    for variant in variants:
+        pair_df = df[df[group_col].isin([control_label, variant])]
+
+        try:
+            p_val, lrt_stat, alpha_est, _ = perform_negbin_test(pair_df, kpi, group_col)
+            if pd.isna(p_val):
+                raise ValueError("LRT degrees of freedom <= 0")
+            adj_p = min(p_val * num_comparisons, 1.0)
+            sig = "✅" if adj_p < 0.05 else "❌"
+            if adj_p < 0.05:
+                significant_pairs.append(_fmt_pair(variant, control_label, adj_p))
+        except Exception as e:
+            st.error(f"Error during pairwise NB test ({variant} vs {control_label}): {e}")
+            p_val, lrt_stat, adj_p, sig = np.nan, np.nan, np.nan, "—"
+
+        posthoc_data.append({
+            "Comparison": f"{variant} vs {control_label}",
+            "LRT Stat": np.round(lrt_stat, 4) if pd.notna(lrt_stat) else "N/A",
+            "p-value": np.round(p_val, 4) if pd.notna(p_val) else "N/A",
+            "p-adj (Bonferroni)": np.round(adj_p, 4) if pd.notna(adj_p) else "N/A",
+            "Significant": sig,
+        })
+
+    st.dataframe(pd.DataFrame(posthoc_data))
+    return significant_pairs
+
 
 # Detect outliers
 
@@ -439,10 +594,14 @@ def log_transform_data(df, kpi):
 
 # Perform statistical tests and provide conclusions
 
-def perform_stat_tests_and_conclusions(df, kpi, model_after, approach, unit="per_transaction"):
+def perform_stat_tests_and_conclusions(
+    df, kpi, model_after, approach, unit="per_transaction",
+    count_max_unique=50, count_max_unique_ratio=0.05,
+):
     st.write("---") # Separator
     st.write("## Statistical Test Results")
-    unit_label = "revenue per visitor" if unit == "per_visitor" else "revenue per transaction"
+    kpi_label = kpi.replace('_', ' ')
+    unit_label = f"{kpi_label} per visitor" if unit == "per_visitor" else f"{kpi_label} per transaction"
     st.write(f"_Analysis unit: **{unit_label}**._")
     st.write("_(Based on Normality of Residuals and Homogeneity of Variance)_")
 
@@ -472,60 +631,92 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach, unit="per
         return
 
     # --- Assumption Checks ---
+    is_count = False
 
     if approach == "Heuristic (Auto-detect)":
         st.write("### 1. Assumption Checks")
-        # Normality of residuals via D'Agostino's K^2 omnibus test (skewness +
-        # kurtosis). Unlike Shapiro-Wilk it is reliable for large samples and
-        # emits no N > 5000 warning, so we use the full residual vector. Its
-        # kurtosis component is only valid for N >= 20, so very small samples
-        # fall back to non-parametric handling.
-        try:
-            resid_for_test = model_after.resid.dropna()
-            st.write("**Normality of Residuals (D'Agostino's K² Test):**")
-            if len(resid_for_test) >= 20:
-                norm_stat, norm_p_val = normaltest(resid_for_test)
-                st.write(f"* Statistic (K²) = {norm_stat:.4f}")
-                st.write(f"* p-value = {norm_p_val:.4f}")
-                is_normal = norm_p_val >= 0.05
-                st.write(f"* _Conclusion: Residuals are likely {'normally distributed' if is_normal else 'NOT normally distributed'}._")
+
+        # --- Count-data gate: check BEFORE normality/Levene ---
+        # Discrete, non-negative count metrics (e.g. items/tickets per buyer)
+        # are structurally unsuited to ANOVA/Welch/KW's continuous-data
+        # assumptions even when they "pass" normality by accident of large N,
+        # and the binomial-style p(1-p) variance base breaks once the mean
+        # exceeds 1. These route to Negative Binomial regression instead.
+        is_count = is_count_kpi(
+            df_clean[kpi],
+            max_unique_for_check=count_max_unique,
+            max_unique_ratio=count_max_unique_ratio,
+        )
+
+        if is_count:
+            st.info("**Detected: discrete count metric.** Routing to Negative Binomial "
+                    "regression instead of the continuous-data decision tree.")
+            mean_val = df_clean[kpi].mean()
+            var_val = df_clean[kpi].var()
+            ratio = var_val / mean_val if mean_val > 0 else np.nan
+            st.write(f"* Mean = {mean_val:.4f}, Variance = {var_val:.4f} "
+                     f"(Variance/Mean ratio = {ratio:.2f})")
+            if pd.notna(ratio) and ratio <= 1.05:
+                st.caption("_Variance ≈ Mean: a Poisson model would likely also fit, "
+                           "but Negative Binomial is used as the general-purpose default._")
             else:
-                is_normal = False
-                st.caption(
-                    "Fewer than 20 residuals — too few for a reliable omnibus "
-                    "normality test; defaulting to non-parametric handling."
-                )
-        except Exception as e:
-            st.error(f"Error during normality test: {e}")
-            st.write("_Skipping further analysis due to normality test error._")
-            return
-
-        # Prepare groups for Levene's test (and potential non-parametric tests)
-        # Use the cleaned data to avoid errors with tests
-        groups = [group_data[kpi] for _, group_data in df_clean.groupby('experience_variant_label', observed=True)]
-
-        # Homogeneity of Variance (Levene's Test)
-        try:
-            # Ensure there's data in each group being passed to Levene
-            if any(len(g) < 1 for g in groups):
-                st.error("Error: At least one group has no data after cleaning. Cannot perform Levene's test.")
+                st.caption("_Variance > Mean: overdispersion present, consistent with "
+                           "why Negative Binomial (rather than Poisson or a binomial "
+                           "z-test) is the appropriate model here._")
+            is_normal = False
+            is_homogeneous = False
+        else:
+            # Normality of residuals via D'Agostino's K^2 omnibus test (skewness +
+            # kurtosis). Unlike Shapiro-Wilk it is reliable for large samples and
+            # emits no N > 5000 warning, so we use the full residual vector. Its
+            # kurtosis component is only valid for N >= 20, so very small samples
+            # fall back to non-parametric handling.
+            try:
+                resid_for_test = model_after.resid.dropna()
+                st.write("**Normality of Residuals (D'Agostino's K² Test):**")
+                if len(resid_for_test) >= 20:
+                    norm_stat, norm_p_val = normaltest(resid_for_test)
+                    st.write(f"* Statistic (K²) = {norm_stat:.4f}")
+                    st.write(f"* p-value = {norm_p_val:.4f}")
+                    is_normal = norm_p_val >= 0.05
+                    st.write(f"* _Conclusion: Residuals are likely {'normally distributed' if is_normal else 'NOT normally distributed'}._")
+                else:
+                    is_normal = False
+                    st.caption(
+                        "Fewer than 20 residuals — too few for a reliable omnibus "
+                        "normality test; defaulting to non-parametric handling."
+                    )
+            except Exception as e:
+                st.error(f"Error during normality test: {e}")
+                st.write("_Skipping further analysis due to normality test error._")
                 return
-            # Levene's test requires at least 2 samples per group if center='median' (default)
-            # or center='mean'. Check group sizes. Let's use default ('median').
-            min_group_size = min(len(g) for g in groups)
-            if min_group_size < 2 and num_groups > 1 :
-                st.warning(f"Warning: Levene's test might be unreliable as at least one group has only {min_group_size} sample(s).")
 
-            levene_stat, levene_p_val = levene(*groups)
-            st.write("**Homogeneity of Variance (Levene's Test):**")
-            st.write(f"* Statistic = {levene_stat:.4f}")
-            st.write(f"* p-value = {levene_p_val:.4f}")
-            is_homogeneous = levene_p_val >= 0.05
-            st.write(f"* _Conclusion: Variances are likely {'homogeneous (equal)' if is_homogeneous else 'NOT homogeneous (unequal)'}._")
-        except Exception as e:
-            st.error(f"Error during Levene's test: {e}")
-            st.write("_Skipping further analysis due to variance test error._")
-            return
+            # Prepare groups for Levene's test (and potential non-parametric tests)
+            # Use the cleaned data to avoid errors with tests
+            groups = [group_data[kpi] for _, group_data in df_clean.groupby('experience_variant_label', observed=True)]
+
+            # Homogeneity of Variance (Levene's Test)
+            try:
+                # Ensure there's data in each group being passed to Levene
+                if any(len(g) < 1 for g in groups):
+                    st.error("Error: At least one group has no data after cleaning. Cannot perform Levene's test.")
+                    return
+                # Levene's test requires at least 2 samples per group if center='median' (default)
+                # or center='mean'. Check group sizes. Let's use default ('median').
+                min_group_size = min(len(g) for g in groups)
+                if min_group_size < 2 and num_groups > 1 :
+                    st.warning(f"Warning: Levene's test might be unreliable as at least one group has only {min_group_size} sample(s).")
+
+                levene_stat, levene_p_val = levene(*groups)
+                st.write("**Homogeneity of Variance (Levene's Test):**")
+                st.write(f"* Statistic = {levene_stat:.4f}")
+                st.write(f"* p-value = {levene_p_val:.4f}")
+                is_homogeneous = levene_p_val >= 0.05
+                st.write(f"* _Conclusion: Variances are likely {'homogeneous (equal)' if is_homogeneous else 'NOT homogeneous (unequal)'}._")
+            except Exception as e:
+                st.error(f"Error during Levene's test: {e}")
+                st.write("_Skipping further analysis due to variance test error._")
+                return
 
     elif approach == "Gamma GLM (Best for Revenue/Items)":
         # Skip diagnostics and go straight to GLM
@@ -581,6 +772,45 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach, unit="per
 
             except Exception as e:
                 st.error(f"Native Gamma Fit failed: {e}")
+                p_value = np.nan
+
+        elif approach == "Heuristic (Auto-detect)" and is_count:
+            st.info("**Test Chosen:** Negative Binomial Regression (LRT)")
+            st.markdown("_Reason: KPI is a discrete, non-negative count metric — Negative "
+                        "Binomial models the mean-variance relationship natively (including "
+                        "overdispersion) rather than assuming a continuous or bounded-proportion "
+                        "distribution._")
+            try:
+                p_value, lr_stat, alpha_est, res_alt = perform_negbin_test(df_clean, kpi)
+
+                if pd.isna(p_value):
+                    st.warning("The Negative Binomial model could not be fit or compared "
+                               "(check that there is more than one variant with data).")
+                else:
+                    test_statistic = lr_stat
+                    test_name = "Negative Binomial Regression (LRT)"
+                    st.write(f"* Likelihood Ratio Statistic: {lr_stat:.4f}")
+                    st.write(f"* p-value: {p_value:.4g}")
+                    st.write(f"* Estimated dispersion (α): {alpha_est:.4f}")
+
+                    is_significant = p_value < 0.05
+
+                    if is_significant and num_groups > 2:
+                        control_label = st.selectbox(
+                            "Select Control Variant for Post-Hoc",
+                            df_clean['experience_variant_label'].unique(),
+                        )
+                        significant_pairs = run_negbin_posthoc(
+                            df=df_clean,
+                            kpi=kpi,
+                            group_col='experience_variant_label',
+                            control_label=control_label,
+                        )
+                    elif not is_significant and num_groups > 2:
+                        st.info("Global test is not significant; pairwise comparisons are not required.")
+
+            except Exception as e:
+                st.error(f"Negative Binomial fit failed: {e}")
                 p_value = np.nan
 
         elif approach == "Heuristic (Auto-detect)":
@@ -735,6 +965,8 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach, unit="per
                 st.markdown("_Refer to the summary statistics above to see which side of each pair is higher._")
             elif approach == "Gamma GLM (Best for Revenue/Items)":
                 st.write("The Likelihood Ratio Test indicates that variant means differ significantly. See the **Pairwise Post-Hoc Comparisons** above to identify which treatments outperformed the control.")
+            elif is_count:
+                st.write("The Likelihood Ratio Test indicates that variant means differ significantly. See the **Pairwise Post-Hoc Comparisons** above to identify which treatments outperformed the control.")
             elif posthoc_results is not None:
                 st.write("The global test is significant, but no individual pair remained significant after multiple-comparison correction. See the post-hoc table above.")
             else:
@@ -857,19 +1089,24 @@ def run():
         kpi = st.selectbox("Select the KPI to analyze:", available_kpis)
 
         # --- Analysis unit selector (per visitor vs per transaction) ---
+        # Generic wording: this selector applies to whichever KPI is chosen
+        # (revenue, item quantity, profit, etc.), not just revenue, so the
+        # labels use the KPI's own name rather than hardcoding "Revenue".
+        kpi_label = kpi.replace('_', ' ')
         unit_choice = st.selectbox(
             "Select the analysis unit:",
             [
-                "Revenue per visitor (includes zero-value rows)",
-                "Revenue per transaction (positive rows only)",
+                f"{kpi_label} per visitor (includes zero-value rows)",
+                f"{kpi_label} per transaction (positive rows only)",
             ],
             help=(
                 "Per visitor averages over every visitor, counting non-buyers as 0 "
-                "(captures conversion-rate and spend effects together; needs zero rows "
-                "in your file). Per transaction looks at order value among buyers only."
+                "(captures conversion-rate and volume/spend effects together; needs "
+                "zero rows in your file). Per transaction looks at the value among "
+                "buyers/orders only."
             ),
         )
-        unit = "per_visitor" if unit_choice.startswith("Revenue per visitor") else "per_transaction"
+        unit = "per_visitor" if "per visitor" in unit_choice else "per_transaction"
 
         # Inspect the zero structure of the chosen KPI to guide the user.
         kpi_series = df[kpi].dropna()
@@ -894,7 +1131,7 @@ def run():
         analysis_approach = st.selectbox(
             "Select Statistical Approach:",
             ["Heuristic (Auto-detect)", "Gamma GLM (Best for Revenue/Items)"],
-            help="Heuristic follows a Normality/Variance decision tree. Gamma GLM is optimized for strictly positive, right-skewed continuous data. For per-visitor analysis, Gamma GLM uses a two-part hurdle model so zeros are included."
+            help="Heuristic follows a count-data gate (Negative Binomial for discrete counts) then a Normality/Variance decision tree. Gamma GLM is optimized for strictly positive, right-skewed continuous data. For per-visitor analysis, Gamma GLM uses a two-part hurdle model so zeros are included."
         )
 
         # Guard: the Gamma family needs non-negative data.
@@ -904,6 +1141,43 @@ def run():
                 f"{n_neg:,} negative value(s). Use the Heuristic approach for this metric, "
                 "or pick a non-negative KPI."
             )
+
+        # --- Count-data detection thresholds (Heuristic path only) ---
+        # What "looks like a count metric" varies a lot by business context —
+        # a low-volume B2B funnel might have counts spanning dozens of
+        # distinct values, while a high-volume consumer funnel might have a
+        # coincidentally-round continuous KPI with few distinct values.
+        # Exposed here rather than hardcoded so it can be tuned per dataset.
+        count_max_unique = 50
+        count_max_unique_ratio = 5.0
+        if analysis_approach == "Heuristic (Auto-detect)":
+            with st.expander("Count-metric detection settings (advanced)"):
+                st.markdown(
+                    "The Heuristic path checks whether the KPI looks like a discrete "
+                    "count (e.g. items/tickets per buyer) before running normality "
+                    "checks, and routes count metrics to Negative Binomial regression "
+                    "instead. Adjust these thresholds if your KPI is being "
+                    "mis-classified as continuous or as a count."
+                )
+                count_max_unique = st.number_input(
+                    "Max distinct values to still call it a count metric",
+                    min_value=2, max_value=1000, value=50, step=1,
+                    help=(
+                        "If the KPI has this many or fewer distinct values (and is "
+                        "non-negative and integer-valued), it's treated as a count "
+                        "metric regardless of dataset size."
+                    ),
+                )
+                count_max_unique_ratio = st.number_input(
+                    "Max distinct-values / row-count ratio (%) to still call it a count metric",
+                    min_value=0.1, max_value=100.0, value=5.0, step=0.5,
+                    help=(
+                        "Fallback for large datasets: even if distinct values exceed "
+                        "the cap above, the KPI is still treated as a count metric if "
+                        "distinct values are below this percentage of total rows."
+                    ),
+                )
+
 
         # Select how to handle outliers
         outlier_handling = st.selectbox("Select how to handle outliers:", ['None', 'Winsorizing (STD/Percentile)', 'Log Transform', 'Removal'], help='Choose the method for handling outliers. "None" uses a default > 5 standard deviation definition for detection purposes. Only use Log Transform when your data does not contain negative numbers.')
@@ -1078,7 +1352,11 @@ def run():
                 plt.clf()
 
             action_bar.progress(80, text="Running statistical tests…")
-            perform_stat_tests_and_conclusions(processed_df, kpi, model_after, analysis_approach, unit)
+            perform_stat_tests_and_conclusions(
+                processed_df, kpi, model_after, analysis_approach, unit,
+                count_max_unique=count_max_unique,
+                count_max_unique_ratio=count_max_unique_ratio / 100.0,
+            )
             action_bar.progress(100, text="Analysis complete.")
             action_bar.empty()
             
