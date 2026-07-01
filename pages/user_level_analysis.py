@@ -17,7 +17,7 @@ import streamlit as st
 import itertools
 
 st.set_page_config(
-    page_title="User Level analysis",
+    page_title="Continuous metric analysis",
     page_icon="🔢",
     layout="wide",
 )
@@ -292,7 +292,7 @@ def perform_gamma_test(df, kpi, unit="per_transaction"):
 # Negative Binomial model (discrete count KPIs, e.g. items/tickets per buyer)
 # ---------------------------------------------------------------------------
 
-def is_count_kpi(series, max_unique_for_check=50):
+def is_count_kpi(series, max_unique_for_check=50, max_unique_ratio=0.05):
     """
     Heuristic gate: treat the KPI as a discrete count metric if all
     non-null values are non-negative integers (or integer-valued floats,
@@ -305,6 +305,22 @@ def is_count_kpi(series, max_unique_for_check=50):
     overdispersed) violates the continuous-data assumptions those tests
     are built on regardless of what a normality test reports on a large
     sample.
+
+    Both cardinality thresholds are exposed as parameters (rather than
+    hardcoded) because what "looks like a count" varies a lot by business
+    context — a KPI with 40 distinct values might be a clear count metric
+    for a low-volume B2B funnel, or a coincidentally-round continuous KPI
+    for a high-volume consumer funnel. Callers are expected to surface
+    these as UI inputs rather than relying on one global default.
+
+    max_unique_for_check: absolute cap on distinct values to still call it
+        a count metric (e.g. 50 -> KPIs with more than 50 distinct values
+        are treated as continuous unless the ratio check below applies).
+    max_unique_ratio: distinct-values-to-row-count ratio below which the
+        KPI is still treated as a count metric even if it exceeds the
+        absolute cap above (relevant for very large datasets where a
+        genuine count metric can have many distinct values in absolute
+        terms while still being a tiny fraction of total rows).
     """
     s = series.dropna()
     if s.empty:
@@ -314,7 +330,7 @@ def is_count_kpi(series, max_unique_for_check=50):
     if not np.allclose(s, np.round(s)):
         return False
     n_unique = s.nunique()
-    return n_unique <= max_unique_for_check or (n_unique / len(s)) < 0.05
+    return n_unique <= max_unique_for_check or (n_unique / len(s)) < max_unique_ratio
 
 
 def fit_negbin(data, exog=None):
@@ -576,7 +592,10 @@ def log_transform_data(df, kpi):
 
 # Perform statistical tests and provide conclusions
 
-def perform_stat_tests_and_conclusions(df, kpi, model_after, approach, unit="per_transaction"):
+def perform_stat_tests_and_conclusions(
+    df, kpi, model_after, approach, unit="per_transaction",
+    count_max_unique=50, count_max_unique_ratio=0.05,
+):
     st.write("---") # Separator
     st.write("## Statistical Test Results")
     unit_label = "revenue per visitor" if unit == "per_visitor" else "revenue per transaction"
@@ -620,7 +639,11 @@ def perform_stat_tests_and_conclusions(df, kpi, model_after, approach, unit="per
         # assumptions even when they "pass" normality by accident of large N,
         # and the binomial-style p(1-p) variance base breaks once the mean
         # exceeds 1. These route to Negative Binomial regression instead.
-        is_count = is_count_kpi(df_clean[kpi])
+        is_count = is_count_kpi(
+            df_clean[kpi],
+            max_unique_for_check=count_max_unique,
+            max_unique_ratio=count_max_unique_ratio,
+        )
 
         if is_count:
             st.info("**Detected: discrete count metric.** Routing to Negative Binomial "
@@ -1111,6 +1134,43 @@ def run():
                 "or pick a non-negative KPI."
             )
 
+        # --- Count-data detection thresholds (Heuristic path only) ---
+        # What "looks like a count metric" varies a lot by business context —
+        # a low-volume B2B funnel might have counts spanning dozens of
+        # distinct values, while a high-volume consumer funnel might have a
+        # coincidentally-round continuous KPI with few distinct values.
+        # Exposed here rather than hardcoded so it can be tuned per dataset.
+        count_max_unique = 50
+        count_max_unique_ratio = 5.0
+        if analysis_approach == "Heuristic (Auto-detect)":
+            with st.expander("Count-metric detection settings (advanced)"):
+                st.markdown(
+                    "The Heuristic path checks whether the KPI looks like a discrete "
+                    "count (e.g. items/tickets per buyer) before running normality "
+                    "checks, and routes count metrics to Negative Binomial regression "
+                    "instead. Adjust these thresholds if your KPI is being "
+                    "mis-classified as continuous or as a count."
+                )
+                count_max_unique = st.number_input(
+                    "Max distinct values to still call it a count metric",
+                    min_value=2, max_value=1000, value=50, step=1,
+                    help=(
+                        "If the KPI has this many or fewer distinct values (and is "
+                        "non-negative and integer-valued), it's treated as a count "
+                        "metric regardless of dataset size."
+                    ),
+                )
+                count_max_unique_ratio = st.number_input(
+                    "Max distinct-values / row-count ratio (%) to still call it a count metric",
+                    min_value=0.1, max_value=100.0, value=5.0, step=0.5,
+                    help=(
+                        "Fallback for large datasets: even if distinct values exceed "
+                        "the cap above, the KPI is still treated as a count metric if "
+                        "distinct values are below this percentage of total rows."
+                    ),
+                )
+
+
         # Select how to handle outliers
         outlier_handling = st.selectbox("Select how to handle outliers:", ['None', 'Winsorizing (STD/Percentile)', 'Log Transform', 'Removal'], help='Choose the method for handling outliers. "None" uses a default > 5 standard deviation definition for detection purposes. Only use Log Transform when your data does not contain negative numbers.')
 
@@ -1284,7 +1344,11 @@ def run():
                 plt.clf()
 
             action_bar.progress(80, text="Running statistical tests…")
-            perform_stat_tests_and_conclusions(processed_df, kpi, model_after, analysis_approach, unit)
+            perform_stat_tests_and_conclusions(
+                processed_df, kpi, model_after, analysis_approach, unit,
+                count_max_unique=count_max_unique,
+                count_max_unique_ratio=count_max_unique_ratio / 100.0,
+            )
             action_bar.progress(100, text="Analysis complete.")
             action_bar.empty()
             
