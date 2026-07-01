@@ -52,22 +52,24 @@ def render_documentation():
         st.markdown(r"""
         Before testing, choose **what one row represents** for the comparison. This must
         match how you plan the experiment (and how you size it in the pre-test tool).
+        The same choice applies whatever KPI you're analyzing — revenue, item quantity,
+        profit, etc.
 
-        ### Revenue per transaction (positive rows only)
-        * The unit is a **transaction**; the metric is e.g. average order value.
+        ### Per transaction (positive rows only)
+        * The unit is a **transaction**; the metric is e.g. average order value or items per order.
         * Rows with a value of **0 are excluded** — they aren't orders.
         * Gamma path: a single Gamma per variant (strictly positive data).
-        * Answers *"did the value of an order change?"* It does **not** capture a change
+        * Answers *"did the value/quantity of an order change?"* It does **not** capture a change
           in how many people buy, and carries a mild selection effect (the set of orders
           is itself influenced by the treatment).
 
-        ### Revenue per visitor (includes zero rows)
+        ### Per visitor (includes zero rows)
         * The unit is a **visitor**; non-buyers count as **0**.
         * **All rows are kept**, including the zeros.
         * This is usually the real business outcome, and the unit you randomise on, so it
-          captures both *more people buying* and *buyers spending more*.
+          captures both *more people buying* and *buyers buying/spending more*.
         * Gamma path: a **two-part (hurdle) model** — a Bernoulli component for the
-          probability of converting, multiplied by a Gamma component for the spend of
+          probability of converting, multiplied by a Gamma component for the value of
           those who do. The log-likelihoods of both parts are added, and the Likelihood
           Ratio Test uses the combined model. This is how the Gamma approach is made to
           *accept zeros* instead of dropping them.
@@ -598,7 +600,8 @@ def perform_stat_tests_and_conclusions(
 ):
     st.write("---") # Separator
     st.write("## Statistical Test Results")
-    unit_label = "revenue per visitor" if unit == "per_visitor" else "revenue per transaction"
+    kpi_label = kpi.replace('_', ' ')
+    unit_label = f"{kpi_label} per visitor" if unit == "per_visitor" else f"{kpi_label} per transaction"
     st.write(f"_Analysis unit: **{unit_label}**._")
     st.write("_(Based on Normality of Residuals and Homogeneity of Variance)_")
 
@@ -1086,19 +1089,24 @@ def run():
         kpi = st.selectbox("Select the KPI to analyze:", available_kpis)
 
         # --- Analysis unit selector (per visitor vs per transaction) ---
+        # Generic wording: this selector applies to whichever KPI is chosen
+        # (revenue, item quantity, profit, etc.), not just revenue, so the
+        # labels use the KPI's own name rather than hardcoding "Revenue".
+        kpi_label = kpi.replace('_', ' ')
         unit_choice = st.selectbox(
             "Select the analysis unit:",
             [
-                "Revenue per visitor (includes zero-value rows)",
-                "Revenue per transaction (positive rows only)",
+                f"{kpi_label} per visitor (includes zero-value rows)",
+                f"{kpi_label} per transaction (positive rows only)",
             ],
             help=(
                 "Per visitor averages over every visitor, counting non-buyers as 0 "
-                "(captures conversion-rate and spend effects together; needs zero rows "
-                "in your file). Per transaction looks at order value among buyers only."
+                "(captures conversion-rate and volume/spend effects together; needs "
+                "zero rows in your file). Per transaction looks at the value among "
+                "buyers/orders only."
             ),
         )
-        unit = "per_visitor" if unit_choice.startswith("Revenue per visitor") else "per_transaction"
+        unit = "per_visitor" if "per visitor" in unit_choice else "per_transaction"
 
         # Inspect the zero structure of the chosen KPI to guide the user.
         kpi_series = df[kpi].dropna()
