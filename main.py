@@ -24,7 +24,7 @@ client_pages = [
     st.Page("pages/pre_test_analysis.py",           title="Pre-Test Analysis",           icon="🔬"),
     st.Page("pages/srm_calculator.py",              title="SRM Check",                   icon="⚖️"),
     st.Page("pages/experiment_analysis.py",         title="Experiment Analysis",         icon="🧪"),
-    st.Page("pages/continuous_metric_analysis.py",  title="Continuous Metric Analysis",  icon="📐"),
+    st.Page("pages/user_level_analysis.py",         title="Continuous Metric Analysis",  icon="📐"),
     st.Page("pages/behavioral_analysis.py",         title="Behavioral Analysis",         icon="🧠"),
     st.Page("pages/interaction_analysis.py",        title="Interaction Analysis",        icon="🔀"),
     st.Page("pages/sequential_analysis.py",         title="Sequential Analysis",         icon="⏱️"),
