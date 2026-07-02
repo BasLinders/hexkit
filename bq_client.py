@@ -74,15 +74,6 @@ def _build_client_config(client_id: str, client_secret: str, redirect_uri: str) 
 
 
 def get_auth_url(client_id: str, client_secret: str) -> str:
-    """
-    Build the Google OAuth authorization URL using the provided credentials.
-
-    PKCE note: google-auth-oauthlib >= 1.0 automatically generates a
-    code_verifier and embeds the corresponding code_challenge in the URL.
-    The verifier is stored on the flow object but lost when the page
-    reloads after the redirect. We recover it by encoding it into the
-    state parameter — Google returns state unchanged in the callback.
-    """
     redirect_uri = _get_redirect_uri()
     config = _build_client_config(client_id, client_secret, redirect_uri)
     flow = Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
@@ -93,15 +84,20 @@ def get_auth_url(client_id: str, client_secret: str) -> str:
         prompt="consent",
     )
 
-    # Embed verifier in state so it survives the redirect
+    # Encode verifier AND credentials into state — both need to survive the redirect
     verifier: str = getattr(flow, "code_verifier", None) or ""
-    if verifier:
-        encoded = base64.urlsafe_b64encode(verifier.encode()).decode().rstrip("=")
-        parsed = urllib.parse.urlparse(auth_url)
-        qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-        qs["state"] = [encoded]
-        new_query = urllib.parse.urlencode({k: v[0] for k, v in qs.items()})
-        auth_url = urllib.parse.urlunparse(parsed._replace(query=new_query))
+    state_data = json.dumps({
+        "verifier":      verifier,
+        "client_id":     client_id,
+        "client_secret": client_secret,
+    })
+    encoded = base64.urlsafe_b64encode(state_data.encode()).decode().rstrip("=")
+
+    parsed = urllib.parse.urlparse(auth_url)
+    qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    qs["state"] = [encoded]
+    new_query = urllib.parse.urlencode({k: v[0] for k, v in qs.items()})
+    auth_url = urllib.parse.urlunparse(parsed._replace(query=new_query))
 
     return auth_url
 
@@ -112,23 +108,21 @@ def exchange_code_for_credentials(
     client_id: str = "",
     client_secret: str = "",
 ) -> Credentials:
-    """
-    Exchange an authorization code for credentials.
-    Reconstructs the Flow from the provided credentials (no stored session state needed).
-    Recovers the PKCE code_verifier from the state parameter if present.
-    """
-    redirect_uri = _get_redirect_uri()
-    config = _build_client_config(client_id, client_secret, redirect_uri)
-
-    # Decode PKCE verifier from state
+    # Decode state — verifier and credentials are both embedded here
     verifier: Optional[str] = None
     if state:
         try:
             padding = 4 - len(state) % 4
             padded = state + ("=" * (padding % 4))
-            verifier = base64.urlsafe_b64decode(padded).decode()
+            state_data = json.loads(base64.urlsafe_b64decode(padded).decode())
+            verifier      = state_data.get("verifier", "") or None
+            client_id     = state_data.get("client_id", client_id)
+            client_secret = state_data.get("client_secret", client_secret)
         except Exception:
             verifier = None
+
+    redirect_uri = _get_redirect_uri()
+    config = _build_client_config(client_id, client_secret, redirect_uri)
 
     flow = Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
     fetch_kwargs: dict = {"code": code}
