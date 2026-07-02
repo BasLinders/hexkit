@@ -20,11 +20,14 @@ from sql_builder import VariantPair, ExperimentConfig
 
 def render_auth_panel() -> bool:
     """Renders sign-in/sign-out. Returns True if authenticated."""
+    client_id     = st.session_state.get("gcp_client_id", "")
+    client_secret = st.session_state.get("gcp_client_secret", "")
+
     params = st.query_params
     if "code" in params and not is_authenticated():
         try:
             state = params.get("state", "")
-            exchange_code_for_credentials(params["code"], state)
+            exchange_code_for_credentials(params["code"], state, client_id, client_secret)
             st.query_params.clear()
             st.rerun()
         except Exception as e:
@@ -45,12 +48,7 @@ def render_auth_panel() -> bool:
             "You'll be taken to Google in a new tab — after signing in, "
             "continue in that tab."
         )
-        auth_url = get_auth_url()
-        # Streamlit Cloud sandboxes all content in iframes without allow-top-navigation.
-        # Any attempt to navigate the top window (window.top, target="_self", meta refresh)
-        # either gets blocked by the sandbox or causes Google to refuse loading inside an
-        # iframe (X-Frame-Options: DENY → 403). st.link_button's new-tab behavior is the
-        # correct and only reliable mechanism for external OAuth navigation in Streamlit Cloud.
+        auth_url = get_auth_url(client_id, client_secret)
         st.link_button(
             "🔐 Sign in with Google",
             auth_url,

@@ -693,6 +693,47 @@ def run() -> None:
     st.title("Data export")
     st.caption("Export BigQuery experiment data for statistical analysis.")
 
+    # --- GCP credentials -----------------------------------------------------
+    st.divider()
+    st.subheader("GCP credentials")
+    st.caption(
+        "Enter your own GCP OAuth client credentials. "
+        "Create one at [console.cloud.google.com](https://console.cloud.google.com) under "
+        "APIs & Services → Credentials → OAuth 2.0 Client IDs. "
+        "Add `https://hexkit.streamlit.app/oauth2callback` as an authorised redirect URI."
+    )
+
+    creds_set = (
+        st.session_state.get("gcp_client_id")
+        and st.session_state.get("gcp_client_secret")
+    )
+
+    with st.expander("🔑 Enter credentials", expanded=not creds_set):
+        client_id = st.text_input(
+            "Client ID",
+            value=st.session_state.get("gcp_client_id", ""),
+            placeholder="123456789-abc...apps.googleusercontent.com",
+            key="gcp_client_id_input",
+        )
+        client_secret = st.text_input(
+            "Client secret",
+            value=st.session_state.get("gcp_client_secret", ""),
+            type="password",
+            key="gcp_client_secret_input",
+        )
+        if st.button("Save credentials"):
+            if client_id and client_secret:
+                st.session_state.gcp_client_id = client_id
+                st.session_state.gcp_client_secret = client_secret
+                # Clear any existing token so a fresh OAuth flow is triggered
+                st.session_state.pop("bq_token", None)
+                st.rerun()
+            else:
+                st.warning("Both Client ID and Client secret are required.")
+
+    if not st.session_state.get("gcp_client_id"):
+        st.stop()
+
     # --- Auth ----------------------------------------------------------------
     if not render_auth_panel():
         st.stop()
@@ -749,7 +790,6 @@ def run() -> None:
 
     # --- Execution gate ------------------------------------------------------
     _render_execution_gate(project, dataset, sql, mode)
-
 
 # ============================================================================
 # 4. ENTRY POINT
