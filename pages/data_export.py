@@ -5,6 +5,8 @@
 from __future__ import annotations
 from typing import Literal, Optional, Union, cast
 
+from bq_client import is_authenticated
+
 import streamlit as st
 
 from bq_client import (
@@ -703,7 +705,7 @@ def run() -> None:
         "Add `https://hexkit.streamlit.app/oauth2callback` as an authorised redirect URI."
     )
 
-    creds_set = (
+    creds_set = is_authenticated() or (
         st.session_state.get("gcp_client_id")
         and st.session_state.get("gcp_client_secret")
     )
@@ -731,7 +733,7 @@ def run() -> None:
             else:
                 st.warning("Both Client ID and Client secret are required.")
 
-    if not st.session_state.get("gcp_client_id"):
+    if not st.session_state.get("gcp_client_id") and not is_authenticated():
         st.stop()
 
     # --- Auth ----------------------------------------------------------------
