@@ -2,6 +2,9 @@
 # 1. LIBRARIES
 # ============================================================================
 
+import json
+import base64
+
 from __future__ import annotations
 from typing import Literal, Optional, Union, cast
 
@@ -695,6 +698,23 @@ def run() -> None:
     st.title("Data export")
     st.caption("Export BigQuery experiment data for statistical analysis.")
 
+    # --- Handle OAuth callback FIRST, before any gate ------------------------
+    params = st.query_params
+    if "code" in params and not is_authenticated():
+        try:
+            state = params.get("state", "")
+            if state:
+                padding = 4 - len(state) % 4
+                padded = state + ("=" * (padding % 4))
+                state_data = json.loads(base64.urlsafe_b64decode(padded).decode())
+                st.session_state.gcp_client_id     = state_data.get("client_id", "")
+                st.session_state.gcp_client_secret = state_data.get("client_secret", "")
+            exchange_code_for_credentials(params["code"], state)
+            st.query_params.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"Authentication failed: {e}")
+
     # --- GCP credentials -----------------------------------------------------
     st.divider()
     st.subheader("GCP credentials")
@@ -702,7 +722,7 @@ def run() -> None:
         "Enter your own GCP OAuth client credentials. "
         "Create one at [console.cloud.google.com](https://console.cloud.google.com) under "
         "APIs & Services → Credentials → OAuth 2.0 Client IDs. "
-        "Add `https://hexkit.streamlit.app/oauth2callback` as an authorised redirect URI."
+        "Add `https://hexkit.streamlit.app/data_export` as an authorised redirect URI."
     )
 
     creds_set = is_authenticated() or (
@@ -725,7 +745,7 @@ def run() -> None:
         )
         if st.button("Save credentials"):
             if client_id and client_secret:
-                st.session_state.gcp_client_id = client_id
+                st.session_state.gcp_client_id     = client_id
                 st.session_state.gcp_client_secret = client_secret
                 # Clear any existing token so a fresh OAuth flow is triggered
                 st.session_state.pop("bq_token", None)
@@ -733,7 +753,7 @@ def run() -> None:
             else:
                 st.warning("Both Client ID and Client secret are required.")
 
-    if not st.session_state.get("gcp_client_id") and not is_authenticated():
+    if not is_authenticated() and not st.session_state.get("gcp_client_id"):
         st.stop()
 
     # --- Auth ----------------------------------------------------------------
@@ -754,7 +774,7 @@ def run() -> None:
     # --- Mode selector -------------------------------------------------------
     st.divider()
     mode_labels = [label for _, label in EXPORT_MODES]
-    mode_keys = [key for key, _ in EXPORT_MODES]
+    mode_keys   = [key   for key, _ in EXPORT_MODES]
 
     selected_label = st.selectbox(
         "Export mode",
