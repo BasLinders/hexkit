@@ -48,24 +48,6 @@ SCOPES = [
 ]
 
 
-def _get_client_config() -> dict:
-    """
-    Load OAuth client config from st.secrets.
-    Expected secrets.toml entry:
-        BQ_OAUTH_CLIENT_CONFIG = '{"web": {"client_id": "...", ...}}'
-    """
-    try:
-        raw = st.secrets["BQ_OAUTH_CLIENT_CONFIG"]
-        return json.loads(raw) if isinstance(raw, str) else dict(raw)
-    except (KeyError, AttributeError):
-        st.error(
-            "**Missing secret: `BQ_OAUTH_CLIENT_CONFIG`**\n\n"
-            "Add it in the Streamlit Cloud dashboard under *Settings → Secrets*.\n"
-            "Paste the full contents of your GCP `client_secret.json` as a JSON string."
-        )
-        st.stop()
-
-
 def _get_redirect_uri() -> str:
     """
     Read redirect URI from secrets so it can be changed per deployment
@@ -78,9 +60,22 @@ def _get_redirect_uri() -> str:
         return "https://hexkit.streamlit.app/"
 
 
-def get_auth_url() -> str:
+def _build_client_config(client_id: str, client_secret: str, redirect_uri: str) -> dict:
+    """Build a Flow-compatible client config dict from individual credentials."""
+    return {
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [redirect_uri],
+        }
+    }
+
+
+def get_auth_url(client_id: str, client_secret: str) -> str:
     """
-    Build the Google OAuth authorization URL.
+    Build the Google OAuth authorization URL using the provided credentials.
 
     PKCE note: google-auth-oauthlib >= 1.0 automatically generates a
     code_verifier and embeds the corresponding code_challenge in the URL.
@@ -88,8 +83,8 @@ def get_auth_url() -> str:
     reloads after the redirect. We recover it by encoding it into the
     state parameter — Google returns state unchanged in the callback.
     """
-    config = _get_client_config()
     redirect_uri = _get_redirect_uri()
+    config = _build_client_config(client_id, client_secret, redirect_uri)
     flow = Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
 
     auth_url, _ = flow.authorization_url(
@@ -111,14 +106,19 @@ def get_auth_url() -> str:
     return auth_url
 
 
-def exchange_code_for_credentials(code: str, state: str = "") -> Credentials:
+def exchange_code_for_credentials(
+    code: str,
+    state: str = "",
+    client_id: str = "",
+    client_secret: str = "",
+) -> Credentials:
     """
     Exchange an authorization code for credentials.
-    Reconstructs the Flow from secrets (no stored session state needed).
+    Reconstructs the Flow from the provided credentials (no stored session state needed).
     Recovers the PKCE code_verifier from the state parameter if present.
     """
-    config = _get_client_config()
     redirect_uri = _get_redirect_uri()
+    config = _build_client_config(client_id, client_secret, redirect_uri)
 
     # Decode PKCE verifier from state
     verifier: Optional[str] = None
