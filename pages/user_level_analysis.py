@@ -17,7 +17,7 @@ import streamlit as st
 import itertools
 
 st.set_page_config(
-    page_title="Continuous metric analysis",
+    page_title="User level analysis",
     page_icon="🔢",
     layout="wide",
 )
@@ -1033,7 +1033,7 @@ def _distribution_plot_frame(frame, kpi, unit):
 
 # Main Streamlit app
 def run():
-    st.title("Continuous Metric Analysis")
+    st.title("User Level Analysis")
     """
     This calculator lets you analyze revenue data or the amount of items of ecommerce transactions (or leads) for your online experiments. See the example CSV file for what you need to upload. 
     You're not limited to just A and B, but can add more labels when applicable (C, D, etc.).
