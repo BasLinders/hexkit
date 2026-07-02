@@ -2,11 +2,11 @@
 # 1. LIBRARIES
 # ============================================================================
 
-import json
-import base64
-
 from __future__ import annotations
 from typing import Literal, Optional, Union, cast
+
+import json
+import base64
 
 from bq_client import is_authenticated
 
