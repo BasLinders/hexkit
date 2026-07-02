@@ -730,30 +730,32 @@ def run() -> None:
         and st.session_state.get("gcp_client_secret")
     )
 
-    with st.expander("🔑 Enter credentials", expanded=not creds_set):
-        client_id = st.text_input(
-            "Client ID",
-            value=st.session_state.get("gcp_client_id", ""),
-            placeholder="123456789-abc...apps.googleusercontent.com",
-            key="gcp_client_id_input",
-        )
-        client_secret = st.text_input(
-            "Client secret",
-            value=st.session_state.get("gcp_client_secret", ""),
-            type="password",
-            key="gcp_client_secret_input",
-        )
-        if st.button("Save credentials"):
-            if client_id and client_secret:
-                st.session_state.gcp_client_id     = client_id
-                st.session_state.gcp_client_secret = client_secret
-                # Clear any existing token so a fresh OAuth flow is triggered
-                st.session_state.pop("bq_token", None)
-                st.rerun()
-            else:
-                st.warning("Both Client ID and Client secret are required.")
+    if is_authenticated():
+        st.success("✓ GCP credentials connected", icon="🔑")
+    else:
+        with st.expander("🔑 Enter credentials", expanded=True):
+            client_id = st.text_input(
+                "Client ID",
+                value=st.session_state.get("gcp_client_id", ""),
+                placeholder="123456789-abc...apps.googleusercontent.com",
+                key="gcp_client_id_input",
+            )
+            client_secret = st.text_input(
+                "Client secret",
+                value=st.session_state.get("gcp_client_secret", ""),
+                type="password",
+                key="gcp_client_secret_input",
+            )
+            if st.button("Save credentials"):
+                if client_id and client_secret:
+                    st.session_state.gcp_client_id     = client_id
+                    st.session_state.gcp_client_secret = client_secret
+                    st.session_state.pop("bq_token", None)
+                    st.rerun()
+                else:
+                    st.warning("Both Client ID and Client secret are required.")
 
-    if not is_authenticated() and not st.session_state.get("gcp_client_id"):
+    if not st.session_state.get("gcp_client_id"):
         st.stop()
 
     # --- Auth ----------------------------------------------------------------
