@@ -144,7 +144,6 @@ def render_documentation():
 # Preprocess data
 def preprocess_data(df):
     errors = []
-
     # Normalize column names: strip spaces & convert to lowercase
     df.columns = df.columns.str.strip().str.lower()
 
@@ -158,26 +157,18 @@ def preprocess_data(df):
         errors.append("Column 'experience_variant_label' is missing after preprocessing. Please check your CSV file.")
         return df, errors  # Prevent further processing
 
-    # Check for missing values
+    # Check for missing values in label
     if df['experience_variant_label'].isnull().any():
         errors.append("'experience_variant_label' contains null values.")
-    if 'total_item_quantity' in df and df['total_item_quantity'].isnull().any():
-        errors.append("'total_item_quantity' contains null values.")
-    if 'purchase_revenue' in df and df['purchase_revenue'].isnull().any():
-        errors.append("'purchase_revenue' contains null values.")
-    if 'profit' in df and df['profit'].isnull().any():
-        errors.append("'profit' contains null values.")
 
     # Ensure categorical variable
     df['experience_variant_label'] = pd.Categorical(df['experience_variant_label'])
 
-    # Convert to numeric
-    if 'total_item_quantity' in df:
-        df['total_item_quantity'] = pd.to_numeric(df['total_item_quantity'], errors='coerce')
-    if 'purchase_revenue' in df:
-        df['purchase_revenue'] = pd.to_numeric(df['purchase_revenue'], errors='coerce')
-    if 'profit' in df:
-        df['profit'] = pd.to_numeric(df['profit'], errors='coerce')
+    # Convert to numeric FIRST, then fill missing with 0
+    numeric_cols = ['total_item_quantity', 'purchase_revenue', 'profit']
+    for col in numeric_cols:
+        if col in df:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
     return df, errors
 
