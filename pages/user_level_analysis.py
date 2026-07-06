@@ -983,11 +983,16 @@ def perform_stat_tests_and_conclusions(
 
     st.write("---")
 
-@st.cache_data(show_spinner=False)
-def _read_csv_cached(file_contents):
-    """Cached raw CSV read (the expensive step). Preprocessing is run separately
-    in run() so the progress bar can report reading and cleaning as two phases."""
-    return pd.read_csv(file_contents)
+@st.cache_data(show_spinner=True)
+def _read_csv_cached(uploaded_file):
+    sample = uploaded_file.read(2048).decode('utf-8', errors='ignore')
+    uploaded_file.seek(0)
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=';,')
+        sep = dialect.delimiter
+    except csv.Error:
+        sep = ','  # fallback default
+    return pd.read_csv(uploaded_file, sep=sep)
 
 
 def _distribution_plot_frame(frame, kpi, unit):
