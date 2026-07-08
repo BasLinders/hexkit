@@ -1,8 +1,10 @@
+import logging
 import streamlit as st
 import altair as alt
 import pandas as pd
 import numpy as np
 import uuid
+from pydantic import ValidationError
 from scipy.stats import norm as scipy_norm
 from st_supabase_connection import SupabaseConnection
 from foe.bayesian.operations import BayesianEngine, get_lift_prior
@@ -11,11 +13,20 @@ from foe.core.models import BusinessCaseInput, ExperimentInput
 # --- CONSTANTS & CONFIGURATION ---
 st.set_page_config(page_title="Sequential Analysis", layout="wide")
 
+logger = logging.getLogger(__name__)
+
 TEST_TYPE_ONE_SAMPLE = "One-sample (fixed baseline)"
 TEST_TYPE_MULTI_SAMPLE = "Multi-sample (Control vs. Variants)"
 
 # Initialize Supabase Connection
 conn = st.connection("supabase", type=SupabaseConnection)
+
+# Session-state keys for the ad-hoc Revenue Impact overlay, reset whenever a
+# new or different experiment is loaded so settings never leak between them.
+REVENUE_SETTINGS_KEYS = (
+    "seq_aov", "seq_aov_cv", "seq_use_lift_prior",
+    "seq_expected_lift_pct", "seq_skepticism",
+)
 
 
 def is_valid_uuid(val):
@@ -25,6 +36,17 @@ def is_valid_uuid(val):
         return True
     except ValueError:
         return False
+
+
+def get_deduped_variant_df(df, variant_name):
+    """
+    Returns variant_name's rows collapsed to one row per date (last write
+    wins for duplicate dates). Shared by the LLR/decision-card path and the
+    Revenue Impact batch precompute so "what counts as latest" has exactly
+    one implementation.
+    """
+    variant_df = df[df["variant_name"] == variant_name].copy()
+    return variant_df.groupby("measurement_date").last().reset_index()
 
 
 # --- STATISTICAL FUNCTIONS ---
@@ -120,6 +142,49 @@ def calculate_instantaneous_power(n_var, p0, mde, alpha, n_ctrl=None):
 # to Multi-sample tests -- the engine has no concept of a fixed baseline CR.
 
 BUSINESS_PROJECTION_DAYS = 183  # ~6 months, matches the Business Case page
+
+
+@st.cache_data(ttl=60, show_spinner="Simulating revenue impact...")
+def _compute_revenue_impact(
+    batch_visitors, batch_conversions, batch_labels,
+    aov_value, aov_cv, runtime_days,
+    expected_lift_pct, skepticism,
+):
+    """
+    Runs the FOE BayesianEngine Monte Carlo simulation once per unique
+    combination of inputs (cached across Streamlit reruns triggered by
+    unrelated widgets). Takes hashable primitives only -- the lift prior is
+    rebuilt from its (expected_lift_pct, skepticism) inputs inside the cache
+    boundary rather than passed in as an object, so caching doesn't depend on
+    how the foe package's dataclass happens to hash.
+    """
+    lift_prior = get_lift_prior(expected_lift_pct=expected_lift_pct, skepticism=skepticism)
+    engine = BayesianEngine(seed=42)
+
+    experiment_input = ExperimentInput(
+        visitors=list(batch_visitors),
+        conversions=list(batch_conversions),
+        labels=list(batch_labels),
+    )
+    probability_results = engine.run_probability_analysis(experiment_input, lift_prior=lift_prior)
+    # index 0 (Control) is unused by run_monetary_projection.
+    prob_best_overall = [0.0] + [r.prob_being_best for r in probability_results]
+
+    biz_case = BusinessCaseInput(
+        aovs={label: aov_value for label in batch_labels},
+        runtime_days=runtime_days,
+        projection_period=BUSINESS_PROJECTION_DAYS,
+    )
+    monetary_results = engine.run_monetary_projection(
+        visitors=list(batch_visitors),
+        conversions=list(batch_conversions),
+        biz_case=biz_case,
+        prob_best_overall=prob_best_overall,
+        variant_labels=list(batch_labels),
+        lift_prior=lift_prior,
+        aov_cv=aov_cv,
+    )
+    return {r["variant_label"]: r for r in monetary_results}
 
 
 # --- DATABASE FUNCTIONS ---
@@ -401,9 +466,9 @@ def analysis_section(df, params):
                 ),
                 key="seq_skepticism",
             )
-            lift_prior = get_lift_prior(expected_lift_pct=expected_lift_pct, skepticism=skepticism)
         else:
-            lift_prior = get_lift_prior(expected_lift_pct=0.0, skepticism="uninformative")
+            expected_lift_pct = 0.0
+            skepticism = "uninformative"
 
     revenue_enabled = aov_value > 0 and test_type == TEST_TYPE_MULTI_SAMPLE
     if aov_value > 0 and test_type == TEST_TYPE_ONE_SAMPLE:
@@ -416,78 +481,75 @@ def analysis_section(df, params):
     # --- REVENUE IMPACT (batch, via the shared FOE BayesianEngine) ---
     # Computed once for every variant together (not per-variant) because the
     # engine's monetary projection and "probability of being best" are inherently
-    # multi-arm comparisons.
+    # multi-arm comparisons. revenue_unavailable_reason distinguishes *why* the
+    # per-variant fallback caption applies, so it never contradicts a real error
+    # shown above it.
     revenue_by_label = {}
+    revenue_unavailable_reason = None  # None | "no_traffic" | "misaligned_dates" | "error"
+
     if revenue_enabled and variants_to_test:
-        ctrl_df = df[df["variant_name"] == "Control"].copy()
-        ctrl_df = ctrl_df.groupby("measurement_date").last().reset_index()
+        ctrl_dedup = get_deduped_variant_df(df, "Control")
 
-        batch_labels = ["Control"] + variants_to_test
-        batch_visitors = []
-        batch_conversions = []
-        all_have_traffic = not ctrl_df.empty
+        if ctrl_dedup.empty:
+            revenue_unavailable_reason = "no_traffic"
+        else:
+            latest_shared_date = ctrl_dedup["measurement_date"].max()
+            ctrl_latest = ctrl_dedup[ctrl_dedup["measurement_date"] == latest_shared_date].iloc[-1]
 
-        if all_have_traffic:
-            batch_visitors.append(int(ctrl_df.iloc[-1]["visitors"]))
-            batch_conversions.append(int(ctrl_df.iloc[-1]["conversions"]))
-            all_have_traffic = batch_visitors[0] > 0
+            batch_labels = ["Control"] + variants_to_test
+            batch_visitors = [int(ctrl_latest["visitors"])]
+            batch_conversions = [int(ctrl_latest["conversions"])]
 
-        for v in variants_to_test:
-            v_df = df[df["variant_name"] == v].copy()
-            v_df = v_df.groupby("measurement_date").last().reset_index()
-            if v_df.empty:
-                all_have_traffic = False
-                break
-            vis = int(v_df.iloc[-1]["visitors"])
-            batch_visitors.append(vis)
-            batch_conversions.append(int(v_df.iloc[-1]["conversions"]))
-            if vis <= 0:
-                all_have_traffic = False
+            if batch_visitors[0] <= 0:
+                revenue_unavailable_reason = "no_traffic"
+            else:
+                for v in variants_to_test:
+                    v_dedup = get_deduped_variant_df(df, v)
+                    if v_dedup.empty:
+                        revenue_unavailable_reason = "no_traffic"
+                        break
+                    if v_dedup["measurement_date"].max() != latest_shared_date:
+                        # Same guarantee the main per-variant loop gets from its
+                        # pd.merge(..., on="measurement_date") below -- Control and
+                        # every variant must share their latest date before their
+                        # cumulative counts are combined into one revenue figure.
+                        revenue_unavailable_reason = "misaligned_dates"
+                        break
+                    v_latest = v_dedup.iloc[-1]
+                    vis = int(v_latest["visitors"])
+                    if vis <= 0:
+                        revenue_unavailable_reason = "no_traffic"
+                        break
+                    batch_visitors.append(vis)
+                    batch_conversions.append(int(v_latest["conversions"]))
 
-        if all_have_traffic:
+        if revenue_unavailable_reason is None:
             try:
                 overall_first = df["measurement_date"].min()
                 overall_last = df["measurement_date"].max()
                 runtime_days = max((overall_last - overall_first).days, 1)
 
-                engine = BayesianEngine(seed=42)
-                experiment_input = ExperimentInput(
-                    visitors=batch_visitors,
-                    conversions=batch_conversions,
-                    labels=batch_labels,
+                revenue_by_label = _compute_revenue_impact(
+                    tuple(batch_visitors), tuple(batch_conversions), tuple(batch_labels),
+                    aov_value, aov_cv, runtime_days,
+                    expected_lift_pct, skepticism,
                 )
-                probability_results = engine.run_probability_analysis(
-                    experiment_input, lift_prior=lift_prior,
+            except (ValidationError, ValueError) as e:
+                st.warning(f"Could not compute revenue impact — the current data doesn't fit the model: {e}")
+                revenue_unavailable_reason = "error"
+            except Exception:
+                logger.exception("Unexpected error computing revenue impact")
+                st.warning(
+                    "Could not compute revenue impact due to an unexpected error. "
+                    "This has been logged for investigation."
                 )
-                # index 0 (Control) is unused by run_monetary_projection.
-                prob_best_overall = [0.0] + [r.prob_being_best for r in probability_results]
-
-                biz_case = BusinessCaseInput(
-                    aovs={label: aov_value for label in batch_labels},
-                    runtime_days=runtime_days,
-                    projection_period=BUSINESS_PROJECTION_DAYS,
-                )
-                monetary_results = engine.run_monetary_projection(
-                    visitors=batch_visitors,
-                    conversions=batch_conversions,
-                    biz_case=biz_case,
-                    prob_best_overall=prob_best_overall,
-                    variant_labels=batch_labels,
-                    lift_prior=lift_prior,
-                    aov_cv=aov_cv,
-                )
-                revenue_by_label = {r["variant_label"]: r for r in monetary_results}
-            except Exception as e:
-                st.warning(f"Could not compute revenue impact: {e}")
+                revenue_unavailable_reason = "error"
 
     for variant in variants_to_test:
-        var_df = df[df["variant_name"] == variant].copy()
-        # Guard against duplicate dates
-        var_df = var_df.groupby("measurement_date").last().reset_index()
+        var_df = get_deduped_variant_df(df, variant)
 
         if test_type == TEST_TYPE_MULTI_SAMPLE:
-            ctrl_df = df[df["variant_name"] == "Control"].copy()
-            ctrl_df = ctrl_df.groupby("measurement_date").last().reset_index()
+            ctrl_df = get_deduped_variant_df(df, "Control")
 
             merged = pd.merge(
                 var_df, ctrl_df, on="measurement_date", suffixes=("_var", "_ctrl")
@@ -703,7 +765,12 @@ def analysis_section(df, params):
                     f"€{revenue_result['expected_total_contribution']:,.0f}",
                 )
                 rev_col2.metric("Expected Uplift", f"€{revenue_result['expected_uplift']:,.0f}")
-                rev_col3.metric("Expected Risk", f"€{-revenue_result['expected_risk']:,.0f}")
+                # expected_risk is always a non-negative magnitude (see
+                # BayesianEngine.run_monetary_projection) -- displayed as a plain
+                # positive figure, matching the "cost of waiting" caption below and
+                # the engine's own conclusion text, both of which use the word
+                # "risk"/"downside" to carry the negative connotation instead of a sign.
+                rev_col3.metric("Expected Risk", f"€{revenue_result['expected_risk']:,.0f}")
                 st.caption(revenue_result["conclusion"])
 
                 if est_days is not None:
@@ -720,10 +787,22 @@ def analysis_section(df, params):
                         f"outcome."
                     )
             elif revenue_enabled:
-                st.caption(
-                    "💡 Revenue Impact needs at least one visitor recorded for every variant "
-                    "(including Control) to compute a posterior."
-                )
+                if revenue_unavailable_reason == "misaligned_dates":
+                    st.caption(
+                        "💡 Revenue Impact is paused: Control and this variant's latest "
+                        "entries are on different dates. Add matching data points for both "
+                        "to re-enable it."
+                    )
+                elif revenue_unavailable_reason == "error":
+                    st.caption(
+                        "💡 Revenue Impact couldn't be computed this time — see the message "
+                        "above."
+                    )
+                else:
+                    st.caption(
+                        "💡 Revenue Impact needs at least one visitor recorded for every "
+                        "variant (including Control) to compute a posterior."
+                    )
 
     if chart_data:
         final_chart_df = pd.concat(chart_data)
@@ -855,6 +934,8 @@ def setup_sidebar(defaults, is_locked):
                 st.session_state["exp_id"] = str(uuid.uuid4())
                 st.session_state["params_locked"] = False
                 st.session_state["fetched_params"] = {}
+                for key in REVENUE_SETTINGS_KEYS:
+                    st.session_state.pop(key, None)
                 st.rerun()
 
             if st.session_state.get("exp_id"):
@@ -869,6 +950,8 @@ def setup_sidebar(defaults, is_locked):
                     if params:
                         st.session_state["fetched_params"] = params
                         st.session_state["params_locked"] = True
+                        for key in REVENUE_SETTINGS_KEYS:
+                            st.session_state.pop(key, None)
                         st.toast("Parameters loaded and locked!", icon="🔒")
                     else:
                         st.error("Experiment ID not found or no parameters set.")
