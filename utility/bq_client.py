@@ -418,7 +418,7 @@ def autodetect_variants(
     param_key: str,
     prefix: str,
 ) -> list[str]:
-    from sql_builder import build_autodetect_variants_query
+    from utility.sql_builder import build_autodetect_variants_query
     from datetime import datetime, timedelta
 
     # Use only the last day of the selected date range to minimise scan cost.
@@ -452,7 +452,7 @@ def autodetect_kpis(
     start_date: str,
     end_date: str,
 ) -> list[str]:
-    from sql_builder import build_autodetect_kpi_query
+    from utility.sql_builder import build_autodetect_kpi_query
     sql = build_autodetect_kpi_query(project, dataset, start_date, end_date)
     df = run_query(project, sql)
     return df["event_name"].tolist() if not df.empty else []
