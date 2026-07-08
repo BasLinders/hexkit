@@ -288,9 +288,12 @@ def get_frequentist_inputs():
     st.write("---")
     st.session_state.confidence_level = st.number_input(
         "In %, how confident do you want to be in the results?",
-        min_value=0, step=1,
+        min_value=1, max_value=99, step=1,
         value=st.session_state.get("confidence_level", 95),
-        help="Set the confidence level for which you want to test (enter 90, 95, etc)."
+        help="Set the confidence level for which you want to test (enter 90, 95, etc). "
+             "Must be strictly between 0 and 100 -- at 100% the interval always spans "
+             "the entire real line (unbounded in both directions), which is a degenerate, "
+             "not a stricter, result."
     )
     st.session_state.test_duration = st.number_input(
         "How many days has this test been running?",
@@ -1305,6 +1308,12 @@ def calculate_frequentist_statistics(
 ) -> Dict[str, Any]:
     if sum(visitor_counts) == 0 or any(v < 0 for v in visitor_counts):
         raise ValueError("Visitor counts must be positive and sum to a non-zero value.")
+    if not (0 < confidence_level < 100):
+        raise ValueError(
+            f"confidence_level must be strictly between 0 and 100 (got {confidence_level}). "
+            "At 0% or 100%, norm.ppf returns 0 or +inf, producing a degenerate "
+            "(zero-width or fully unbounded) confidence interval."
+        )
 
     num_variants = len(visitor_counts)
     alpha = 1 - (confidence_level / 100)
