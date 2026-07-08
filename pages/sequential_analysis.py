@@ -3,9 +3,10 @@ import altair as alt
 import pandas as pd
 import numpy as np
 import uuid
-from dataclasses import dataclass
 from scipy.stats import norm as scipy_norm
 from st_supabase_connection import SupabaseConnection
+from foe.bayesian.operations import BayesianEngine, get_lift_prior
+from foe.core.models import BusinessCaseInput, ExperimentInput
 
 # --- CONSTANTS & CONFIGURATION ---
 st.set_page_config(page_title="Sequential Analysis", layout="wide")
@@ -111,105 +112,14 @@ def calculate_instantaneous_power(n_var, p0, mde, alpha, n_ctrl=None):
 
 
 # --- BUSINESS IMPACT (BAYESIAN REVENUE OVERLAY) ---
-# Ad-hoc monetary lens on top of the locked mSPRT test, mirroring the Bayesian
-# business-case simulation in experiment_analysis.py (Beta posterior CR +
-# log-normal AOV + lift-plausibility weighting). It never feeds back into
-# alpha/beta/tau or the LLR decision itself.
-
-@dataclass(frozen=True)
-class LiftPrior:
-    mean_log_lift: float
-    std_log_lift: float
-
-
-_LIFT_PRIOR_STD = {
-    "skeptical": 0.10,
-    "moderate": 0.25,
-    "uninformative": 1.00,
-}
+# Ad-hoc monetary lens on top of the locked mSPRT test: delegates the Beta
+# posterior CR sampling, log-normal AOV sampling, lift-plausibility weighting,
+# and monetary projection to the shared FOE BayesianEngine (foe.bayesian.operations)
+# rather than re-implementing it here. Never feeds back into alpha/beta/tau or
+# the LLR decision itself. Requires a real Control group, so it only applies
+# to Multi-sample tests -- the engine has no concept of a fixed baseline CR.
 
 BUSINESS_PROJECTION_DAYS = 183  # ~6 months, matches the Business Case page
-
-
-def get_lift_prior(expected_lift_pct, skepticism):
-    if expected_lift_pct <= -100:
-        raise ValueError("expected_lift_pct must be greater than -100.")
-    return LiftPrior(
-        mean_log_lift=np.log1p(expected_lift_pct / 100.0),
-        std_log_lift=_LIFT_PRIOR_STD[skepticism],
-    )
-
-
-def compute_lift_weights(cr_samples_control, cr_samples_challenger, prior):
-    log_lift = np.log(cr_samples_challenger) - np.log(cr_samples_control)
-    log_w = scipy_norm.logpdf(log_lift, prior.mean_log_lift, prior.std_log_lift)
-    w = np.exp(log_w - log_w.max())
-    return w / w.sum()
-
-
-def sample_aov(mean_aov, cv, n_samples, rng):
-    if mean_aov <= 0:
-        return np.zeros(n_samples)
-    sigma2 = np.log1p(cv ** 2)
-    mu = np.log(mean_aov) - sigma2 / 2
-    return rng.lognormal(mean=mu, sigma=np.sqrt(sigma2), size=n_samples)
-
-
-def estimate_revenue_impact(
-    control_visitors, control_conversions,
-    variant_visitors, variant_conversions,
-    aov, aov_cv, days_elapsed, lift_prior,
-    fixed_control_cr=None,
-    n_simulations=20000, seed=42,
-):
-    """
-    Bayesian monetary overlay on the current cumulative counts.
-
-    One-sample tests have no measured control traffic, so the baseline is
-    treated as a fixed rate (fixed_control_cr) rather than a posterior --
-    consistent with how the LLR itself treats p0.
-    """
-    rng = np.random.default_rng(seed)
-
-    if fixed_control_cr is not None:
-        control_cr = np.full(n_simulations, fixed_control_cr)
-        control_daily_conv = control_cr * (variant_visitors / days_elapsed)
-    else:
-        control_cr = rng.beta(
-            1 + control_conversions, 1 + (control_visitors - control_conversions), size=n_simulations
-        )
-        control_daily_conv = control_cr * (control_visitors / days_elapsed)
-
-    variant_cr = rng.beta(
-        1 + variant_conversions, 1 + (variant_visitors - variant_conversions), size=n_simulations
-    )
-    variant_daily_conv = variant_cr * (variant_visitors / days_elapsed)
-
-    weights = compute_lift_weights(control_cr, variant_cr, lift_prior)
-    aov_samples = sample_aov(aov, aov_cv, n_simulations, rng)
-
-    diff = variant_daily_conv - control_daily_conv
-    positive_mask = diff > 0
-    negative_mask = diff < 0
-
-    prob_variant_better = np.average(positive_mask, weights=weights)
-    prob_control_better = np.average(negative_mask, weights=weights)
-
-    expected_daily_gain = (
-        np.average(diff * aov_samples, weights=weights * positive_mask)
-        if positive_mask.any() else 0.0
-    )
-    expected_daily_loss = (
-        np.average(diff * aov_samples, weights=weights * negative_mask)
-        if negative_mask.any() else 0.0
-    )
-
-    return {
-        "prob_variant_better": float(prob_variant_better),
-        "prob_control_better": float(prob_control_better),
-        "expected_daily_gain": float(expected_daily_gain),
-        "expected_daily_loss": float(expected_daily_loss),
-    }
 
 
 # --- DATABASE FUNCTIONS ---
@@ -495,7 +405,80 @@ def analysis_section(df, params):
         else:
             lift_prior = get_lift_prior(expected_lift_pct=0.0, skepticism="uninformative")
 
-    revenue_enabled = aov_value > 0
+    revenue_enabled = aov_value > 0 and test_type == TEST_TYPE_MULTI_SAMPLE
+    if aov_value > 0 and test_type == TEST_TYPE_ONE_SAMPLE:
+        st.caption(
+            "💡 Revenue Impact needs a real Control group with its own posterior, so it "
+            "isn't available for One-sample tests (the baseline here is a fixed historical "
+            "rate, not measured data)."
+        )
+
+    # --- REVENUE IMPACT (batch, via the shared FOE BayesianEngine) ---
+    # Computed once for every variant together (not per-variant) because the
+    # engine's monetary projection and "probability of being best" are inherently
+    # multi-arm comparisons.
+    revenue_by_label = {}
+    if revenue_enabled and variants_to_test:
+        ctrl_df = df[df["variant_name"] == "Control"].copy()
+        ctrl_df = ctrl_df.groupby("measurement_date").last().reset_index()
+
+        batch_labels = ["Control"] + variants_to_test
+        batch_visitors = []
+        batch_conversions = []
+        all_have_traffic = not ctrl_df.empty
+
+        if all_have_traffic:
+            batch_visitors.append(int(ctrl_df.iloc[-1]["visitors"]))
+            batch_conversions.append(int(ctrl_df.iloc[-1]["conversions"]))
+            all_have_traffic = batch_visitors[0] > 0
+
+        for v in variants_to_test:
+            v_df = df[df["variant_name"] == v].copy()
+            v_df = v_df.groupby("measurement_date").last().reset_index()
+            if v_df.empty:
+                all_have_traffic = False
+                break
+            vis = int(v_df.iloc[-1]["visitors"])
+            batch_visitors.append(vis)
+            batch_conversions.append(int(v_df.iloc[-1]["conversions"]))
+            if vis <= 0:
+                all_have_traffic = False
+
+        if all_have_traffic:
+            try:
+                overall_first = df["measurement_date"].min()
+                overall_last = df["measurement_date"].max()
+                runtime_days = max((overall_last - overall_first).days, 1)
+
+                engine = BayesianEngine(seed=42)
+                experiment_input = ExperimentInput(
+                    visitors=batch_visitors,
+                    conversions=batch_conversions,
+                    labels=batch_labels,
+                )
+                probability_results = engine.run_probability_analysis(
+                    experiment_input, lift_prior=lift_prior,
+                )
+                # index 0 (Control) is unused by run_monetary_projection.
+                prob_best_overall = [0.0] + [r.prob_being_best for r in probability_results]
+
+                biz_case = BusinessCaseInput(
+                    aovs={label: aov_value for label in batch_labels},
+                    runtime_days=runtime_days,
+                    projection_period=BUSINESS_PROJECTION_DAYS,
+                )
+                monetary_results = engine.run_monetary_projection(
+                    visitors=batch_visitors,
+                    conversions=batch_conversions,
+                    biz_case=biz_case,
+                    prob_best_overall=prob_best_overall,
+                    variant_labels=batch_labels,
+                    lift_prior=lift_prior,
+                    aov_cv=aov_cv,
+                )
+                revenue_by_label = {r["variant_label"]: r for r in monetary_results}
+            except Exception as e:
+                st.warning(f"Could not compute revenue impact: {e}")
 
     for variant in variants_to_test:
         var_df = df[df["variant_name"] == variant].copy()
@@ -708,59 +691,39 @@ def analysis_section(df, params):
                 else:
                     st.info("INCONCLUSIVE - Continue collecting data.")
 
-            # --- REVENUE IMPACT (Bayesian overlay) ---
-            if revenue_enabled:
+            # --- REVENUE IMPACT (via the shared FOE BayesianEngine) ---
+            revenue_result = revenue_by_label.get(variant)
+            if revenue_enabled and revenue_result is not None:
                 st.divider()
                 st.markdown("##### 💰 Revenue Impact")
 
-                if test_type == TEST_TYPE_MULTI_SAMPLE:
-                    impact = estimate_revenue_impact(
-                        control_visitors=base_vis,
-                        control_conversions=merged.iloc[-1]["conversions_ctrl"],
-                        variant_visitors=latest_vis,
-                        variant_conversions=latest_conv,
-                        aov=aov_value, aov_cv=aov_cv,
-                        days_elapsed=days_elapsed, lift_prior=lift_prior,
-                    )
-                else:
-                    impact = estimate_revenue_impact(
-                        control_visitors=None, control_conversions=None,
-                        variant_visitors=latest_vis, variant_conversions=latest_conv,
-                        aov=aov_value, aov_cv=aov_cv,
-                        days_elapsed=days_elapsed, lift_prior=lift_prior,
-                        fixed_control_cr=base_cr,
-                    )
-
-                stop_now_uplift = (
-                    impact["expected_daily_gain"] * BUSINESS_PROJECTION_DAYS * impact["prob_variant_better"]
-                )
-                stop_now_risk = (
-                    impact["expected_daily_loss"] * BUSINESS_PROJECTION_DAYS * impact["prob_control_better"]
-                )
-                stop_now_total = stop_now_uplift + stop_now_risk
-
                 rev_col1, rev_col2, rev_col3 = st.columns(3)
                 rev_col1.metric(
-                    f"Value if you stop now ({BUSINESS_PROJECTION_DAYS}d)", f"€{stop_now_total:,.0f}"
+                    f"Value if you stop now ({BUSINESS_PROJECTION_DAYS}d)",
+                    f"€{revenue_result['expected_total_contribution']:,.0f}",
                 )
-                rev_col2.metric("Expected Uplift", f"€{stop_now_uplift:,.0f}")
-                rev_col3.metric("Expected Risk", f"€{stop_now_risk:,.0f}")
-                st.caption(
-                    "Bayesian projection: current posterior CR × log-normal AOV, weighted by your "
-                    "lift-plausibility prior, extrapolated over a 6-month horizon at the observed "
-                    "daily traffic rate. Directional, not a guarantee — same logic as the Business "
-                    "Case page."
-                )
+                rev_col2.metric("Expected Uplift", f"€{revenue_result['expected_uplift']:,.0f}")
+                rev_col3.metric("Expected Risk", f"€{-revenue_result['expected_risk']:,.0f}")
+                st.caption(revenue_result["conclusion"])
 
                 if est_days is not None:
-                    waiting_gain = impact["expected_daily_gain"] * est_days
-                    waiting_risk = impact["expected_daily_loss"] * est_days
+                    # expected_uplift/risk scale linearly with the projection period, so
+                    # rescaling by est_days/BUSINESS_PROJECTION_DAYS recovers the same
+                    # per-day rate the engine used, without re-simulating.
+                    scale = est_days / BUSINESS_PROJECTION_DAYS
+                    waiting_gain = revenue_result["expected_uplift"] * scale
+                    waiting_risk = revenue_result["expected_risk"] * scale
                     st.info(
                         f"⏳ **Cost of waiting:** continuing for the estimated **{est_days:.1f} more "
                         f"days** to reach a decision puts roughly **€{waiting_gain:,.0f} of upside** "
                         f"and **€{waiting_risk:,.0f} of downside** on the table before you know the "
                         f"outcome."
                     )
+            elif revenue_enabled:
+                st.caption(
+                    "💡 Revenue Impact needs at least one visitor recorded for every variant "
+                    "(including Control) to compute a posterior."
+                )
 
     if chart_data:
         final_chart_df = pd.concat(chart_data)
