@@ -319,6 +319,18 @@ def get_frequentist_inputs():
             value=st.session_state.aovs[i] if st.session_state.aovs[i] is not None else 0.0,
             key=f"f_aov_{i}",
         )
+    st.session_state.aov_cv = st.slider(
+        "AOV Variability (CV)",
+        min_value=0.0, max_value=2.0, step=0.1,
+        value=st.session_state.get("aov_cv", 0.5),
+        help="AOV above is a point estimate, not a known constant -- it has its own sampling "
+             "uncertainty. Set this to the coefficient of variation of order value (std / mean; "
+             "0.5 is a common e-commerce assumption) so that uncertainty is propagated into the "
+             "confidence range too, not just the conversion-rate uncertainty. Leave at 0 only if "
+             "your AOVs are truly known, fixed constants (e.g. a deliberate price difference), "
+             "not estimates from order data -- otherwise the range will look more confident than "
+             "the data supports, especially when AOV differs by variant."
+    )
 
     st.write("---")
     st.write("### Overdispersion Correction (Optional)")
@@ -1658,6 +1670,7 @@ def display_frequentist_summary(
     prior=0.5,
     test_duration=None,
     aovs=None,
+    aov_cv=0.0,
 ):
     if not results:
         st.error("Calculation results are missing, cannot display summary.")
@@ -1836,13 +1849,25 @@ def display_frequentist_summary(
                     "\\text{projection days}$$\n\n"
                     "The confidence range reflects the same tail (Greater/Less/Two-sided) as "
                     "the statistical result above, propagated through both variants' "
-                    "conversion-rate uncertainty — it never claims more than the data "
-                    "licenses. On a non-significant result, the range spans zero (or is "
-                    "otherwise inconclusive) and should be read as illustrative, not a "
-                    "business case to act on."
+                    "conversion-rate uncertainty **and**, if an AOV Variability (CV) is set, "
+                    "each AOV's own sampling uncertainty too — since AOV is itself normally an "
+                    "estimate, not a known constant. Skipping that (CV=0) can make the range "
+                    "look confidently positive purely from a 'certain' AOV gap, even when the "
+                    "underlying conversion-rate difference alone is nowhere near significant. "
+                    "On a non-significant result, the range spans zero (or is otherwise "
+                    "inconclusive) and should be read as illustrative, not a business case to "
+                    "act on."
                 )
 
             daily_visitors = sum(visitor_counts) / test_duration
+            se_aov_ctrl = (
+                (aov_ctrl * aov_cv) / math.sqrt(conversion_counts[0])
+                if aov_cv > 0 and conversion_counts[0] > 0 else 0.0
+            )
+            se_aov_chal = (
+                (aov_chal * aov_cv) / math.sqrt(conversion_counts[i])
+                if aov_cv > 0 and conversion_counts[i] > 0 else 0.0
+            )
             monetary = FrequentistEngine.estimate_monetary_impact_per_variant(
                 p_ctrl=conversion_rates[0],
                 se_ctrl=results['standard_errors'][0],
@@ -1853,6 +1878,8 @@ def display_frequentist_summary(
                 daily_visitors=daily_visitors,
                 alpha=results['sidak_alpha'],
                 alternative=_TAIL_TO_ALTERNATIVE[tail],
+                se_aov_ctrl=se_aov_ctrl,
+                se_aov_chal=se_aov_chal,
             )
 
             def _fmt_money(x):
@@ -2041,6 +2068,7 @@ def run():
                             prior=prior,
                             test_duration=test_duration,
                             aovs=aovs,
+                            aov_cv=st.session_state.get("aov_cv", 0.0),
                         )
 
                 except Exception as e:
