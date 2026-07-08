@@ -22,3 +22,7 @@ prophet
 plotly
 patsy
 db-dtypes
+pydantic>=2.0.0
+# TODO: point back to @main once first-order-engine PR #5 (estimate_monetary_impact /
+# generate_monetary_conclusion on FrequentistEngine) merges.
+foe @ git+https://github.com/BasLinders/first-order-engine.git@frequentist-monetary-impact
