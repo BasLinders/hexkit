@@ -19,6 +19,8 @@ import math
 from dataclasses import dataclass
 from typing import Literal, List, Tuple, Dict, Any, Optional, cast
 
+from foe.frequentist.operations import FrequentistEngine
+
 
 st.set_page_config(
     page_title="Experiment Analysis",
@@ -36,6 +38,7 @@ def initialize_session_state():
     st.session_state.setdefault("aov_cv", 0.5)
     st.session_state.setdefault("confidence_level", 95)
     st.session_state.setdefault("test_duration", 7)
+    st.session_state.setdefault("freq_aov", 0.0)
     st.session_state.setdefault("tail", "Greater")
     st.session_state.setdefault("probability_winner", 80.0)
     st.session_state.setdefault("runtime_days", 0)
@@ -286,7 +289,19 @@ def get_frequentist_inputs():
         "How many days has this test been running?",
         min_value=1,
         value=st.session_state.get("test_duration", 7),
-        help="Enter the number of days the experiment has been running. Used to estimate potential time savings from variance adjustment."
+        help="Enter the number of days the experiment has been running. Used to estimate potential time savings from variance adjustment, and to project daily traffic for the business case below."
+    )
+
+    st.write("---")
+    st.write("### Business Case (Optional)")
+    st.session_state.freq_aov = st.number_input(
+        "Average Order Value (€)",
+        min_value=0.0, step=0.01,
+        value=st.session_state.get("freq_aov", 0.0),
+        help="Leave at 0 to skip the monetary translation. Unlike the Bayesian business case, this "
+             "is a deterministic scaling of the observed effect and its confidence interval -- no "
+             "simulation, no probability of being best -- so the range never claims more than the "
+             "confidence interval itself licenses."
     )
 
     st.write("---")
@@ -358,7 +373,8 @@ def get_frequentist_inputs():
         reduction_factor,
         st.session_state.test_duration,
         sensitivity_mode,
-        custom_prior
+        custom_prior,
+        st.session_state.freq_aov,
     )
 
 
@@ -1610,7 +1626,9 @@ def display_frequentist_summary(
     visitor_counts,
     conversion_counts,
     reduction_factor=1.0,
-    prior=0.5
+    prior=0.5,
+    test_duration=None,
+    aov=0.0,
 ):
     if not results:
         st.error("Calculation results are missing, cannot display summary.")
@@ -1768,6 +1786,49 @@ def display_frequentist_summary(
             else:
                 st.success(fndr_success)
 
+        if aov > 0 and test_duration:
+            st.write("#### Business Case")
+            with st.expander("How is this calculated?"):
+                st.markdown(
+                    "Unlike the Bayesian business case, this is **deterministic** — no "
+                    "simulation, no probability of being best. The observed conversion-rate "
+                    "difference and its confidence interval are scaled directly by expected "
+                    "daily traffic (total visitors across all variants ÷ test duration) and "
+                    "your Average Order Value:\n\n"
+                    "$$\\text{Impact} = \\text{diff} \\times \\text{daily visitors} "
+                    "\\times \\text{AOV} \\times \\text{projection days}$$\n\n"
+                    "The range shown is the same confidence interval as the statistical "
+                    "result above, just converted to money — it never claims more than the "
+                    "CI itself licenses. On a non-significant result, the range spans zero "
+                    "and should be read as illustrative, not a business case to act on."
+                )
+
+            daily_visitors = sum(visitor_counts) / test_duration
+            monetary = FrequentistEngine.estimate_monetary_impact(
+                diff=observed_diff,
+                ci_diff=ci_difference,
+                daily_visitors=daily_visitors,
+                aov=aov,
+            )
+
+            def _fmt_money(x):
+                return "Unbounded" if math.isinf(x) else f"€{x:,.0f}"
+
+            bc_col1, bc_col2 = st.columns(2)
+            bc_col1.metric(
+                f"Projected Impact ({monetary['projection_period']}d)",
+                _fmt_money(monetary["point_estimate"]),
+            )
+            bc_col2.metric(
+                "Confidence Range",
+                f"{_fmt_money(monetary['ci_low'])} to {_fmt_money(monetary['ci_high'])}",
+            )
+            st.caption(
+                FrequentistEngine.generate_monetary_conclusion(
+                    alphabet[i], monetary, is_significant[challenger_index_in_lists]
+                )
+            )
+
 
 # Main logic
 
@@ -1853,7 +1914,8 @@ def run():
             reduction_factor,
             test_duration,
             sensitivity_mode,
-            custom_prior
+            custom_prior,
+            freq_aov,
         ) = get_frequentist_inputs()
         st.write("---")
         st.session_state.tail = st.radio(
@@ -1929,6 +1991,8 @@ def run():
                             conversion_counts,
                             reduction_factor=reduction_factor,
                             prior=prior,
+                            test_duration=test_duration,
+                            aov=freq_aov,
                         )
 
                 except Exception as e:
