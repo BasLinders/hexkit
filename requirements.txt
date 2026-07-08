@@ -23,4 +23,6 @@ plotly
 patsy
 db-dtypes
 pydantic>=2.0.0
+# TODO: point back to @main once first-order-engine PR #6
+# (estimate_monetary_impact_per_variant) merges.
 foe @ git+https://github.com/BasLinders/first-order-engine.git@main

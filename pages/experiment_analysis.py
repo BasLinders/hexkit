@@ -20,6 +20,14 @@ from dataclasses import dataclass
 from typing import Literal, List, Tuple, Dict, Any, Optional, cast
 
 from foe.frequentist.operations import FrequentistEngine
+from foe.frequentist.confidence import compute_interval_difference
+from foe.core.models import AlternativeHypothesis
+
+_TAIL_TO_ALTERNATIVE = {
+    "Greater": AlternativeHypothesis.GREATER,
+    "Less": AlternativeHypothesis.LESS,
+    "Two-sided": AlternativeHypothesis.TWO_SIDED,
+}
 
 
 st.set_page_config(
@@ -38,7 +46,6 @@ def initialize_session_state():
     st.session_state.setdefault("aov_cv", 0.5)
     st.session_state.setdefault("confidence_level", 95)
     st.session_state.setdefault("test_duration", 7)
-    st.session_state.setdefault("freq_aov", 0.0)
     st.session_state.setdefault("tail", "Greater")
     st.session_state.setdefault("probability_winner", 80.0)
     st.session_state.setdefault("runtime_days", 0)
@@ -294,15 +301,21 @@ def get_frequentist_inputs():
 
     st.write("---")
     st.write("### Business Case (Optional)")
-    st.session_state.freq_aov = st.number_input(
-        "Average Order Value (€)",
-        min_value=0.0, step=0.01,
-        value=st.session_state.get("freq_aov", 0.0),
-        help="Leave at 0 to skip the monetary translation. Unlike the Bayesian business case, this "
-             "is a deterministic scaling of the observed effect and its confidence interval -- no "
-             "simulation, no probability of being best -- so the range never claims more than the "
-             "confidence interval itself licenses."
+    st.caption(
+        "Leave every AOV at 0 to skip the monetary translation. Unlike the Bayesian business "
+        "case, this is a deterministic scaling of each variant's own conversion rate and "
+        "standard error -- no simulation, no probability of being best -- so the range never "
+        "claims more than the confidence interval itself licenses. AOV is entered per variant "
+        "because it may legitimately differ (e.g. a pricing or merchandising test); if your "
+        "test doesn't change what a conversion is worth, just enter the same value everywhere."
     )
+    for i in range(num_variants):
+        st.session_state.aovs[i] = st.number_input(
+            f"Average Order Value for Variant {alphabet[i]} (€)",
+            min_value=0.0, step=0.01,
+            value=st.session_state.aovs[i] if st.session_state.aovs[i] is not None else 0.0,
+            key=f"f_aov_{i}",
+        )
 
     st.write("---")
     st.write("### Overdispersion Correction (Optional)")
@@ -374,7 +387,7 @@ def get_frequentist_inputs():
         st.session_state.test_duration,
         sensitivity_mode,
         custom_prior,
-        st.session_state.freq_aov,
+        st.session_state.aovs,
     )
 
 
@@ -1305,11 +1318,10 @@ def calculate_frequentist_statistics(
         for cr, v in zip(conversion_rates, visitor_counts)
     ]
 
-    # Keep a nominal critical value for the marginal per-variant CIs,
-    # AND a family-wise critical value for the difference CIs so the CI agrees
-    # with the (Šidák-corrected) significance verdict at 3+ variants.
+    # Marginal per-variant CIs stay two-sided regardless of tail -- a
+    # variant's own conversion rate has no directional hypothesis of its
+    # own; only the CONTROL-VS-CHALLENGER comparison does.
     z_critical = norm.ppf(1 - (alpha / 2))
-    z_critical_family = norm.ppf(1 - (sidak_alpha / 2))
 
     margins_of_error = [z_critical * se for se in standard_errors]
     confidence_intervals = [
@@ -1322,12 +1334,20 @@ def calculate_frequentist_statistics(
     lowest_interval = min(lower_boundaries)
     highest_interval = max(upper_boundaries)
 
+    # The DIFFERENCE CI, by contrast, must reflect the selected tail: a
+    # one-sided Greater/Less test licenses only a lower/upper bound (the
+    # other side is +/-inf), matching the one-sided p-value computed below.
+    # Delegates to foe's compute_interval_difference (used by
+    # FrequentistEngine.run_synthesis) rather than re-deriving it, so this
+    # app's own CI and the shared engine's stay in lockstep.
+    alternative = _TAIL_TO_ALTERNATIVE[tail]
     confidence_intervals_diff = []
     for i in range(1, num_variants):
         diff_cr = conversion_rates[i] - conversion_rates[0]
         se_diff = np.sqrt(standard_errors[i] ** 2 + standard_errors[0] ** 2)
-        moe_diff = z_critical_family * se_diff  # Family-wise width.
-        ci_diff = (diff_cr - moe_diff, diff_cr + moe_diff)
+        # Family-wise alpha (Šidák-corrected at 3+ variants) so the CI agrees
+        # with the significance verdict below.
+        ci_diff = compute_interval_difference(diff_cr, se_diff, alpha=sidak_alpha, alternative=alternative)
         confidence_intervals_diff.append(ci_diff)
 
     observed = np.array(visitor_counts)
@@ -1628,7 +1648,7 @@ def display_frequentist_summary(
     reduction_factor=1.0,
     prior=0.5,
     test_duration=None,
-    aov=0.0,
+    aovs=None,
 ):
     if not results:
         st.error("Calculation results are missing, cannot display summary.")
@@ -1696,9 +1716,12 @@ def display_frequentist_summary(
                 help=f"The {results['confidence_level']}% confidence interval is [{challenger_ci[0]*100:.2f}% - {challenger_ci[1]*100:.2f}%]"
             )
         with col3:
+            def _fmt_pct_bound(x):
+                return "unbounded" if math.isinf(x) else f"{x*100:+.2f}%"
+
             ci_help = (
                 f"The confidence interval for the uplift is from "
-                f"{ci_difference[0]*100:+.2f}% to {ci_difference[1]*100:+.2f}%."
+                f"{_fmt_pct_bound(ci_difference[0])} to {_fmt_pct_bound(ci_difference[1])}."
             )
             if num_variants >= 3:
                 ci_help += " (Šidák family-wise level.)"
@@ -1786,29 +1809,41 @@ def display_frequentist_summary(
             else:
                 st.success(fndr_success)
 
-        if aov > 0 and test_duration:
+        aov_ctrl = aovs[0] if aovs and len(aovs) > 0 and aovs[0] is not None else 0.0
+        aov_chal = aovs[i] if aovs and len(aovs) > i and aovs[i] is not None else 0.0
+
+        if test_duration and (aov_ctrl > 0 or aov_chal > 0):
             st.write("#### Business Case")
             with st.expander("How is this calculated?"):
                 st.markdown(
                     "Unlike the Bayesian business case, this is **deterministic** — no "
-                    "simulation, no probability of being best. The observed conversion-rate "
-                    "difference and its confidence interval are scaled directly by expected "
-                    "daily traffic (total visitors across all variants ÷ test duration) and "
-                    "your Average Order Value:\n\n"
-                    "$$\\text{Impact} = \\text{diff} \\times \\text{daily visitors} "
-                    "\\times \\text{AOV} \\times \\text{projection days}$$\n\n"
-                    "The range shown is the same confidence interval as the statistical "
-                    "result above, just converted to money — it never claims more than the "
-                    "CI itself licenses. On a non-significant result, the range spans zero "
-                    "and should be read as illustrative, not a business case to act on."
+                    "simulation, no probability of being best. Each variant's own conversion "
+                    "rate and standard error are combined into a value-weighted difference "
+                    "(Control and Challenger may carry different AOVs), scaled by expected "
+                    "daily traffic (total visitors across all variants ÷ test duration):\n\n"
+                    "$$X = p_{\\text{challenger}} \\times \\text{AOV}_{\\text{challenger}} - "
+                    "p_{\\text{control}} \\times \\text{AOV}_{\\text{control}}$$\n\n"
+                    "$$\\text{Impact} = X \\times \\text{daily visitors} \\times "
+                    "\\text{projection days}$$\n\n"
+                    "The confidence range reflects the same tail (Greater/Less/Two-sided) as "
+                    "the statistical result above, propagated through both variants' "
+                    "conversion-rate uncertainty — it never claims more than the data "
+                    "licenses. On a non-significant result, the range spans zero (or is "
+                    "otherwise inconclusive) and should be read as illustrative, not a "
+                    "business case to act on."
                 )
 
             daily_visitors = sum(visitor_counts) / test_duration
-            monetary = FrequentistEngine.estimate_monetary_impact(
-                diff=observed_diff,
-                ci_diff=ci_difference,
+            monetary = FrequentistEngine.estimate_monetary_impact_per_variant(
+                p_ctrl=conversion_rates[0],
+                se_ctrl=results['standard_errors'][0],
+                aov_ctrl=aov_ctrl,
+                p_chal=conversion_rates[i],
+                se_chal=results['standard_errors'][i],
+                aov_chal=aov_chal,
                 daily_visitors=daily_visitors,
-                aov=aov,
+                alpha=results['sidak_alpha'],
+                alternative=_TAIL_TO_ALTERNATIVE[tail],
             )
 
             def _fmt_money(x):
@@ -1823,6 +1858,10 @@ def display_frequentist_summary(
                 "Confidence Range",
                 f"{_fmt_money(monetary['ci_low'])} to {_fmt_money(monetary['ci_high'])}",
             )
+            if aov_ctrl != aov_chal:
+                st.caption(
+                    f"AOV used: €{aov_ctrl:,.2f} (Control) vs €{aov_chal:,.2f} ({alphabet[i]})."
+                )
             st.caption(
                 FrequentistEngine.generate_monetary_conclusion(
                     alphabet[i], monetary, is_significant[challenger_index_in_lists]
@@ -1915,7 +1954,7 @@ def run():
             test_duration,
             sensitivity_mode,
             custom_prior,
-            freq_aov,
+            aovs,
         ) = get_frequentist_inputs()
         st.write("---")
         st.session_state.tail = st.radio(
@@ -1992,7 +2031,7 @@ def run():
                             reduction_factor=reduction_factor,
                             prior=prior,
                             test_duration=test_duration,
-                            aov=freq_aov,
+                            aovs=aovs,
                         )
 
                 except Exception as e:
