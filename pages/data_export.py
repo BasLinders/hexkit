@@ -8,11 +8,11 @@ from typing import Literal, Optional, Union, cast
 import json
 import base64
 
-from bq_client import is_authenticated
+from utility.bq_client import is_authenticated
 
 import streamlit as st
 
-from bq_client import (
+from utility.bq_client import (
     dry_run,
     get_monthly_usage,
     run_query,
@@ -22,7 +22,7 @@ from bq_client import (
     autodetect_variants,
     autodetect_kpis,
 )
-from bq_ui_components import (
+from utility.bq_ui_components import (
     render_auth_panel,
     render_connection_selectors,
     render_date_range,
@@ -31,7 +31,7 @@ from bq_ui_components import (
     render_sql_viewer,
     render_export_options,
 )
-from sql_builder import (
+from utility.sql_builder import (
     BaselineParams,
     BinomialParams,
     ContinuousParams,
