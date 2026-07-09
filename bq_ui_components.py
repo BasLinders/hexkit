@@ -4,34 +4,104 @@ Reusable Streamlit UI blocks shared across all export modes.
 """
 from __future__ import annotations
 from typing import Literal, Optional, cast
+import base64
+import json
 import streamlit as st
 from bq_client import (
     is_authenticated, get_auth_url, exchange_code_for_credentials,
-    sign_out, list_projects, list_datasets, dry_run, run_preview,
-    run_query, df_to_csv_bytes, export_to_sheets, autodetect_variants,
-    autodetect_kpis
+    get_redirect_uri, sign_out, list_projects, list_datasets, dry_run,
+    run_preview, run_query, df_to_csv_bytes, export_to_sheets,
+    autodetect_variants, autodetect_kpis
 )
 from sql_builder import VariantPair, ExperimentConfig
+
+
+# ---------------------------------------------------------------------------
+# GCP credentials gate
+# ---------------------------------------------------------------------------
+
+def render_gcp_credentials_gate(page_path: str = "") -> bool:
+    """
+    Renders the GCP OAuth client id/secret entry (skipped once already set)
+    and the Google sign-in panel. Handles the OAuth callback itself, restoring
+    the client id/secret from the encoded `state` param since session state
+    does not survive the redirect on Streamlit Cloud.
+
+    `page_path` identifies the calling page (e.g. "data_export", "automation")
+    so the sign-in flow round-trips through that page's own redirect URI
+    instead of a single shared one.
+
+    Returns True once the session is fully authenticated and ready to proceed.
+    Callers should `st.stop()` when this returns False.
+    """
+    params = st.query_params
+    if "code" in params and not is_authenticated():
+        try:
+            state = params.get("state", "")
+            if state:
+                padding = 4 - len(state) % 4
+                padded = state + ("=" * (padding % 4))
+                state_data = json.loads(base64.urlsafe_b64decode(padded).decode())
+                st.session_state.gcp_client_id     = state_data.get("client_id", "")
+                st.session_state.gcp_client_secret = state_data.get("client_secret", "")
+            exchange_code_for_credentials(params["code"], state)
+            st.query_params.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"Authentication failed: {e}")
+
+    st.subheader("GCP credentials")
+
+    if is_authenticated():
+        st.success("✓ GCP credentials connected", icon="🔑")
+    else:
+        st.caption(
+            "Enter your own GCP OAuth client credentials. "
+            "Create one at [console.cloud.google.com](https://console.cloud.google.com) under "
+            "APIs & Services → Credentials → OAuth 2.0 Client IDs. "
+            f"Add `{get_redirect_uri(page_path)}` as an authorised redirect URI."
+        )
+        with st.expander("🔑 Enter credentials", expanded=True):
+            client_id = st.text_input(
+                "Client ID",
+                value=st.session_state.get("gcp_client_id", ""),
+                placeholder="123456789-abc...apps.googleusercontent.com",
+                key="gcp_client_id_input",
+            )
+            client_secret = st.text_input(
+                "Client secret",
+                value=st.session_state.get("gcp_client_secret", ""),
+                type="password",
+                key="gcp_client_secret_input",
+            )
+            if st.button("Save credentials", key="gcp_creds_save_btn"):
+                if client_id and client_secret:
+                    st.session_state.gcp_client_id     = client_id
+                    st.session_state.gcp_client_secret = client_secret
+                    st.session_state.pop("bq_token", None)
+                    st.rerun()
+                else:
+                    st.warning("Both Client ID and Client secret are required.")
+
+    if not st.session_state.get("gcp_client_id"):
+        return False
+
+    st.divider()
+    return render_auth_panel(page_path)
 
 
 # ---------------------------------------------------------------------------
 # Auth panel
 # ---------------------------------------------------------------------------
 
-def render_auth_panel() -> bool:
-    """Renders sign-in/sign-out. Returns True if authenticated."""
+def render_auth_panel(page_path: str = "") -> bool:
+    """
+    Renders sign-in/sign-out. Returns True if authenticated.
+    The OAuth callback itself is handled by render_gcp_credentials_gate()
+    before this is called — this only renders the button/status.
+    """
     client_id     = st.session_state.get("gcp_client_id", "")
     client_secret = st.session_state.get("gcp_client_secret", "")
-
-    params = st.query_params
-    if "code" in params and not is_authenticated():
-        try:
-            state = params.get("state", "")
-            exchange_code_for_credentials(params["code"], state, client_id, client_secret)
-            st.query_params.clear()
-            st.rerun()
-        except Exception as e:
-            st.error(f"Authentication failed: {e}")
 
     if is_authenticated():
         col1, col2 = st.columns([4, 1])
@@ -48,7 +118,7 @@ def render_auth_panel() -> bool:
             "You'll be taken to Google in a new tab — after signing in, "
             "continue in that tab."
         )
-        auth_url = get_auth_url(client_id, client_secret)
+        auth_url = get_auth_url(client_id, client_secret, page_path)
         st.link_button(
             "🔐 Sign in with Google",
             auth_url,

@@ -5,11 +5,6 @@
 from __future__ import annotations
 from typing import Literal, Optional, Union, cast
 
-import json
-import base64
-
-from bq_client import is_authenticated
-
 import streamlit as st
 
 from bq_client import (
@@ -23,7 +18,7 @@ from bq_client import (
     autodetect_kpis,
 )
 from bq_ui_components import (
-    render_auth_panel,
+    render_gcp_credentials_gate,
     render_connection_selectors,
     render_date_range,
     render_variant_inputs,
@@ -698,68 +693,9 @@ def run() -> None:
     st.title("Data export")
     st.caption("Export BigQuery experiment data for statistical analysis.")
 
-    # --- Handle OAuth callback FIRST, before any gate ------------------------
-    params = st.query_params
-    if "code" in params and not is_authenticated():
-        try:
-            state = params.get("state", "")
-            if state:
-                padding = 4 - len(state) % 4
-                padded = state + ("=" * (padding % 4))
-                state_data = json.loads(base64.urlsafe_b64decode(padded).decode())
-                st.session_state.gcp_client_id     = state_data.get("client_id", "")
-                st.session_state.gcp_client_secret = state_data.get("client_secret", "")
-            exchange_code_for_credentials(params["code"], state)
-            st.query_params.clear()
-            st.rerun()
-        except Exception as e:
-            st.error(f"Authentication failed: {e}")
-
-    # --- GCP credentials -----------------------------------------------------
+    # --- GCP credentials + Google sign-in -------------------------------------
     st.divider()
-    st.subheader("GCP credentials")
-    st.caption(
-        "Enter your own GCP OAuth client credentials. "
-        "Create one at [console.cloud.google.com](https://console.cloud.google.com) under "
-        "APIs & Services → Credentials → OAuth 2.0 Client IDs. "
-        "Add `https://hexkit.streamlit.app/data_export` as an authorised redirect URI."
-    )
-
-    creds_set = is_authenticated() or (
-        st.session_state.get("gcp_client_id")
-        and st.session_state.get("gcp_client_secret")
-    )
-
-    if is_authenticated():
-        st.success("✓ GCP credentials connected", icon="🔑")
-    else:
-        with st.expander("🔑 Enter credentials", expanded=True):
-            client_id = st.text_input(
-                "Client ID",
-                value=st.session_state.get("gcp_client_id", ""),
-                placeholder="123456789-abc...apps.googleusercontent.com",
-                key="gcp_client_id_input",
-            )
-            client_secret = st.text_input(
-                "Client secret",
-                value=st.session_state.get("gcp_client_secret", ""),
-                type="password",
-                key="gcp_client_secret_input",
-            )
-            if st.button("Save credentials"):
-                if client_id and client_secret:
-                    st.session_state.gcp_client_id     = client_id
-                    st.session_state.gcp_client_secret = client_secret
-                    st.session_state.pop("bq_token", None)
-                    st.rerun()
-                else:
-                    st.warning("Both Client ID and Client secret are required.")
-
-    if not st.session_state.get("gcp_client_id"):
-        st.stop()
-
-    # --- Auth ----------------------------------------------------------------
-    if not render_auth_panel():
+    if not render_gcp_credentials_gate("data_export"):
         st.stop()
 
     # --- Connection ----------------------------------------------------------
