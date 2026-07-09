@@ -51,13 +51,25 @@ SCOPES = [
 def _get_redirect_base_url() -> str:
     """
     Read the app's base URL from secrets so it can be changed per deployment
-    without touching code.
+    without touching code. Must be a single string with no page path —
+    get_redirect_uri() appends the page path. Register each page's full URL
+    (e.g. https://hexkit.streamlit.app/automation) as its own authorised
+    redirect URI in the Google Cloud OAuth client, not here.
     Expected: BQ_REDIRECT_URI = "https://hexkit.streamlit.app"
     """
     try:
-        return st.secrets["BQ_REDIRECT_URI"]
+        base = st.secrets["BQ_REDIRECT_URI"]
     except (KeyError, AttributeError):
         return "https://hexkit.streamlit.app/"
+    if not isinstance(base, str):
+        raise TypeError(
+            "BQ_REDIRECT_URI in secrets must be a single string with no page "
+            'path, e.g. BQ_REDIRECT_URI = "https://hexkit.streamlit.app" — '
+            f"got {base!r}. Page paths are appended automatically; register "
+            "each page's full URL as its own authorised redirect URI in the "
+            "Google Cloud OAuth client instead."
+        )
+    return base
 
 
 def get_redirect_uri(page_path: str = "") -> str:
