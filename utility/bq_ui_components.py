@@ -7,13 +7,13 @@ from typing import Literal, Optional, cast
 import base64
 import json
 import streamlit as st
-from bq_client import (
+from utility.bq_client import (
     is_authenticated, get_auth_url, exchange_code_for_credentials,
     get_redirect_uri, sign_out, list_projects, list_datasets, dry_run,
     run_preview, run_query, df_to_csv_bytes, export_to_sheets,
     autodetect_variants, autodetect_kpis
 )
-from sql_builder import VariantPair, ExperimentConfig
+from utility.sql_builder import VariantPair, ExperimentConfig
 
 
 # ---------------------------------------------------------------------------

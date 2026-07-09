@@ -22,5 +22,6 @@ prophet
 plotly
 patsy
 db-dtypes
+requests>=2.31.0
 pydantic>=2.0.0
 foe @ git+https://github.com/BasLinders/first-order-engine.git@main

@@ -7,7 +7,7 @@ from typing import Literal, Optional, Union, cast
 
 import streamlit as st
 
-from bq_client import (
+from utility.bq_client import (
     dry_run,
     get_monthly_usage,
     run_query,
@@ -17,7 +17,7 @@ from bq_client import (
     autodetect_variants,
     autodetect_kpis,
 )
-from bq_ui_components import (
+from utility.bq_ui_components import (
     render_gcp_credentials_gate,
     render_connection_selectors,
     render_date_range,
@@ -26,7 +26,7 @@ from bq_ui_components import (
     render_sql_viewer,
     render_export_options,
 )
-from sql_builder import (
+from utility.sql_builder import (
     BaselineParams,
     BinomialParams,
     ContinuousParams,
