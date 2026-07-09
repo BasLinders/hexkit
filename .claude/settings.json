@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -c \"from streamlit.testing.v1 import AppTest; print\\('AppTest available'\\)\")",
+      "Bash(.venv/bin/python -c \"import streamlit; print\\(streamlit.__version__\\)\")"
+    ]
+  }
+}

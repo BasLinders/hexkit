@@ -11,7 +11,7 @@ from typing import Literal, cast
 import pandas as pd
 
 from utility.bq_ui_components import (
-    render_auth_panel,
+    render_gcp_credentials_gate,
     render_connection_selectors,
     render_date_range,
     render_variant_inputs,
@@ -61,7 +61,7 @@ def _render_stage_fetch():
         "exactly one control (A) and one variation (B)."
     )
 
-    if not render_auth_panel():
+    if not render_gcp_credentials_gate("automation"):
         return
 
     st.divider()

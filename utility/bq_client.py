@@ -48,16 +48,31 @@ SCOPES = [
 ]
 
 
-def _get_redirect_uri() -> str:
+def _get_redirect_base_url() -> str:
     """
-    Read redirect URI from secrets so it can be changed per deployment
+    Read the app's base URL from secrets so it can be changed per deployment
     without touching code.
-    Expected: BQ_REDIRECT_URI = "https://hexkit.streamlit.app/"
+    Expected: BQ_REDIRECT_URI = "https://hexkit.streamlit.app"
     """
     try:
         return st.secrets["BQ_REDIRECT_URI"]
     except (KeyError, AttributeError):
         return "https://hexkit.streamlit.app/"
+
+
+def get_redirect_uri(page_path: str = "") -> str:
+    """
+    Build the OAuth redirect URI for a given page.
+    Each Streamlit page needs its own redirect URI (e.g. .../data_export,
+    .../automation) registered as an authorised redirect URI in the Google
+    Cloud OAuth client, so the callback lands back on the page that started
+    the flow rather than a fixed shared page.
+    Omitting page_path returns the bare base URL (legacy single-redirect setups).
+    """
+    base = _get_redirect_base_url()
+    if not page_path:
+        return base
+    return f"{base.rstrip('/')}/{page_path.strip('/')}"
 
 
 def _build_client_config(client_id: str, client_secret: str, redirect_uri: str) -> dict:
@@ -73,8 +88,8 @@ def _build_client_config(client_id: str, client_secret: str, redirect_uri: str) 
     }
 
 
-def get_auth_url(client_id: str, client_secret: str) -> str:
-    redirect_uri = _get_redirect_uri()
+def get_auth_url(client_id: str, client_secret: str, page_path: str = "") -> str:
+    redirect_uri = get_redirect_uri(page_path)
     config = _build_client_config(client_id, client_secret, redirect_uri)
     flow = Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
 
@@ -84,12 +99,15 @@ def get_auth_url(client_id: str, client_secret: str) -> str:
         prompt="consent",
     )
 
-    # Encode verifier AND credentials into state — both need to survive the redirect
+    # Encode verifier, credentials, AND the originating page into state — all
+    # need to survive the redirect, and the token exchange must reuse the
+    # exact same redirect_uri that was used here.
     verifier: str = getattr(flow, "code_verifier", None) or ""
     state_data = json.dumps({
         "verifier":      verifier,
         "client_id":     client_id,
         "client_secret": client_secret,
+        "page_path":     page_path,
     })
     encoded = base64.urlsafe_b64encode(state_data.encode()).decode().rstrip("=")
 
@@ -108,8 +126,9 @@ def exchange_code_for_credentials(
     client_id: str = "",
     client_secret: str = "",
 ) -> Credentials:
-    # Decode state — verifier and credentials are both embedded here
+    # Decode state — verifier, credentials, and the originating page are all embedded here
     verifier: Optional[str] = None
+    page_path = ""
     if state:
         try:
             padding = 4 - len(state) % 4
@@ -118,10 +137,11 @@ def exchange_code_for_credentials(
             verifier      = state_data.get("verifier", "") or None
             client_id     = state_data.get("client_id", client_id)
             client_secret = state_data.get("client_secret", client_secret)
+            page_path     = state_data.get("page_path", "")
         except Exception:
             verifier = None
 
-    redirect_uri = _get_redirect_uri()
+    redirect_uri = get_redirect_uri(page_path)
     config = _build_client_config(client_id, client_secret, redirect_uri)
 
     flow = Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
