@@ -1,6 +1,10 @@
 import streamlit as st
 
-if not st.session_state.get("admin_authenticated"):
+# Google's OAuth redirect ends the WebSocket session and wipes session_state,
+# including admin_authenticated, so a bare admin check would block the page
+# before the returning `code` can be exchanged. Let the callback through;
+# everything past the credentials gate still requires admin_authenticated.
+if not st.session_state.get("admin_authenticated") and "code" not in st.query_params:
     st.error("Access denied.")
     st.stop()
 

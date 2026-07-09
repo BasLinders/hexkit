@@ -30,18 +30,19 @@ client_pages = [
     st.Page("pages/sequential_analysis.py",         title="Sequential Analysis",         icon="⏱️"),
 ]
 
+is_admin = st.session_state.get("admin_authenticated")
+
+# Admin pages stay routable even when logged out — Google's OAuth redirect
+# ends the WebSocket session and wipes session_state, including
+# admin_authenticated, so the callback must still be able to land on
+# /automation. The page itself re-checks admin_authenticated and blocks.
+admin_visibility = "visible" if is_admin else "hidden"
 admin_pages = [
-    st.Page("pages/automation.py", title="Automation", icon="⚙️"),
-    st.Page("pages/experimentation_growth.py",      title="Experimentation Growth",      icon="📈"),
+    st.Page("pages/automation.py", title="Automation", icon="⚙️", visibility=admin_visibility),
+    st.Page("pages/experimentation_growth.py", title="Experimentation Growth", icon="📈", visibility=admin_visibility),
 ]
 
-if st.session_state.get("admin_authenticated"):
-    pages = {
-        "": client_pages,
-        "Admin": admin_pages,
-    }
-else:
-    pages = {"": client_pages}
+pages = {"": client_pages, "Admin": admin_pages}
 
 pg = st.navigation(pages)
 pg.run()

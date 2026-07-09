@@ -1,4 +1,9 @@
 import streamlit as st
+
+if not st.session_state.get("admin_authenticated"):
+    st.error("Access denied.")
+    st.stop()
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt

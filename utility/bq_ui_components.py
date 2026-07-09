@@ -61,7 +61,10 @@ def render_gcp_credentials_gate(page_path: str = "") -> bool:
             "APIs & Services → Credentials → OAuth 2.0 Client IDs. "
             f"Add `{get_redirect_uri(page_path)}` as an authorised redirect URI."
         )
-        with st.expander("🔑 Enter credentials", expanded=True):
+        creds_set = bool(
+            st.session_state.get("gcp_client_id") and st.session_state.get("gcp_client_secret")
+        )
+        with st.expander("🔑 Enter credentials", expanded=not creds_set):
             client_id = st.text_input(
                 "Client ID",
                 value=st.session_state.get("gcp_client_id", ""),
