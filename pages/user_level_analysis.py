@@ -17,6 +17,9 @@ import scikit_posthocs as sp
 import streamlit as st
 import itertools
 
+from foe.continuous.operations import ContinuousMetricEngine
+from foe.core.models import AnalysisUnit, AlternativeHypothesis
+
 st.set_page_config(
     page_title="User level analysis",
     page_icon="🔢",
@@ -586,9 +589,17 @@ def log_transform_data(df, kpi):
 
 # Perform statistical tests and provide conclusions
 
+def _fmt_money(x):
+    """Formats a monetary value for display, handling unbounded CI edges."""
+    if x is None or (isinstance(x, float) and (np.isinf(x) or np.isnan(x))):
+        return "Unbounded"
+    return f"€{x:,.0f}"
+
+
 def perform_stat_tests_and_conclusions(
     df, kpi, model_after, approach, unit="per_transaction",
     count_max_unique=50, count_max_unique_ratio=0.05,
+    include_business_case=False, test_duration_days=None, visitor_counts=None,
 ):
     st.write("---") # Separator
     st.write("## Statistical Test Results")
@@ -939,7 +950,71 @@ def perform_stat_tests_and_conclusions(
                  st.write("* Standard deviation calculation requires more than one sample per group.")
     except Exception as e:
         st.error(f"An error occurred during summary statistics calculation: {e}")
+        summary_stats = None
 
+    # --- Business Case (optional) ---
+    if include_business_case and test_duration_days and summary_stats is not None:
+        st.write("### Business Case")
+        with st.expander("How is this calculated?"):
+            st.markdown(
+                "For **per visitor** analysis, each variant's mean KPI value already "
+                "represents € (or units) per visitor, since non-converting visitors "
+                "are counted as 0. For **per transaction** analysis, the mean is € "
+                "per order, so it's combined with each variant's order rate "
+                "(orders ÷ total visitors) to get the same per-visitor economics. "
+                "The difference between a variant and the control is then projected "
+                "over 183 days using the site's average daily visitor volume, with a "
+                "95% confidence range from the standard errors of the underlying means "
+                "(and order rates, for per-transaction)."
+            )
+
+        control_label = st.selectbox(
+            "Select the control (baseline) variant for the business case:",
+            unique_groups,
+            key="bc_control_label",
+        )
+
+        if unit == "per_transaction" and not visitor_counts:
+            st.info(
+                "Provide total visitor counts per variant above to enable the "
+                "business case for per-transaction analysis."
+            )
+        else:
+            try:
+                if unit == "per_visitor":
+                    daily_visitors = len(df_clean) / test_duration_days
+                    bc_unit = AnalysisUnit.PER_VISITOR
+                else:
+                    daily_visitors = sum(visitor_counts.values()) / test_duration_days
+                    bc_unit = AnalysisUnit.PER_TRANSACTION
+
+                group_stats = summary_stats.to_dict(orient="index")
+                bc_results = ContinuousMetricEngine().run_business_case(
+                    group_stats=group_stats,
+                    control_label=control_label,
+                    unit=bc_unit,
+                    daily_visitors=daily_visitors,
+                    visitor_counts=visitor_counts,
+                    alternative=AlternativeHypothesis.TWO_SIDED,
+                    projection_period=183,
+                )
+
+                for res in bc_results:
+                    st.write(f"**{res['variant']}** vs **{control_label}**")
+                    bc_col1, bc_col2 = st.columns(2)
+                    bc_col1.metric(
+                        f"Projected Impact ({res['projection_period']}d)",
+                        _fmt_money(res["point_estimate"]),
+                    )
+                    bc_col2.metric(
+                        "Confidence Range",
+                        f"{_fmt_money(res['ci_low'])} to {_fmt_money(res['ci_high'])}",
+                    )
+                    st.caption(res["conclusion"])
+            except Exception as e:
+                st.error(f"Business case calculation failed: {e}")
+
+        st.write("---")
 
     # --- Conclusion ---
     st.write("### 4. Conclusion")
@@ -1123,6 +1198,34 @@ def run():
         else:  # per_transaction
             if n_zeros > 0:
                 st.info(f"Per-transaction analysis will exclude {n_zeros:,} zero-value row(s) (non-orders).")
+
+        # --- Business case (optional) ---
+        st.write("#### Business Case (optional)")
+        include_business_case = st.checkbox(
+            "Calculate a monetary business case",
+            value=False,
+            help=(
+                "Projects the KPI difference between each challenger and the control "
+                "into a future € impact, using your test's traffic and duration."
+            ),
+        )
+        test_duration_days = None
+        visitor_counts_input = None
+        if include_business_case:
+            test_duration_days = st.number_input(
+                "Test duration so far (days):", min_value=1, value=14, step=1,
+            )
+            if unit == "per_transaction":
+                st.caption(
+                    "Per-transaction analysis only counts orders, so the business case "
+                    "needs each variant's total visitor count to derive its order rate."
+                )
+                visitor_counts_input = {}
+                for group in df['experience_variant_label'].unique():
+                    visitor_counts_input[group] = st.number_input(
+                        f"Total visitors for '{group}':",
+                        min_value=1, value=1000, step=1, key=f"bc_visitors_{group}",
+                    )
 
         # Select analysis approach (Gamma model for revenue/items per transaction, heuristic framework for e.g. profit
         analysis_approach = st.selectbox(
@@ -1353,6 +1456,9 @@ def run():
                 processed_df, kpi, model_after, analysis_approach, unit,
                 count_max_unique=count_max_unique,
                 count_max_unique_ratio=count_max_unique_ratio / 100.0,
+                include_business_case=include_business_case,
+                test_duration_days=test_duration_days,
+                visitor_counts=visitor_counts_input,
             )
             action_bar.progress(100, text="Analysis complete.")
             action_bar.empty()
