@@ -721,7 +721,7 @@ def perform_stat_tests_and_conclusions(
                 st.write("_Skipping further analysis due to variance test error._")
                 return
 
-    elif approach == "Gamma GLM (Best for Revenue/Items)":
+    elif approach == "Gamma GLM (Best for Revenue)":
         # Skip diagnostics and go straight to GLM
         if unit == "per_visitor":
             st.info("Diagnostic tests (normality/Levene) skipped. Using a two-part hurdle model (Bernoulli × Gamma) that includes non-converting visitors (zeros).")
@@ -742,7 +742,7 @@ def perform_stat_tests_and_conclusions(
     is_significant = False # Initialize
 
     try:
-        if approach == "Gamma GLM (Best for Revenue/Items)":
+        if approach == "Gamma GLM (Best for Revenue)":
             if unit == "per_visitor":
                 st.info("Native two-part (hurdle) Likelihood Ratio Test")
             else:
@@ -1030,7 +1030,7 @@ def perform_stat_tests_and_conclusions(
                 for pair in significant_pairs:
                     st.markdown(f"* {pair}")
                 st.markdown("_Refer to the summary statistics above to see which side of each pair is higher._")
-            elif approach == "Gamma GLM (Best for Revenue/Items)":
+            elif approach == "Gamma GLM (Best for Revenue)":
                 st.write("The Likelihood Ratio Test indicates that variant means differ significantly. See the **Pairwise Post-Hoc Comparisons** above to identify which treatments outperformed the control.")
             elif is_count:
                 st.write("The Likelihood Ratio Test indicates that variant means differ significantly. See the **Pairwise Post-Hoc Comparisons** above to identify which treatments outperformed the control.")
@@ -1230,12 +1230,12 @@ def run():
         # Select analysis approach (Gamma model for revenue/items per transaction, heuristic framework for e.g. profit
         analysis_approach = st.selectbox(
             "Select Statistical Approach:",
-            ["Heuristic (Auto-detect)", "Gamma GLM (Best for Revenue/Items)"],
+            ["Heuristic (Auto-detect)", "Gamma GLM (Best for Revenue)"],
             help="Heuristic follows a count-data gate (Negative Binomial for discrete counts) then a Normality/Variance decision tree. Gamma GLM is optimized for strictly positive, right-skewed continuous data. For per-visitor analysis, Gamma GLM uses a two-part hurdle model so zeros are included."
         )
 
         # Guard: the Gamma family needs non-negative data.
-        if analysis_approach == "Gamma GLM (Best for Revenue/Items)" and n_neg > 0:
+        if analysis_approach == "Gamma GLM (Best for Revenue)" and n_neg > 0:
             st.warning(
                 f"The Gamma model requires non-negative values, but '{kpi}' contains "
                 f"{n_neg:,} negative value(s). Use the Heuristic approach for this metric, "
@@ -1402,7 +1402,7 @@ def run():
                 st.caption(proc_note)
             plt.clf()
             
-            if analysis_approach != "Gamma GLM (Best for Revenue/Items)":
+            if analysis_approach != "Gamma GLM (Best for Revenue)":
                 st.write("### Refitted QQ Plot")
                 influence = model_after.get_influence()
                 std_residuals = pd.Series(influence.resid_studentized_internal)
