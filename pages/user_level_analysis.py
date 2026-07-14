@@ -600,6 +600,7 @@ def perform_stat_tests_and_conclusions(
     df, kpi, model_after, approach, unit="per_transaction",
     count_max_unique=50, count_max_unique_ratio=0.05,
     include_business_case=False, test_duration_days=None, visitor_counts=None,
+    control_label=None,
 ):
     st.write("---") # Separator
     st.write("## Statistical Test Results")
@@ -968,13 +969,14 @@ def perform_stat_tests_and_conclusions(
                 "(and order rates, for per-transaction)."
             )
 
-        control_label = st.selectbox(
-            "Select the control (baseline) variant for the business case:",
-            unique_groups,
-            key="bc_control_label",
-        )
+        st.caption(f"_Control (baseline) variant: **{control_label}**._")
 
-        if unit == "per_transaction" and not visitor_counts:
+        if control_label not in summary_stats.index:
+            st.error(
+                f"Control variant '{control_label}' has no data after processing "
+                "(e.g. it may have been entirely removed by outlier handling)."
+            )
+        elif unit == "per_transaction" and not visitor_counts:
             st.info(
                 "Provide total visitor counts per variant above to enable the "
                 "business case for per-transaction analysis."
@@ -1211,9 +1213,15 @@ def run():
         )
         test_duration_days = None
         visitor_counts_input = None
+        control_label_input = None
         if include_business_case:
             test_duration_days = st.number_input(
                 "Test duration so far (days):", min_value=1, value=14, step=1,
+            )
+            control_label_input = st.selectbox(
+                "Select the control (baseline) variant for the business case:",
+                df['experience_variant_label'].unique(),
+                key="bc_control_label",
             )
             if unit == "per_transaction":
                 st.caption(
@@ -1459,6 +1467,7 @@ def run():
                 include_business_case=include_business_case,
                 test_duration_days=test_duration_days,
                 visitor_counts=visitor_counts_input,
+                control_label=control_label_input,
             )
             action_bar.progress(100, text="Analysis complete.")
             action_bar.empty()
