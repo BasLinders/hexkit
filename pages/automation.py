@@ -65,7 +65,11 @@ def _render_stage_fetch():
         "exactly one control (A) and one variation (B)."
     )
 
-    if not render_gcp_credentials_gate("automation"):
+    # The OAuth redirect starts a fresh Streamlit session with a blank
+    # session_state, which would otherwise look logged out of the admin gate
+    # even though the user never left it. extra_state carries admin_authenticated
+    # across that redirect — see render_gcp_credentials_gate.
+    if not render_gcp_credentials_gate("automation", extra_state={"admin_authenticated": True}):
         return
 
     st.divider()

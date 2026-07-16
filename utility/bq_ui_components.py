@@ -20,7 +20,7 @@ from utility.sql_builder import VariantPair, ExperimentConfig
 # GCP credentials gate
 # ---------------------------------------------------------------------------
 
-def render_gcp_credentials_gate(page_path: str = "") -> bool:
+def render_gcp_credentials_gate(page_path: str = "", extra_state: Optional[dict] = None) -> bool:
     """
     Renders the GCP OAuth client id/secret entry (skipped once already set)
     and the Google sign-in panel. Handles the OAuth callback itself, restoring
@@ -30,6 +30,12 @@ def render_gcp_credentials_gate(page_path: str = "") -> bool:
     `page_path` identifies the calling page (e.g. "data_export", "automation")
     so the sign-in flow round-trips through that page's own redirect URI
     instead of a single shared one.
+
+    `extra_state` is an optional dict of additional session_state keys/values
+    to carry across that same redirect discontinuity — e.g. an admin-gated
+    page passing {"admin_authenticated": True} so the fresh post-redirect
+    session doesn't look logged out of the admin gate. Restored by
+    exchange_code_for_credentials before this returns.
 
     Returns True once the session is fully authenticated and ready to proceed.
     Callers should `st.stop()` when this returns False.
@@ -90,14 +96,14 @@ def render_gcp_credentials_gate(page_path: str = "") -> bool:
         return False
 
     st.divider()
-    return render_auth_panel(page_path)
+    return render_auth_panel(page_path, extra_state)
 
 
 # ---------------------------------------------------------------------------
 # Auth panel
 # ---------------------------------------------------------------------------
 
-def render_auth_panel(page_path: str = "") -> bool:
+def render_auth_panel(page_path: str = "", extra_state: Optional[dict] = None) -> bool:
     """
     Renders sign-in/sign-out. Returns True if authenticated.
     The OAuth callback itself is handled by render_gcp_credentials_gate()
@@ -121,7 +127,7 @@ def render_auth_panel(page_path: str = "") -> bool:
             "You'll be taken to Google in a new tab — after signing in, "
             "continue in that tab."
         )
-        auth_url = get_auth_url(client_id, client_secret, page_path)
+        auth_url = get_auth_url(client_id, client_secret, page_path, extra_state)
         st.link_button(
             "🔐 Sign in with Google",
             auth_url,
