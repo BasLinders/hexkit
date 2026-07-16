@@ -59,7 +59,9 @@ def _get_redirect_base_url() -> str:
     """
     try:
         base = st.secrets["BQ_REDIRECT_URI"]
-    except (KeyError, AttributeError):
+    except Exception:
+        # Covers both a missing key and no secrets.toml existing at all
+        # (StreamlitSecretNotFoundError, a FileNotFoundError subclass).
         return "https://hexkit.streamlit.app/"
     if not isinstance(base, str):
         raise TypeError(
@@ -100,7 +102,12 @@ def _build_client_config(client_id: str, client_secret: str, redirect_uri: str) 
     }
 
 
-def get_auth_url(client_id: str, client_secret: str, page_path: str = "") -> str:
+def get_auth_url(
+    client_id: str,
+    client_secret: str,
+    page_path: str = "",
+    extra_state: Optional[dict] = None,
+) -> str:
     redirect_uri = get_redirect_uri(page_path)
     config = _build_client_config(client_id, client_secret, redirect_uri)
     flow = Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
@@ -111,15 +118,19 @@ def get_auth_url(client_id: str, client_secret: str, page_path: str = "") -> str
         prompt="consent",
     )
 
-    # Encode verifier, credentials, AND the originating page into state — all
-    # need to survive the redirect, and the token exchange must reuse the
-    # exact same redirect_uri that was used here.
+    # Encode verifier, credentials, the originating page, AND any caller-supplied
+    # extra_state into state — all need to survive the redirect, since it starts
+    # a fresh Streamlit session with none of this in session state. extra_state
+    # lets a caller (e.g. an admin-gated page) carry its own session flags
+    # (e.g. admin_authenticated) across that same discontinuity — see
+    # exchange_code_for_credentials, which restores them into session state.
     verifier: str = getattr(flow, "code_verifier", None) or ""
     state_data = json.dumps({
         "verifier":      verifier,
         "client_id":     client_id,
         "client_secret": client_secret,
         "page_path":     page_path,
+        "extra":         extra_state or {},
     })
     encoded = base64.urlsafe_b64encode(state_data.encode()).decode().rstrip("=")
 
@@ -138,9 +149,11 @@ def exchange_code_for_credentials(
     client_id: str = "",
     client_secret: str = "",
 ) -> Credentials:
-    # Decode state — verifier, credentials, and the originating page are all embedded here
+    # Decode state — verifier, credentials, the originating page, and any
+    # caller-supplied extra_state (e.g. admin_authenticated) are all embedded here
     verifier: Optional[str] = None
     page_path = ""
+    extra_state: dict = {}
     if state:
         try:
             padding = 4 - len(state) % 4
@@ -150,6 +163,7 @@ def exchange_code_for_credentials(
             client_id     = state_data.get("client_id", client_id)
             client_secret = state_data.get("client_secret", client_secret)
             page_path     = state_data.get("page_path", "")
+            extra_state   = state_data.get("extra", {}) or {}
         except Exception:
             verifier = None
 
@@ -161,6 +175,11 @@ def exchange_code_for_credentials(
     if verifier:
         fetch_kwargs["code_verifier"] = verifier
     flow.fetch_token(**fetch_kwargs)
+
+    # Restore caller-supplied session flags now that this fresh session has a
+    # session_state to restore them into — see get_auth_url's extra_state param.
+    for key, value in extra_state.items():
+        st.session_state[key] = value
 
     creds = flow.credentials
     st.session_state["credentials"] = _creds_to_dict(creds)
