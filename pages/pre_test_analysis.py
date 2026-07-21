@@ -9,11 +9,13 @@ import streamlit as st
 from dataclasses import dataclass
 from scipy.stats import norm
 from scipy.stats import gamma as scipy_gamma
-from scipy.special import gammaln
-from scipy.optimize import minimize
+from scipy.stats import nbinom
 from statsmodels.stats.proportion import proportion_effectsize
 from statsmodels.stats.power import zt_ind_solve_power
 from prophet import Prophet  # type: ignore[import-untyped]  # Prophet stubs are incomplete
+from foe.pretest.operations import PretestEngine
+from foe.continuous.operations import ContinuousMetricEngine
+from foe.core.models import AlternativeHypothesis as FoeAlternative
 
 st.set_page_config(
     page_title="Pre-test analysis",
@@ -80,6 +82,15 @@ class GammaFit:
     n: int
 
 
+@dataclass
+class NegBinFit:
+    mean: float
+    variance: float      # mean + alpha * mean**2 (NB2)
+    alpha: float         # dispersion parameter
+    log_likelihood: float
+    n: int
+
+
 # ---------------------------------------------------------------------------
 # Metric abstraction
 # ---------------------------------------------------------------------------
@@ -104,33 +115,18 @@ def metric_moments(inputs: BaselineInputs) -> tuple[float, float]:
 # Statistical helpers
 # ---------------------------------------------------------------------------
 
-def holm_bonferroni_z(num_comparisons: int, alpha: float, tails: str) -> float:
-    """
-    Return the most conservative critical z-value under the Holm-Bonferroni
-    step-down procedure.
-
-    The Holm procedure orders hypotheses by p-value, adjusting alpha at each
-    step as alpha / (m - rank + 1).  For pre-test planning we don't yet have
-    p-values, so we conservatively use the *first* (most stringent) step:
-        adjusted_alpha = alpha / num_comparisons
-
-    This is identical to simple Bonferroni for the first comparison and is
-    the standard conservative choice when planning sample size.
-    """
-    adjusted_alpha = alpha / num_comparisons
-    if tails == "Two-sided":
-        return float(norm.ppf(1 - adjusted_alpha / 2))
-    return float(norm.ppf(1 - adjusted_alpha))
+def _foe_alternative(tails: str) -> FoeAlternative:
+    """Map this file's 'One-sided'/'Two-sided' tails choice onto foe's
+    AlternativeHypothesis enum (GREATER is treated identically to LESS by
+    PretestEngine.get_z_alpha, since both use the one-tailed critical value)."""
+    return FoeAlternative.TWO_SIDED if tails == "Two-sided" else FoeAlternative.GREATER
 
 
 def get_critical_z(num_variants: int, alpha: float, tails: str) -> float:
-    """Return the adjusted critical z-value, applying Holm-Bonferroni when
-    there are more than two variants."""
-    if num_variants > 2:
-        return holm_bonferroni_z(num_variants - 1, alpha, tails)
-    if tails == "Two-sided":
-        return float(norm.ppf(1 - alpha / 2))
-    return float(norm.ppf(1 - alpha))
+    """Return the adjusted critical z-value via foe's PretestEngine, which
+    applies Holm-Bonferroni step-down correction when there are more than two
+    variants (shared with the post-test/business engines elsewhere in the app)."""
+    return PretestEngine.get_z_alpha(num_variants, alpha, _foe_alternative(tails))
 
 
 def mde_from_visitors(
@@ -142,26 +138,20 @@ def mde_from_visitors(
 ) -> float:
     """
     Minimum detectable effect for a two-sample test of means, expressed as a
-    percentage of the baseline `mean`.
-
-    Under H0 both variants share the same per-unit `variance`, so the standard
-    error of the difference is:
-        SE = sqrt(2 * variance / n)
-    The factor of 2 comes from adding the variance of two equal-sized groups.
-    The absolute MDE is (z_alpha + z_power) * SE; dividing by `mean` gives the
-    relative MDE.
+    percentage of the baseline `mean`. Delegates to foe's PretestEngine, which
+    implements the same two-group SE formula this file used to compute locally:
+        SE = sqrt(2 * variance / n); MDE = (z_alpha + z_power) * SE / mean * 100
 
     For a binomial KPI pass variance = p*(1-p) and mean = p; for a continuous
     KPI pass variance = sigma**2 and mean = mu.
     """
-    se = float(np.sqrt(2 * variance / visitors_per_variant))
-    mde_absolute = (z_alpha + z_power) * se
-    return float((mde_absolute / mean) * 100)  # relative MDE as a percentage
+    return PretestEngine._relative_mde(mean, variance, visitors_per_variant, z_alpha, z_power)
 
 
 def fit_gamma(data: np.ndarray) -> GammaFit:
     """
-    Fit a Gamma distribution (shape k, scale theta) by maximum likelihood.
+    Fit a Gamma distribution (shape k, scale theta) by maximum likelihood, via
+    foe's ContinuousMetricEngine (the same Gamma MLE the post-test tool uses).
 
     The Gamma is a natural model for positive, right-skewed continuous KPIs
     such as revenue per visitor or items per transaction.  Its first two
@@ -171,44 +161,17 @@ def fit_gamma(data: np.ndarray) -> GammaFit:
         CV       = 1 / sqrt(k)
 
     Only strictly positive observations are used, since the Gamma is defined
-    on x > 0.  Method-of-moments estimates seed the optimiser.
+    on x > 0.
     """
     data = np.asarray(data, dtype=float)
     data = data[np.isfinite(data)]
     data = data[data > 0]
     if data.size < 2:
         raise ValueError("Need at least two positive observations to fit a Gamma model.")
-
-    mean_x = float(np.mean(data))
-    var_x = float(np.var(data))
-    if var_x <= 0:
+    if float(np.var(data)) <= 0:
         raise ValueError("Data has zero variance; cannot fit a Gamma model.")
 
-    k_start = mean_x ** 2 / var_x
-    theta_start = var_x / mean_x
-
-    n = int(data.size)
-    mean_log = float(np.mean(np.log(data)))
-
-    def neg_log_likelihood(params: np.ndarray) -> float:
-        k, theta = params
-        if k <= 0 or theta <= 0:
-            return 1e10
-        ll = (
-            n * (k - 1) * mean_log
-            - n * k * np.log(theta)
-            - n * mean_x / theta
-            - n * gammaln(k)
-        )
-        return float(-ll)
-
-    res = minimize(
-        neg_log_likelihood,
-        x0=np.array([k_start, theta_start]),
-        method="L-BFGS-B",
-        bounds=[(1e-6, None), (1e-6, None)],
-    )
-    k_mle, theta_mle = float(res.x[0]), float(res.x[1])
+    k_mle, theta_mle, log_lik = ContinuousMetricEngine.fit_gamma(data)
 
     return GammaFit(
         k=k_mle,
@@ -216,8 +179,40 @@ def fit_gamma(data: np.ndarray) -> GammaFit:
         mean=k_mle * theta_mle,
         variance=k_mle * theta_mle ** 2,
         cv=1.0 / np.sqrt(k_mle),
-        log_likelihood=float(-res.fun),
-        n=n,
+        log_likelihood=float(log_lik),
+        n=int(data.size),
+    )
+
+
+def fit_negbin_count(data: np.ndarray) -> NegBinFit:
+    """
+    Fit a Negative Binomial (NB2) model to a discrete count KPI (e.g. items
+    per order) via foe's ContinuousMetricEngine -- the same engine, and the
+    same NB2 MLE, the post-test tool uses to actually test this kind of
+    metric. Reusing it (rather than a separate method-of-moments estimator)
+    keeps the pre-test variance assumption consistent with how the collected
+    data will later be analyzed.
+
+    fit_negbin's default (no exog) is an intercept-only NB2 regression, which
+    is exactly a single-group NB2 MLE: mean = exp(intercept), and the NB2
+    mean-variance relationship gives variance = mean + alpha * mean**2.
+    """
+    data = np.asarray(data, dtype=float)
+    data = data[np.isfinite(data)]
+    data = data[data >= 0]
+    if data.size < 2:
+        raise ValueError("Need at least two non-negative observations to fit a Negative Binomial model.")
+
+    log_lik, alpha, res = ContinuousMetricEngine.fit_negbin(data)
+    mean = float(np.exp(res.params[0]))
+    variance = mean + alpha * mean ** 2
+
+    return NegBinFit(
+        mean=mean,
+        variance=variance,
+        alpha=float(alpha),
+        log_likelihood=float(log_lik),
+        n=int(data.size),
     )
 
 
@@ -361,13 +356,13 @@ def calculate_sample_size_required(
         # Equal-variance assumption for a continuous metric.
         var_treat = var0
 
-    v_null = 2 * var0
-    v_alt = var0 + var_treat
-
-    term1 = z_alpha * np.sqrt(v_null)
-    term2 = z_power * np.sqrt(v_alt)
-
-    sample_size = int(np.ceil(((term1 + term2) ** 2) / (mde_absolute ** 2)))
+    sample_size = PretestEngine._sample_size_per_variant(
+        mde_absolute=mde_absolute,
+        var_null_sum=2 * var0,
+        var_alt_sum=var0 + var_treat,
+        z_alpha=z_alpha,
+        z_power=z_power,
+    )
 
     # Estimate runtime (per-variant daily volume from the weekly total)
     daily_per_group = (inputs.baseline_visitors / 7) / inputs.num_variants
@@ -438,18 +433,19 @@ def calculate_power(
         else:
             var_treat = var0
 
-        se_null = float(np.sqrt(2 * var0 / n_per_variant))
-        se_alt = float(np.sqrt((var0 + var_treat) / n_per_variant))
-
         if alternative == "two-sided":
             z_crit = float(norm.ppf(1 - alpha / 2))
-            power = float(
-                norm.cdf((delta - z_crit * se_null) / se_alt)
-                + norm.cdf((-delta - z_crit * se_null) / se_alt)
-            )
         else:
             z_crit = float(norm.ppf(1 - alpha))
-            power = float(norm.cdf((delta - z_crit * se_null) / se_alt))
+
+        power = PretestEngine._power_two_sample(
+            delta=delta,
+            var_null_sum=2 * var0,
+            var_alt_sum=var0 + var_treat,
+            n_per_variant=n_per_variant,
+            z_alpha=z_crit,
+            alternative=_foe_alternative("Two-sided" if alternative == "two-sided" else "One-sided"),
+        )
 
     return PowerResult(
         power=float(power),
@@ -523,20 +519,13 @@ def compound_per_visitor_moments(
     txn_mean: float, txn_variance: float, conversion_rate: float
 ) -> tuple[float, float]:
     """Per-visitor mean and variance of a revenue-style metric, built from the
-    per-transaction (buyer) distribution and the conversion rate.
-
-    With conversion rate p, and spend among buyers having mean m and variance v,
-    the per-visitor value R = B * S (B ~ Bernoulli(p), S = spend) satisfies:
+    per-transaction (buyer) distribution and the conversion rate, via foe's
+    PretestEngine (shared with the post-test/business engines elsewhere in
+    the app):
         E[R]   = p * m
         Var[R] = p * v + m**2 * p * (1 - p)
-    The variance term has two parts: within-buyer spend variance (p*v) and the
-    extra variance from buyers-vs-non-buyers (m^2 * p(1-p)). This is the exact
-    moment-matched zero-inflated model; n is then counted in visitors.
     """
-    p = conversion_rate
-    mean_r = p * txn_mean
-    var_r = p * txn_variance + (txn_mean ** 2) * p * (1 - p)
-    return float(mean_r), float(var_r)
+    return PretestEngine.compound_per_visitor_moments(txn_mean, txn_variance, conversion_rate)
 
 
 def _mde_color_scale() -> list[list[float | str]]:
@@ -626,6 +615,47 @@ def _render_gamma_fit(fit: GammaFit, values: np.ndarray) -> None:
     st.plotly_chart(fig, width="stretch")
 
 
+def _render_negbin_fit(fit: NegBinFit, values: np.ndarray) -> None:
+    """Show fitted Negative Binomial parameters and an overlay of the
+    empirical histogram against the fitted probability mass function."""
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Mean", f"{fit.mean:,.2f}")
+    m2.metric("Std dev", f"{np.sqrt(fit.variance):,.2f}")
+    m3.metric("Dispersion (α)", f"{fit.alpha:.3f}")
+
+    pos = values[values >= 0]
+    # NB2 -> scipy's (n, p) parameterization: n = 1/alpha, p = n / (n + mean).
+    n_param = 1.0 / fit.alpha
+    p_param = n_param / (n_param + fit.mean)
+    xs = np.arange(0, int(pos.max()) + 1)
+    pmf = nbinom.pmf(xs, n_param, p_param)
+
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=pos,
+        histnorm="probability density",
+        name="Observed",
+        opacity=0.55,
+        marker_color="#0072B2",
+        xbins=dict(start=-0.5, end=float(pos.max()) + 0.5, size=1),
+    ))
+    fig.add_trace(go.Scatter(
+        x=xs, y=pmf, mode="markers+lines", name="Fitted Negative Binomial",
+        line=dict(color="#E69F00", width=2.5),
+    ))
+    fig.update_layout(
+        title=f"KPI distribution & fitted Negative Binomial (n = {fit.n:,})",
+        xaxis_title="KPI value (count)",
+        yaxis_title="Probability",
+        bargap=0.02,
+        height=320,
+        margin=dict(l=60, r=30, t=50, b=50),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
 def _read_continuous_values(key_prefix: str) -> np.ndarray | None:
     """Shared paste/upload widget returning a numeric array (or None)."""
     src = st.radio(
@@ -698,13 +728,16 @@ def _continuous_metric_inputs(
 
     method = st.radio(
         "How do you want to specify the KPI distribution?",
-        ["Fit a Gamma model from data", "Enter summary statistics"],
+        ["Fit a model from data", "Enter summary statistics"],
         horizontal=True,
         key="cont_method",
         help=(
-            "Fit a Gamma model to a sample of individual transaction values, or "
-            "enter summary numbers directly. For a per-visitor metric you also "
-            "supply the conversion rate, which folds the non-converting (zero) "
+            "Fit a model to a sample of individual transaction values, or enter "
+            "summary numbers directly. The fit auto-detects discrete count "
+            "metrics (e.g. items per order) and uses a Negative Binomial model "
+            "instead of Gamma for those, matching how the post-test tool treats "
+            "the same kind of metric. For a per-visitor metric you also supply "
+            "the conversion rate, which folds the non-converting (zero) "
             "visitors into the mean and variance."
         ),
     )
@@ -745,35 +778,64 @@ def _continuous_metric_inputs(
     # ---- Fit-from-data path -----------------------------------------------
     st.caption(
         "Paste or upload a sample of **individual transaction values** "
-        "(positive amounts; one per order)."
+        "(positive amounts, or counts, one per order)."
     )
     values = _read_continuous_values("cont")
     if values is None or values.size == 0:
-        st.info("Provide transaction values to fit the Gamma model.")
+        st.info("Provide transaction values to fit a model.")
         return 0.0, 0.0, scaling
 
     positive = values[values > 0]
     n_zeros = int(values.size - positive.size)
     if positive.size < 2:
-        st.warning("Need at least two positive values to fit a Gamma model.")
+        st.warning("Need at least two positive values to fit a model.")
         return 0.0, 0.0, scaling
 
-    try:
-        fit = fit_gamma(values)
-    except ValueError as exc:
-        st.warning(str(exc))
-        return 0.0, 0.0, scaling
-
-    if n_zeros > 0:
-        st.caption(
-            f"{n_zeros:,} non-positive value(s) were excluded from the Gamma fit "
-            "(the Gamma is defined for x > 0; zeros are handled via the "
-            "conversion rate below for per-visitor metrics)."
+    # Count-data gate: a discrete, non-negative count metric (e.g. items or
+    # tickets per order) is structurally unsuited to the Gamma's continuous,
+    # right-skewed density -- and typically overdispersed (variance > mean),
+    # which Gamma doesn't capture either. Route it to Negative Binomial
+    # instead, mirroring the post-test tool's count-data gate so pre-test
+    # planning and post-test hypothesis testing agree on how the metric is
+    # modelled.
+    if ContinuousMetricEngine.is_count_kpi(values):
+        st.info(
+            "**Detected: discrete count metric** (e.g. items per order). Fitting "
+            "a Negative Binomial model instead of Gamma -- count data is "
+            "discrete and typically overdispersed (variance > mean), which the "
+            "Gamma's continuous density doesn't capture. This matches how the "
+            "post-test tool models the same kind of metric."
         )
-    _render_gamma_fit(fit, values)
+        try:
+            nb_fit = fit_negbin_count(values)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"Negative Binomial fit failed: {exc}")
+            return 0.0, 0.0, scaling
 
-    # Transaction-level moments from the fit.
-    m, v = fit.mean, fit.variance
+        if n_zeros > 0:
+            st.caption(
+                f"{n_zeros:,} negative value(s) were excluded from the fit "
+                "(a count metric cannot be negative)."
+            )
+        _render_negbin_fit(nb_fit, values)
+        m, v = nb_fit.mean, nb_fit.variance
+    else:
+        try:
+            fit = fit_gamma(values)
+        except ValueError as exc:
+            st.warning(str(exc))
+            return 0.0, 0.0, scaling
+
+        if n_zeros > 0:
+            st.caption(
+                f"{n_zeros:,} non-positive value(s) were excluded from the Gamma fit "
+                "(the Gamma is defined for x > 0; zeros are handled via the "
+                "conversion rate below for per-visitor metrics)."
+            )
+        _render_gamma_fit(fit, values)
+
+        # Transaction-level moments from the fit.
+        m, v = fit.mean, fit.variance
 
     if not per_visitor:
         return float(m), float(v), scaling
@@ -1308,7 +1370,7 @@ def render_seasonal_mode(kpi_type: str) -> None:
                 "contribute 0; a CV of 3-6+ is common."
                 if analysis_unit == "per_visitor"
                 else "Order values are right-skewed; a CV of roughly 1-3 is common."
-            ) + " Estimate it in the non-seasonal Continuous mode via the Gamma fit if unsure."
+            ) + " Estimate it in the non-seasonal Continuous mode via the fit-from-data option if unsure (auto-detects Gamma vs. Negative Binomial for count metrics)."
             st.number_input(
                 cv_label,
                 min_value=0.0, step=0.1,
@@ -1503,9 +1565,12 @@ def run() -> None:
         st.markdown("""
         **KPI type**
         * *Binomial:* a yes/no outcome per visitor; conversion rate, signup rate, bounce.
-        * *Continuous:* a real-valued outcome per unit; revenue per visitor, items per
-          order, time on site. A Gamma model captures the positive, right-skewed shape
-          of these metrics and supplies the mean and variance the calculations need.
+        * *Continuous:* a real-valued outcome per unit; revenue per visitor, time on
+          site. A Gamma model captures the positive, right-skewed shape of these
+          metrics and supplies the mean and variance the calculations need. Discrete
+          count metrics (e.g. items per order) are auto-detected when fitting from
+          data and use a Negative Binomial model instead, since count data is
+          overdispersed in a way Gamma doesn't capture.
 
         **1. MDE Projection (Fixed Duration)**
         * *Best for:* Strict deadlines.
@@ -1536,7 +1601,8 @@ def run() -> None:
         key="kpi_type_radio",
         help=(
             "Choose Binomial for yes/no outcomes (conversion). Choose Continuous for "
-            "real-valued outcomes (revenue, items per transaction) modelled with a Gamma fit."
+            "real-valued outcomes (revenue, items per order, …) -- modelled with a "
+            "Gamma fit, or a Negative Binomial fit if the data looks like a count."
         ),
     )
     kpi_type = "Binomial" if kpi_choice.startswith("Binomial") else "Continuous"
