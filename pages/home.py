@@ -15,7 +15,7 @@ st.sidebar.image(logo_url, width="stretch")
 # st.image(logo_url)
 st.write("### <span style='color: orange;'>v1.5.2</span>", unsafe_allow_html=True)
 st.write("""
-This is the main page for the Happy Horizon Experimentation Toolkit. You can navigate to individual apps using the sidebar.
+This is the main page for the <span style='color:#fff; font-weight: 600;>H</span>appy Horizon <span style='color:#fff; font-weight: 600;>Ex</span>perimentation Tool<span style='color:#fff; font-weight: 600;>kit</span>. You can navigate to individual apps using the sidebar.
 
 ### What you're looking at
 This toolkit has been created for the purposes of analyzing data from online controlled experiments ('A/B tests') to learn from and better understand user behavior.  
