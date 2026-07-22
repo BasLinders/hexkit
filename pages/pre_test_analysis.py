@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from dataclasses import dataclass
 from scipy.stats import norm
 from scipy.stats import gamma as scipy_gamma
@@ -1019,6 +1021,62 @@ def render_mde_mode(kpi_type: str) -> None:
         )
 
 
+def _render_copyable_table(df: pd.DataFrame, key: str) -> None:
+    """Render a static HTML table with a one-click 'Copy' button.
+
+    `st.dataframe`'s built-in copy-via-selection doesn't apply here because
+    this table is rendered as raw HTML (so column widths/formatting stay
+    stable); a small JS button is injected instead to copy the data as TSV,
+    which pastes cleanly into Excel/Sheets.
+    """
+    headers = list(df.columns)
+    tsv_text = "\n".join(
+        ["\t".join(headers)] + ["\t".join(str(v) for v in row) for row in df.itertuples(index=False)]
+    )
+
+    header_html = "".join(f"<th>{h}</th>" for h in headers)
+    rows_html = "".join(
+        "<tr>" + "".join(f"<td>{v}</td>" for v in row) + "</tr>"
+        for row in df.itertuples(index=False)
+    )
+
+    html = f"""
+    <div style="font-family: 'Source Sans Pro', sans-serif; color: inherit;">
+      <button id="copy-btn-{key}" style="
+        margin-bottom: 8px; padding: 4px 12px; font-size: 14px;
+        border: 1px solid #808495; border-radius: 6px;
+        background: transparent; color: inherit; cursor: pointer;
+      ">📋 Copy table</button>
+      <table style="border-collapse: collapse; width: 100%; font-size: 14px;">
+        <thead><tr>{header_html}</tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    <style>
+      th, td {{ border: 1px solid #80849580; padding: 4px 10px; text-align: right; }}
+      th:first-child, td:first-child {{ text-align: left; }}
+      @media (prefers-color-scheme: dark) {{
+        body {{ color: #fafafa; }}
+      }}
+      @media (prefers-color-scheme: light) {{
+        body {{ color: #31333f; }}
+      }}
+    </style>
+    <script>
+      const btn = document.getElementById("copy-btn-{key}");
+      const data = {json.dumps(tsv_text)};
+      btn.addEventListener("click", () => {{
+        navigator.clipboard.writeText(data).then(() => {{
+          const original = btn.innerText;
+          btn.innerText = "✅ Copied!";
+          setTimeout(() => {{ btn.innerText = original; }}, 1500);
+        }});
+      }});
+    </script>
+    """
+    components.html(html, height=48 + 33 * (len(df) + 1), scrolling=True)
+
+
 def _display_mde_table(inputs: BaselineInputs, results: list[MDERow]) -> None:
     unit = _unit_label(inputs.kpi_type, inputs.analysis_unit)
     st.write("## MDE Calculation Results")
@@ -1042,7 +1100,7 @@ def _display_mde_table(inputs: BaselineInputs, results: list[MDERow]) -> None:
                 "Relative MDE (%)": [f"{r.relative_mde_pct:.2f}%" for r in results],
             }
         )
-        st.write(df.to_html(index=False), unsafe_allow_html=True)
+        _render_copyable_table(df, key="mde-standard")
 
     with tab_sensitivity:
         st.write(
