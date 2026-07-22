@@ -51,6 +51,9 @@ class BaselineParams:
     # "per_user" (one row per order, for pre-test model fitting) is only
     # meaningful for output_type == "revenue".
     output_shape: Literal["aggregate", "daily", "per_user"] = "aggregate"
+    # Adds add-to-cart conversion counts alongside the purchase-based ones.
+    # Binomial only — revenue mode has no "conversion" concept to extend.
+    kpi_add_to_cart: bool = False
     page_filter_type: Optional[Literal["regex", "contains"]] = None  # None = no filter
     page_filter_value: str = ""
 
@@ -192,6 +195,12 @@ def _build_baseline_aggregate(p: BaselineParams, limit: int = 0) -> str:
   -- Desktop
   COUNT(DISTINCT CASE WHEN main.device.category = 'desktop' THEN main.user_pseudo_id END) AS desktop_visitors,
   COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' AND main.device.category = 'desktop' THEN main.user_pseudo_id END) AS desktop_conversions"""
+        if p.kpi_add_to_cart:
+            select_cols += """,
+  -- Add to cart (all devices / mobile / desktop)
+  COUNT(DISTINCT CASE WHEN main.event_name = 'add_to_cart' THEN main.user_pseudo_id END) AS total_add_to_cart_conversions,
+  COUNT(DISTINCT CASE WHEN main.event_name = 'add_to_cart' AND main.device.category = 'mobile' THEN main.user_pseudo_id END) AS mobile_add_to_cart_conversions,
+  COUNT(DISTINCT CASE WHEN main.event_name = 'add_to_cart' AND main.device.category = 'desktop' THEN main.user_pseudo_id END) AS desktop_add_to_cart_conversions"""
 
     return f"""-- Baseline export ({p.output_type}, aggregate) — sample size preparation
 DECLARE start_date STRING DEFAULT '{p.start_date}';
@@ -224,6 +233,9 @@ def _build_baseline_daily(p: BaselineParams, limit: int = 0) -> str:
   PARSE_DATE('%Y%m%d', main.event_date) AS report_date,
   COUNT(DISTINCT main.user_pseudo_id) AS visitors,
   COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' THEN main.user_pseudo_id END) AS conversions"""
+        if p.kpi_add_to_cart:
+            select_cols += """,
+  COUNT(DISTINCT CASE WHEN main.event_name = 'add_to_cart' THEN main.user_pseudo_id END) AS add_to_cart_conversions"""
 
     return f"""-- Baseline export ({p.output_type}, daily rows) — sample size preparation
 DECLARE start_date STRING DEFAULT '{p.start_date}';
