@@ -445,6 +445,47 @@ def run_query(project: str, sql: str) -> "pd.DataFrame":
     return job.result().to_dataframe()
 
 
+def create_scan_session(project: str, create_temp_table_sql: str) -> str:
+    """
+    Runs a `CREATE TEMP TABLE ... AS SELECT ...` statement with a BigQuery
+    session enabled, waits for it to finish, and returns the session_id so
+    later queries can read that temp table via run_query_in_session.
+    """
+    client = get_bq_client(project)
+    job_config = bigquery.QueryJobConfig(create_session=True)
+    job = client.query(create_temp_table_sql, job_config=job_config)
+    job.result()
+    return job.session_info.session_id
+
+
+def run_query_in_session(project: str, sql: str, session_id: str) -> "pd.DataFrame":
+    """Runs a query against an existing BigQuery session (e.g. to read a
+    TEMP TABLE created by create_scan_session) and returns a DataFrame."""
+    client = get_bq_client(project)
+    job_config = bigquery.QueryJobConfig(
+        connection_properties=[bigquery.ConnectionProperty(key="session_id", value=session_id)]
+    )
+    job = client.query(sql, job_config=job_config)
+    return job.result().to_dataframe()
+
+
+def run_combined_export(
+    project: str,
+    create_temp_sql: str,
+    select_sqls: dict[str, str],
+) -> dict[str, "pd.DataFrame"]:
+    """
+    Materializes the shared scan once (via a BigQuery session), then runs
+    each labeled SELECT against it in that same session — e.g.
+    {"binomial": df, "continuous": df} — billing the big scan only once.
+    """
+    session_id = create_scan_session(project, create_temp_sql)
+    return {
+        label: run_query_in_session(project, sql, session_id)
+        for label, sql in select_sqls.items()
+    }
+
+
 def run_preview(project: str, sql: str, limit: int = 25) -> "pd.DataFrame":
     """
     Strips trailing semicolons, appends LIMIT, runs the query.

@@ -12,6 +12,7 @@ from utility.bq_client import (
     get_monthly_usage,
     run_query,
     run_preview,
+    run_combined_export,
     df_to_csv_bytes,
     export_to_sheets,
     autodetect_variants,
@@ -35,11 +36,16 @@ from utility.sql_builder import (
     ExperimentConfig,
     VariantPair,
     build_baseline,
-    build_binomial,
-    build_continuous,
     build_sequential,
     build_interaction,
     build_autodetect_variants_query,
+    binomial_shared_scan_flags,
+    build_shared_scan_select,
+    build_binomial_from_shared_scan,
+    build_continuous_from_shared_scan,
+    build_experiment_single_output_sql,
+    build_experiment_shared_scan_temp_table_sql,
+    build_experiment_session_output_sql,
 )
 
 
@@ -53,8 +59,7 @@ from utility.sql_builder import (
 
 EXPORT_MODES: list[tuple[str, str]] = [
     ("baseline",     "📊 Baseline export"),
-    ("binomial",     "🔢 Experiment — Binomial"),
-    ("continuous",   "📈 Experiment — Continuous"),
+    ("experiment",   "🔢 Experiment data (Binomial / Continuous)"),
     ("sequential",   "🔁 Sequential test"),
     ("interaction",  "🔀 Interaction export"),
 ]
@@ -197,17 +202,50 @@ def _render_baseline_inputs(
     )
 
 
-def _render_binomial_inputs(
+def _render_experiment_inputs(
     project: str,
     dataset: str,
     start_date: str,
     end_date: str,
-) -> Optional[BinomialParams]:
+) -> Optional[dict]:
+    """
+    Merged binomial + continuous mode. Checking one output behaves exactly
+    like the old dedicated binomial/continuous modes. Checking both scans
+    events_* once (shared_scan) and returns two separate result tables —
+    see _run_experiment_mode / _render_combined_execution_gate.
+    """
+    st.subheader("Output(s)")
+    col1, col2 = st.columns(2)
+    with col1:
+        want_binomial = st.checkbox(
+            "Binomial (aggregated conversion counts per variant)",
+            value=True,
+            key="exp_want_binomial",
+            help="Visitor and conversion counts per variant, for conversion-rate KPIs.",
+        )
+    with col2:
+        want_continuous = st.checkbox(
+            "Continuous (row-level RPV / RPT data)",
+            value=False,
+            key="exp_want_continuous",
+            help="One row per user (or user-transaction), for revenue-per-visitor or revenue-per-transaction analysis.",
+        )
+
+    if not want_binomial and not want_continuous:
+        st.warning("Select at least one output — Binomial, Continuous, or both.")
+        return None
+
+    if want_binomial and want_continuous:
+        st.info(
+            "Both outputs selected — events_* is scanned once and shared between them, "
+            "instead of scanning it twice.",
+            icon="💡",
+        )
 
     param_key, match_strategy, exp_prefix, experiments = render_variant_inputs(
         project, dataset, start_date, end_date,
-        key_prefix="bin",
-        show_multi_experiment=True,
+        key_prefix="exp",
+        show_multi_experiment=want_binomial and not want_continuous,
     )
     match_strategy = cast(Literal["exact", "like"], match_strategy)
 
@@ -216,117 +254,90 @@ def _render_binomial_inputs(
         "Post-exposure filtering",
         value=True,
         help="Only count events that occurred after the user's first experiment exposure. Recommended.",
-        key="bin_post_exposure",
+        key="exp_post_exposure",
     )
 
-    st.divider()
-    kpis = render_kpi_checkboxes(
-        project, dataset, start_date, end_date,
-        key_prefix="bin_kpi",
-        show_device_split=True,
-    )
+    binomial_params: Optional[BinomialParams] = None
+    continuous_params: Optional[ContinuousParams] = None
+
+    if want_binomial:
+        st.divider()
+        kpis = render_kpi_checkboxes(
+            project, dataset, start_date, end_date,
+            key_prefix="exp_bin_kpi",
+            show_device_split=True,
+        )
+        binomial_params = BinomialParams(
+            project=project,
+            dataset=dataset,
+            start_date=start_date,
+            end_date=end_date,
+            param_key=param_key,
+            match_strategy=match_strategy,
+            experiments=experiments,
+            post_exposure_filter=post_exposure,
+            kpi_transactions=kpis.get("kpi_transactions", True),
+            kpi_add_to_cart=kpis.get("kpi_add_to_cart", True),
+            kpi_aov=kpis.get("kpi_aov", True),
+            kpi_ideal=kpis.get("kpi_ideal", False),
+            kpi_device_split=kpis.get("kpi_device_split", True),
+            kpi_login=kpis.get("kpi_login", False),
+            kpi_create_account=kpis.get("kpi_create_account", False),
+        )
+
+    if want_continuous:
+        st.divider()
+        col1, col2 = st.columns(2)
+        with col1:
+            device_filter = cast(
+                Literal["all", "desktop", "mobile"],
+                st.radio(
+                    "Device filter",
+                    options=["all", "desktop", "mobile"],
+                    format_func=str.capitalize,
+                    horizontal=True,
+                    key="exp_cont_device_filter",
+                    help="Applied at query level — only the selected device type is returned.",
+                ),
+            )
+        with col2:
+            query_mode = cast(
+                Literal["all_users", "revenue_only"],
+                st.radio(
+                    "Query mode",
+                    options=["all_users", "revenue_only"],
+                    format_func=lambda x: (
+                        "All exposed users (revenue per visitor)"
+                        if x == "all_users"
+                        else "Users with revenue only (revenue per transaction)"
+                    ),
+                    key="exp_cont_query_mode",
+                    help=(
+                        "All exposed users: LEFT JOIN on purchases — non-buyers get revenue = 0. "
+                        "Use this for revenue-per-visitor analysis where zero values matter. "
+                        "Revenue only: INNER JOIN — excludes non-buyers entirely. "
+                        "Use this for revenue-per-transaction analysis."
+                    ),
+                ),
+            )
+        continuous_params = ContinuousParams(
+            project=project,
+            dataset=dataset,
+            start_date=start_date,
+            end_date=end_date,
+            param_key=param_key,
+            match_strategy=match_strategy,
+            experiments=experiments,
+            device_filter=device_filter,
+            query_mode=query_mode,
+            post_exposure_filter=post_exposure,
+        )
 
     if not _experiments_valid(experiments):
         st.warning("All experiments need at least two filled variant strings to continue.")
         return None
 
-    return BinomialParams(
-        project=project,
-        dataset=dataset,
-        start_date=start_date,
-        end_date=end_date,
-        param_key=param_key,
-        match_strategy=match_strategy,
-        experiments=experiments,
-        post_exposure_filter=post_exposure,
-        kpi_transactions=kpis.get("kpi_transactions", True),
-        kpi_add_to_cart=kpis.get("kpi_add_to_cart", True),
-        kpi_aov=kpis.get("kpi_aov", True),
-        kpi_ideal=kpis.get("kpi_ideal", False),
-        kpi_device_split=kpis.get("kpi_device_split", True),
-        kpi_login=kpis.get("kpi_login", False),
-        kpi_create_account=kpis.get("kpi_create_account", False),
-    )
-
-
-def _render_continuous_inputs(
-    project: str,
-    dataset: str,
-    start_date: str,
-    end_date: str,
-) -> Optional[ContinuousParams]:
-
-    st.info(
-        "Continuous queries return one row per user (or user-transaction). "
-        "Review the preview and scan estimate before running.",
-        icon="💡",
-    )
-
-    param_key, match_strategy, exp_prefix, experiments = render_variant_inputs(
-        project, dataset, start_date, end_date,
-        key_prefix="cont",
-        show_multi_experiment=False,
-    )
-    match_strategy = cast(Literal["exact", "like"], match_strategy)
-
-    st.divider()
-    post_exposure = st.toggle(
-        "Post-exposure filtering",
-        value=True,
-        help="Only count purchases that occurred after the user's first exposure.",
-        key="cont_post_exposure",
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        device_filter = cast(
-            Literal["all", "desktop", "mobile"],
-            st.radio(
-                "Device filter",
-                options=["all", "desktop", "mobile"],
-                format_func=str.capitalize,
-                horizontal=True,
-                key="cont_device_filter",
-                help="Applied at query level — only the selected device type is returned.",
-            ),
-        )
-    with col2:
-        query_mode = cast(
-            Literal["all_users", "revenue_only"],
-            st.radio(
-                "Query mode",
-                options=["all_users", "revenue_only"],
-                format_func=lambda x: (
-                    "All exposed users (revenue per visitor)"
-                    if x == "all_users"
-                    else "Users with revenue only (revenue per transaction)"
-                ),
-                key="cont_query_mode",
-                help=(
-                    "All exposed users: LEFT JOIN on purchases — non-buyers get revenue = 0. "
-                    "Use this for revenue-per-visitor analysis where zero values matter. "
-                    "Revenue only: INNER JOIN — excludes non-buyers entirely. "
-                    "Use this for revenue-per-transaction analysis."
-                ),
-            ),
-        )
-
-    if not _experiments_valid(experiments):
-        st.warning("Configure at least one experiment with filled variant strings to continue.")
-        return None
-
-    return ContinuousParams(
-        project=project,
-        dataset=dataset,
-        start_date=start_date,
-        end_date=end_date,
-        param_key=param_key,
-        match_strategy=match_strategy,
-        experiments=experiments,
-        device_filter=device_filter,
-        query_mode=query_mode,
-        post_exposure_filter=post_exposure,
-    )
+    return {"binomial": binomial_params, "continuous": continuous_params}
 
 
 def _render_sequential_inputs(
@@ -574,16 +585,14 @@ def _experiments_valid(experiments: list[ExperimentConfig]) -> bool:
 
 def _build_sql(
     mode: str,
-    params: Union[
-        BaselineParams, BinomialParams, ContinuousParams,
-        SequentialParams, InteractionParams,
-    ],
+    params: Union[BaselineParams, SequentialParams, InteractionParams],
 ) -> str:
-    """Route params to the correct SQL builder."""
+    """Route params to the correct SQL builder. Experiment mode (binomial /
+    continuous, one or both) is handled separately by _run_experiment_mode —
+    it needs a shared events_* scan and, when both outputs are selected, a
+    different (session-based) execution path than the other modes here."""
     builders = {
         "baseline":    lambda p: build_baseline(p),
-        "binomial":    lambda p: build_binomial(p),
-        "continuous":  lambda p: build_continuous(p),
         "sequential":  lambda p: build_sequential(p),
         "interaction": lambda p: build_interaction(p),
     }
@@ -722,6 +731,126 @@ def _render_execution_gate(
         _render_export_row(df_result, result_key, project)
 
 
+def _run_experiment_mode(project: str, dataset: str, selected: dict) -> None:
+    """
+    Builds and executes SQL for the merged binomial/continuous "Experiment
+    data" mode. One output selected -> a single ordinary query (shared_scan
+    as a plain CTE), routed through the existing single-result execution
+    gate below, same as any other mode. Both selected -> shared_scan is
+    materialized once via a BigQuery session and each output is read from
+    it as its own query, via _render_combined_execution_gate.
+    """
+    bp: Optional[BinomialParams] = selected.get("binomial")
+    cp: Optional[ContinuousParams] = selected.get("continuous")
+    ref = bp or cp
+    if ref is None:
+        return  # _render_experiment_inputs already guards against this
+
+    need_page_location, need_payment_type = binomial_shared_scan_flags(bp)
+    shared_scan_select = build_shared_scan_select(
+        ref.project, ref.dataset, ref.start_date, ref.end_date, ref.param_key,
+        need_page_location, need_payment_type,
+    )
+
+    if bp and cp:
+        create_temp_sql = build_experiment_shared_scan_temp_table_sql(shared_scan_select)
+        binomial_sql   = build_experiment_session_output_sql(build_binomial_from_shared_scan(bp))
+        continuous_sql = build_experiment_session_output_sql(build_continuous_from_shared_scan(cp))
+
+        render_sql_viewer(
+            f"{create_temp_sql}\n{binomial_sql}\n{continuous_sql}",
+            key="experiment_combined_sql",
+        )
+        _render_combined_execution_gate(
+            project, dataset, shared_scan_select, create_temp_sql,
+            {"binomial": binomial_sql, "continuous": continuous_sql},
+        )
+    else:
+        label = "binomial" if bp else "continuous"
+        chain = build_binomial_from_shared_scan(bp) if bp else build_continuous_from_shared_scan(cp)
+        sql = build_experiment_single_output_sql(shared_scan_select, chain)
+
+        render_sql_viewer(sql, key=f"experiment_{label}_sql")
+        _render_execution_gate(project, dataset, sql, f"experiment_{label}")
+
+
+def _render_combined_execution_gate(
+    project: str,
+    dataset: str,
+    shared_scan_select: str,
+    create_temp_sql: str,
+    select_sqls: dict[str, str],
+) -> None:
+    """
+    Pre-execution check + run for the two-output (binomial + continuous)
+    case. Dry-runs the bare shared-scan probe for a real cost estimate
+    (unlike sequential mode's script, which BQ can't dry-run at all), then
+    runs the shared scan once via a BigQuery session and both outputs
+    against it, storing each result under its own session-state key.
+    """
+    st.divider()
+    st.subheader("Pre-execution check")
+
+    with st.spinner("Estimating scan cost…"):
+        cost = dry_run(project, shared_scan_select)
+
+    if cost["error"]:
+        st.error(f"Dry-run failed: {cost['error']}")
+        return
+
+    with st.spinner("Fetching monthly usage…"):
+        usage = get_monthly_usage(project, dataset)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(
+            "Shared scan (both outputs)",
+            cost["display"],
+            help="Estimated bytes scanned once and reused for both outputs — this is the whole query cost, not per-output.",
+        )
+    with col2:
+        st.metric(
+            "Used this month",
+            usage["used_display"] if not usage["error"] else "Unavailable",
+        )
+    with col3:
+        st.metric(
+            "Remaining free tier",
+            usage["remaining_display"] if not usage["error"] else "Unavailable",
+        )
+
+    if not usage["error"]:
+        used_pct = usage["used_pct"] / 100
+        st.progress(
+            min(used_pct, 1.0),
+            text=f"{usage['used_display']} of 1 TB used this month ({usage['used_pct']}%)",
+        )
+
+    st.caption(
+        "Preview isn't available for the combined output — cost is dominated by the "
+        "shared scan above, not by row count."
+    )
+
+    st.markdown("---")
+    if st.button("✅ Run full query", type="primary", key="experiment_combined_run"):
+        with st.spinner("Running the shared scan, then both outputs…"):
+            try:
+                results = run_combined_export(project, create_temp_sql, select_sqls)
+                for label, df in results.items():
+                    st.session_state[f"experiment_{label}_result"] = df
+                st.session_state.pop(f"monthly_usage_{project}", None)
+                st.success(", ".join(f"{label}: {len(df):,} rows" for label, df in results.items()))
+            except Exception as e:
+                st.error(f"Query failed: {e}")
+
+    for label in select_sqls:
+        df_result = st.session_state.get(f"experiment_{label}_result")
+        if df_result is not None:
+            st.subheader(label.capitalize())
+            st.dataframe(df_result, use_container_width=True)
+            _render_export_row(df_result, f"experiment_{label}", project)
+
+
 def _render_export_row(df, key_prefix: str, project: str) -> None:
     st.subheader("Export")
     col1, col2 = st.columns(2)
@@ -786,8 +915,8 @@ def run() -> None:
         key="export_mode",
         help=(
             "Baseline: aggregate site metrics for sample size planning — no experiment variables needed. "
-            "Binomial: aggregated conversion counts per variant for transaction rate and binary KPIs. "
-            "Continuous: row-level data per user for revenue per visitor or per transaction analysis. "
+            "Experiment data: binomial (aggregated conversion counts per variant), continuous (row-level "
+            "RPV/RPT data), or both from a single shared scan of events_*. "
             "Sequential: binomial export with optional persistence for sequential testing across runs. "
             "Interaction: classify users by variant combination across multiple simultaneous experiments."
         ),
@@ -799,8 +928,7 @@ def run() -> None:
 
     dispatch = {
         "baseline":    _render_baseline_inputs,
-        "binomial":    _render_binomial_inputs,
-        "continuous":  _render_continuous_inputs,
+        "experiment":  _render_experiment_inputs,
         "sequential":  _render_sequential_inputs,
         "interaction": _render_interaction_inputs,
     }
@@ -809,6 +937,10 @@ def run() -> None:
 
     if params is None:
         st.stop()
+
+    if mode == "experiment":
+        _run_experiment_mode(project, dataset, params)
+        return
 
     # --- SQL preview ---------------------------------------------------------
     sql = _build_sql(mode, params)
