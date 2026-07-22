@@ -494,7 +494,23 @@ def autodetect_variants(
         f"**{cost['display']}** — separate from your export query cost."
     )
     df = run_query(project, sql)
-    return df["variant_string"].tolist() if not df.empty else []
+    if df.empty:
+        if end_dt.date() >= datetime.now().date():
+            st.warning(
+                f"No variant strings found on {sample_start} → {sample_end}. "
+                f"Your end date is today (or later) — BigQuery's GA4 export table "
+                f"for today is usually not finalised until several hours after the "
+                f"day ends, so it may not contain data yet. Try setting the end date "
+                f"to yesterday or earlier and auto-detect again."
+            )
+        else:
+            st.warning(
+                f"No variant strings found on {sample_start} → {sample_end} "
+                f"for param key '{param_key}' and experiment ID '{prefix}'. "
+                f"Double-check the ID and param key, or widen the date range."
+            )
+        return []
+    return df["variant_string"].tolist()
 
 
 def autodetect_kpis(
