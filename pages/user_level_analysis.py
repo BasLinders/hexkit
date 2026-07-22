@@ -489,42 +489,54 @@ def run_negbin_posthoc(df, kpi, group_col, control_label):
 
 def detect_outliers(df, kpi, outlier_stdev, large_file_threshold=10000):
     try:
-        if len(df) > large_file_threshold:
-            st.info(f"Dataset has {len(df):,} rows.")
-            outliers_mask = pd.Series([False] * len(df))
-            for variant in df['experience_variant_label'].unique():
-                variant_data = df[df['experience_variant_label'] == variant][kpi].dropna()
+        # An outlier is an unusually extreme actual value (e.g. an abnormal
+        # order). Zero rows (non-converting visitors, or non-order rows that
+        # haven't been filtered out yet) are never outliers, and including
+        # them would skew the mean/std or OLS fit used to find the real ones.
+        # Bounds are computed on non-zero rows only; zero rows always stay
+        # non-outliers in the returned mask.
+        nonzero_df = df[df[kpi] != 0]
+        outliers_mask = pd.Series([False] * len(df), index=df.index)
+
+        if nonzero_df.empty:
+            return outliers_mask, None, large_file_threshold
+
+        if len(nonzero_df) > large_file_threshold:
+            st.info(f"Dataset has {len(df):,} rows ({len(nonzero_df):,} non-zero).")
+            for variant in nonzero_df['experience_variant_label'].unique():
+                variant_data = nonzero_df[nonzero_df['experience_variant_label'] == variant][kpi].dropna()
                 if not variant_data.empty:
                     # Calculate actual standard deviations instead of IQR
                     mean_val = variant_data.mean()
                     std_val = variant_data.std()
                     lower_bound = mean_val - (outlier_stdev * std_val)
                     upper_bound = mean_val + (outlier_stdev * std_val)
-                    
+
                     variant_outliers = (variant_data < lower_bound) | (variant_data > upper_bound)
                     outliers_mask[variant_data.index] = variant_outliers
             return outliers_mask, None, large_file_threshold
         else:
-            st.info(f"Dataset has {len(df):,} rows.")
-            model = smf.ols(f'{kpi} ~ C(experience_variant_label)', data=df).fit()
+            st.info(f"Dataset has {len(df):,} rows ({len(nonzero_df):,} non-zero).")
+            model = smf.ols(f'{kpi} ~ C(experience_variant_label)', data=nonzero_df).fit()
             influence = model.get_influence()
             standardized_residuals = influence.resid_studentized_internal
             leverage = influence.hat_matrix_diag
             dffits = influence.dffits[0]
 
             residual_threshold = outlier_stdev
-            leverage_threshold = outlier_stdev * (model.df_model + 1) / len(df)
-            dffits_threshold = outlier_stdev * np.sqrt((model.df_model + 1) / len(df))
+            leverage_threshold = outlier_stdev * (model.df_model + 1) / len(nonzero_df)
+            dffits_threshold = outlier_stdev * np.sqrt((model.df_model + 1) / len(nonzero_df))
 
             residuals_outliers = np.abs(standardized_residuals) > residual_threshold
             leverage_outliers = leverage > leverage_threshold
             dffits_outliers = np.abs(dffits) > dffits_threshold
-            outliers_mask = residuals_outliers | leverage_outliers | dffits_outliers
+            nonzero_outliers = residuals_outliers | leverage_outliers | dffits_outliers
+            outliers_mask[nonzero_df.index] = nonzero_outliers
             return outliers_mask, model, large_file_threshold
 
     except Exception as e:
         st.error(f"Error during outlier detection: {e}")
-        return pd.Series([False] * len(df)), None, large_file_threshold
+        return pd.Series([False] * len(df), index=df.index), None, large_file_threshold
 
 # Winsorize and IQR filter combined
 
@@ -534,20 +546,32 @@ def winsorize_data(df, kpi, method, outlier_stdev=None, percentile=None):
     upper_cap = None
     cap_description = "No capping applied" # Default description
 
+    # Bounds should reflect the actual value distribution among real
+    # orders/spenders, not the zero mass (non-converting visitors, or
+    # not-yet-filtered non-order rows) — otherwise a positive lower_cap would
+    # also get applied to zero rows below, incorrectly raising them above zero.
+    # Capping itself is likewise restricted to non-zero rows further down.
+    nonzero_mask = df_copy[kpi] != 0
+    nonzero_values = df_copy.loc[nonzero_mask, kpi]
+
+    if nonzero_values.empty:
+        st.warning(f"Warning: No non-zero {kpi} values to compute Winsorization bounds from. No capping applied.")
+        return df_copy, None, None, "No non-zero values"
+
     if method == 'Standard Deviation':
         if outlier_stdev is None:
             outlier_stdev = 3 # Sensible default
             st.warning(f"Winsorization Standard Deviation not specified, defaulting to {outlier_stdev}.") # Inform user
-        if df_copy[kpi].std() == 0:
-             st.warning(f"Warning: Standard deviation of {kpi} is zero. Cannot apply standard deviation Winsorization.")
+        if nonzero_values.std() == 0:
+             st.warning(f"Warning: Standard deviation of non-zero {kpi} values is zero. Cannot apply standard deviation Winsorization.")
              return df_copy, None, None, "Standard deviation is zero"
 
-        mean = df_copy[kpi].mean()
-        std_dev = df_copy[kpi].std()
+        mean = nonzero_values.mean()
+        std_dev = nonzero_values.std()
         lower_cap = mean - (outlier_stdev * std_dev)
         upper_cap = mean + (outlier_stdev * std_dev)
-        cap_description = f"{outlier_stdev} standard deviations from the mean"
-        st.write(f"_Calculating Winsorization bounds based on: mean ± {outlier_stdev} * std_dev_") # Add clarity
+        cap_description = f"{outlier_stdev} standard deviations from the mean (non-zero rows)"
+        st.write(f"_Calculating Winsorization bounds based on: mean ± {outlier_stdev} * std_dev, non-zero rows_") # Add clarity
 
     elif method == 'Percentile':
         if percentile is None:
@@ -557,11 +581,11 @@ def winsorize_data(df, kpi, method, outlier_stdev=None, percentile=None):
         # Calculate the actual lower/upper percentile values (e.g., 95th -> 2.5th and 97.5th)
         lower_p = (100.0 - percentile) / 2.0
         upper_p = 100.0 - lower_p
-        lower_cap = np.percentile(df_copy[kpi].dropna(), lower_p) # Use np.percentile for robustness
-        upper_cap = np.percentile(df_copy[kpi].dropna(), upper_p) # Use np.percentile for robustness
+        lower_cap = np.percentile(nonzero_values, lower_p) # Use np.percentile for robustness
+        upper_cap = np.percentile(nonzero_values, upper_p) # Use np.percentile for robustness
         # Provide more specific description
-        cap_description = f"the {lower_p:.1f}th and {upper_p:.1f}th percentiles"
-        st.write(f"_Calculating Winsorization bounds based on percentiles: {lower_p:.1f} and {upper_p:.1f}_") # Add clarity
+        cap_description = f"the {lower_p:.1f}th and {upper_p:.1f}th percentiles (non-zero rows)"
+        st.write(f"_Calculating Winsorization bounds based on percentiles: {lower_p:.1f} and {upper_p:.1f}, non-zero rows_") # Add clarity
 
     else:
         # This case should ideally not be reached if UI logic is correct
@@ -571,9 +595,11 @@ def winsorize_data(df, kpi, method, outlier_stdev=None, percentile=None):
     # Apply capping using the determined lower and upper bounds
     # Ensure caps are not None before proceeding
     if lower_cap is not None and upper_cap is not None:
-        df_copy[kpi] = np.where(df_copy[kpi] < lower_cap, lower_cap, df_copy[kpi])
-        df_copy[kpi] = np.where(df_copy[kpi] > upper_cap, upper_cap, df_copy[kpi])
-        st.write(f"_Applied capping between {lower_cap:.4f} and {upper_cap:.4f}_")
+        capped = df_copy.loc[nonzero_mask, kpi]
+        capped = np.where(capped < lower_cap, lower_cap, capped)
+        capped = np.where(capped > upper_cap, upper_cap, capped)
+        df_copy.loc[nonzero_mask, kpi] = capped
+        st.write(f"_Applied capping between {lower_cap:.4f} and {upper_cap:.4f} (non-zero rows only)_")
     else:
         st.warning("Warning: Could not determine capping bounds. No Winsorization applied.")
         cap_description = "No capping applied (bounds indeterminate)"

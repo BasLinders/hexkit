@@ -47,6 +47,10 @@ class BaselineParams:
     dataset: str
     start_date: str
     end_date: str
+    output_type: Literal["binomial", "revenue"] = "binomial"
+    # "per_user" (one row per order, for pre-test model fitting) is only
+    # meaningful for output_type == "revenue".
+    output_shape: Literal["aggregate", "daily", "per_user"] = "aggregate"
     page_filter_type: Optional[Literal["regex", "contains"]] = None  # None = no filter
     page_filter_value: str = ""
 
@@ -122,16 +126,15 @@ class InteractionParams:
 # BASELINE
 # ---------------------------------------------------------------------------
 
-def build_baseline(p: BaselineParams, limit: int = 0) -> str:
-    table = _table_ref(p.project, p.dataset)
-    suffix = _suffix_filter(p.start_date, p.end_date)
-
-    if p.page_filter_type and p.page_filter_value:
-        if p.page_filter_type == "regex":
-            page_condition = f"AND REGEXP_CONTAINS(params.value.string_value, r'{p.page_filter_value}')"
-        else:
-            page_condition = f"AND params.value.string_value LIKE '%{p.page_filter_value}%'"
-        view_page_cte = f"""
+def _baseline_page_filter(p: BaselineParams, table: str, suffix: str) -> tuple[str, str]:
+    """Builds the optional page-view filter CTE + join clause shared by all baseline shapes."""
+    if not (p.page_filter_type and p.page_filter_value):
+        return "", ""
+    if p.page_filter_type == "regex":
+        page_condition = f"AND REGEXP_CONTAINS(params.value.string_value, r'{p.page_filter_value}')"
+    else:
+        page_condition = f"AND params.value.string_value LIKE '%{p.page_filter_value}%'"
+    cte = f"""
 view_page_users AS (
   SELECT DISTINCT user_pseudo_id
   FROM {table}, UNNEST(event_params) AS params
@@ -140,14 +143,114 @@ view_page_users AS (
     AND params.key = 'page_location'
     {page_condition}
 ),"""
-        join_clause = "INNER JOIN view_page_users ON main.user_pseudo_id = view_page_users.user_pseudo_id"
-    else:
-        view_page_cte = ""
-        join_clause = ""
+    join = "INNER JOIN view_page_users ON main.user_pseudo_id = view_page_users.user_pseudo_id"
+    return cte, join
 
+
+def build_baseline(p: BaselineParams, limit: int = 0) -> str:
+    if p.output_shape == "daily":
+        return _build_baseline_daily(p, limit)
+    if p.output_shape == "per_user":
+        return _build_baseline_per_user(p, limit)
+    return _build_baseline_aggregate(p, limit)
+
+
+def _build_baseline_aggregate(p: BaselineParams, limit: int = 0) -> str:
+    table = _table_ref(p.project, p.dataset)
+    suffix = _suffix_filter(p.start_date, p.end_date)
+    view_page_cte, join_clause = _baseline_page_filter(p, table, suffix)
     limit_clause = f"\nLIMIT {limit}" if limit else ""
 
-    return f"""-- Baseline export — sample size preparation
+    if p.output_type == "revenue":
+        select_cols = """
+  -- All devices
+  COUNT(DISTINCT main.user_pseudo_id) AS total_visitors,
+  COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' THEN main.ecommerce.transaction_id END) AS total_transactions,
+  SUM(CASE WHEN main.event_name = 'purchase' THEN main.ecommerce.purchase_revenue ELSE 0 END) AS total_purchase_revenue,
+  ROUND(SUM(CASE WHEN main.event_name = 'purchase' THEN main.ecommerce.purchase_revenue ELSE 0 END) / NULLIF(COUNT(DISTINCT main.user_pseudo_id), 0), 2) AS total_revenue_per_visitor,
+  ROUND(SUM(CASE WHEN main.event_name = 'purchase' THEN main.ecommerce.purchase_revenue ELSE 0 END) / NULLIF(COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' THEN main.ecommerce.transaction_id END), 0), 2) AS total_average_order_value,
+  -- Mobile
+  COUNT(DISTINCT CASE WHEN main.device.category = 'mobile' THEN main.user_pseudo_id END) AS mobile_visitors,
+  COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' AND main.device.category = 'mobile' THEN main.ecommerce.transaction_id END) AS mobile_transactions,
+  SUM(CASE WHEN main.event_name = 'purchase' AND main.device.category = 'mobile' THEN main.ecommerce.purchase_revenue ELSE 0 END) AS mobile_purchase_revenue,
+  ROUND(SUM(CASE WHEN main.event_name = 'purchase' AND main.device.category = 'mobile' THEN main.ecommerce.purchase_revenue ELSE 0 END) / NULLIF(COUNT(DISTINCT CASE WHEN main.device.category = 'mobile' THEN main.user_pseudo_id END), 0), 2) AS mobile_revenue_per_visitor,
+  ROUND(SUM(CASE WHEN main.event_name = 'purchase' AND main.device.category = 'mobile' THEN main.ecommerce.purchase_revenue ELSE 0 END) / NULLIF(COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' AND main.device.category = 'mobile' THEN main.ecommerce.transaction_id END), 0), 2) AS mobile_average_order_value,
+  -- Desktop
+  COUNT(DISTINCT CASE WHEN main.device.category = 'desktop' THEN main.user_pseudo_id END) AS desktop_visitors,
+  COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' AND main.device.category = 'desktop' THEN main.ecommerce.transaction_id END) AS desktop_transactions,
+  SUM(CASE WHEN main.event_name = 'purchase' AND main.device.category = 'desktop' THEN main.ecommerce.purchase_revenue ELSE 0 END) AS desktop_purchase_revenue,
+  ROUND(SUM(CASE WHEN main.event_name = 'purchase' AND main.device.category = 'desktop' THEN main.ecommerce.purchase_revenue ELSE 0 END) / NULLIF(COUNT(DISTINCT CASE WHEN main.device.category = 'desktop' THEN main.user_pseudo_id END), 0), 2) AS desktop_revenue_per_visitor,
+  ROUND(SUM(CASE WHEN main.event_name = 'purchase' AND main.device.category = 'desktop' THEN main.ecommerce.purchase_revenue ELSE 0 END) / NULLIF(COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' AND main.device.category = 'desktop' THEN main.ecommerce.transaction_id END), 0), 2) AS desktop_average_order_value"""
+    else:
+        select_cols = """
+  -- All devices
+  COUNT(DISTINCT main.user_pseudo_id) AS total_visitors,
+  COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' THEN main.user_pseudo_id END) AS total_conversions,
+  -- Mobile
+  COUNT(DISTINCT CASE WHEN main.device.category = 'mobile' THEN main.user_pseudo_id END) AS mobile_visitors,
+  COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' AND main.device.category = 'mobile' THEN main.user_pseudo_id END) AS mobile_conversions,
+  -- Desktop
+  COUNT(DISTINCT CASE WHEN main.device.category = 'desktop' THEN main.user_pseudo_id END) AS desktop_visitors,
+  COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' AND main.device.category = 'desktop' THEN main.user_pseudo_id END) AS desktop_conversions"""
+
+    return f"""-- Baseline export ({p.output_type}, aggregate) — sample size preparation
+DECLARE start_date STRING DEFAULT '{p.start_date}';
+DECLARE end_date   STRING DEFAULT '{p.end_date}';
+
+WITH{view_page_cte}
+dummy AS (SELECT 1)  -- placeholder when no page filter
+
+SELECT{select_cols}
+FROM {table} AS main
+{join_clause}
+WHERE main.{suffix}{limit_clause};
+"""
+
+
+def _build_baseline_daily(p: BaselineParams, limit: int = 0) -> str:
+    table = _table_ref(p.project, p.dataset)
+    suffix = _suffix_filter(p.start_date, p.end_date)
+    view_page_cte, join_clause = _baseline_page_filter(p, table, suffix)
+    limit_clause = f"\nLIMIT {limit}" if limit else ""
+
+    if p.output_type == "revenue":
+        select_cols = """
+  PARSE_DATE('%Y%m%d', main.event_date) AS report_date,
+  COUNT(DISTINCT main.user_pseudo_id) AS visitors,
+  COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' THEN main.ecommerce.transaction_id END) AS transactions,
+  SUM(CASE WHEN main.event_name = 'purchase' THEN main.ecommerce.purchase_revenue ELSE 0 END) AS purchase_revenue"""
+    else:
+        select_cols = """
+  PARSE_DATE('%Y%m%d', main.event_date) AS report_date,
+  COUNT(DISTINCT main.user_pseudo_id) AS visitors,
+  COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' THEN main.user_pseudo_id END) AS conversions"""
+
+    return f"""-- Baseline export ({p.output_type}, daily rows) — sample size preparation
+DECLARE start_date STRING DEFAULT '{p.start_date}';
+DECLARE end_date   STRING DEFAULT '{p.end_date}';
+
+WITH{view_page_cte}
+dummy AS (SELECT 1)  -- placeholder when no page filter
+
+SELECT{select_cols}
+FROM {table} AS main
+{join_clause}
+WHERE main.{suffix}
+GROUP BY report_date
+ORDER BY report_date{limit_clause};
+"""
+
+
+def _build_baseline_per_user(p: BaselineParams, limit: int = 0) -> str:
+    """One row per completed order — for fitting a distribution (e.g. Negative
+    Binomial or Gamma) from raw data in the pre-test tool's continuous KPI mode.
+    Revenue-only: a binomial baseline has no per-order raw value to fit."""
+    table = _table_ref(p.project, p.dataset)
+    suffix = _suffix_filter(p.start_date, p.end_date)
+    view_page_cte, join_clause = _baseline_page_filter(p, table, suffix)
+    limit_clause = f"\nLIMIT {limit}" if limit else ""
+
+    return f"""-- Baseline export (revenue, per-order raw values) — sample size preparation
 DECLARE start_date STRING DEFAULT '{p.start_date}';
 DECLARE end_date   STRING DEFAULT '{p.end_date}';
 
@@ -155,24 +258,16 @@ WITH{view_page_cte}
 dummy AS (SELECT 1)  -- placeholder when no page filter
 
 SELECT
-  -- All devices
-  COUNT(DISTINCT main.user_pseudo_id)                                                         AS total_visitors,
-  COUNTIF(main.event_name = 'add_to_cart')                                                    AS total_add_to_cart,
-  SUM(CASE WHEN main.event_name = 'purchase' THEN main.ecommerce.total_item_quantity ELSE 0 END) AS total_items_purchased,
-  COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' THEN main.ecommerce.transaction_id END)  AS total_transactions,
-  -- Mobile
-  COUNT(DISTINCT CASE WHEN main.device.category = 'mobile' THEN main.user_pseudo_id END)     AS mobile_visitors,
-  COUNTIF(main.event_name = 'add_to_cart' AND main.device.category = 'mobile')               AS mobile_add_to_cart,
-  SUM(CASE WHEN main.event_name = 'purchase' AND main.device.category = 'mobile' THEN main.ecommerce.total_item_quantity ELSE 0 END) AS mobile_items_purchased,
-  COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' AND main.device.category = 'mobile' THEN main.ecommerce.transaction_id END)  AS mobile_transactions,
-  -- Desktop
-  COUNT(DISTINCT CASE WHEN main.device.category = 'desktop' THEN main.user_pseudo_id END)    AS desktop_visitors,
-  COUNTIF(main.event_name = 'add_to_cart' AND main.device.category = 'desktop')              AS desktop_add_to_cart,
-  SUM(CASE WHEN main.event_name = 'purchase' AND main.device.category = 'desktop' THEN main.ecommerce.total_item_quantity ELSE 0 END) AS desktop_items_purchased,
-  COUNT(DISTINCT CASE WHEN main.event_name = 'purchase' AND main.device.category = 'desktop' THEN main.ecommerce.transaction_id END)  AS desktop_transactions
+  main.user_pseudo_id AS user_pseudo_id,
+  main.ecommerce.transaction_id AS transaction_id,
+  main.ecommerce.purchase_revenue AS purchase_revenue,
+  main.ecommerce.total_item_quantity AS total_item_quantity
 FROM {table} AS main
 {join_clause}
-WHERE main.{suffix}{limit_clause};
+WHERE main.{suffix}
+  AND main.event_name = 'purchase'
+  AND main.ecommerce.purchase_revenue IS NOT NULL
+  AND main.ecommerce.purchase_revenue <> 0.0{limit_clause};
 """
 
 

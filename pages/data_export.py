@@ -71,6 +71,56 @@ def _render_baseline_inputs(
     end_date: str,
 ) -> Optional[BaselineParams]:
 
+    st.subheader("Output data")
+    output_type = cast(
+        Literal["binomial", "revenue"],
+        st.radio(
+            "Output type",
+            options=["binomial", "revenue"],
+            format_func=lambda x: (
+                "Binomial (visitors / conversions)" if x == "binomial"
+                else "Revenue (RPV / RPT)"
+            ),
+            horizontal=True,
+            key="bl_output_type",
+            help=(
+                "Binomial: visitor and conversion counts, for conversion-rate sample "
+                "size planning. Revenue: purchase revenue alongside visitors/transactions, "
+                "for RPV (revenue per visitor) or RPT/AOV (revenue per transaction) "
+                "sample size planning."
+            ),
+        ),
+    )
+
+    shape_options = ["aggregate", "daily"]
+    if output_type == "revenue":
+        shape_options.append("per_user")
+    shape_labels = {
+        "aggregate": "Aggregate (single row for the date range)",
+        "daily": "Daily rows (one row per day)",
+        "per_user": "Per-order raw values (for model fitting)",
+    }
+    if st.session_state.get("bl_output_shape") not in shape_options:
+        st.session_state["bl_output_shape"] = "aggregate"
+    output_shape = cast(
+        Literal["aggregate", "daily", "per_user"],
+        st.radio(
+            "Output shape",
+            options=shape_options,
+            format_func=lambda x: shape_labels[x],
+            horizontal=True,
+            key="bl_output_shape",
+            help=(
+                "Aggregate: one summary row, for the pre-test tool's manual baseline "
+                "inputs. Daily rows: one row per day, for the pre-test tool's seasonal "
+                "forecasting CSV upload. Per-order raw values: one row per completed "
+                "order, for fitting a Negative Binomial or Gamma model from raw data "
+                "in the pre-test tool's continuous KPI mode."
+            ),
+        ),
+    )
+
+    st.divider()
     st.subheader("Page filter")
     st.caption(
         "Optional. Filter to users who visited specific pages before inclusion. "
@@ -126,6 +176,8 @@ def _render_baseline_inputs(
         dataset=dataset,
         start_date=start_date,
         end_date=end_date,
+        output_type=output_type,
+        output_shape=output_shape,
         page_filter_type=page_filter_type,
         page_filter_value=page_filter_value,
     )
