@@ -120,6 +120,19 @@ def _render_baseline_inputs(
         ),
     )
 
+    kpi_add_to_cart = False
+    if output_type == "binomial":
+        kpi_add_to_cart = st.checkbox(
+            "Also include add-to-cart conversions",
+            value=False,
+            key="bl_kpi_add_to_cart",
+            help=(
+                "Adds add-to-cart conversion counts alongside the purchase-based "
+                "ones — useful when planning a test for an add-to-cart-rate KPI "
+                "rather than purchase rate. No extra scan cost."
+            ),
+        )
+
     st.divider()
     st.subheader("Page filter")
     st.caption(
@@ -178,6 +191,7 @@ def _render_baseline_inputs(
         end_date=end_date,
         output_type=output_type,
         output_shape=output_shape,
+        kpi_add_to_cart=kpi_add_to_cart,
         page_filter_type=page_filter_type,
         page_filter_value=page_filter_value,
     )
