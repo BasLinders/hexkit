@@ -10,7 +10,7 @@ if not st.session_state.get("admin_authenticated") and "code" not in st.query_pa
 
 import json
 import math
-from typing import Literal, cast
+from typing import Literal, Optional, cast
 
 import pandas as pd
 
@@ -20,20 +20,26 @@ from utility.bq_ui_components import (
     render_date_range,
     render_variant_inputs,
     render_execution_gate,
+    render_combined_execution_gate,
     render_sql_viewer,
 )
 from utility.sql_builder import (
     BinomialParams,
+    ContinuousParams,
     binomial_shared_scan_flags,
     build_shared_scan_select,
     build_binomial_from_shared_scan,
+    build_continuous_from_shared_scan,
     build_experiment_single_output_sql,
+    build_experiment_shared_scan_temp_table_sql,
+    build_experiment_session_output_sql,
 )
 from utility.automation_engine import (
     VariantData,
     TAILS,
     run_frequentist_analysis,
     run_bayesian_analysis,
+    run_continuous_analysis,
     build_airtable_payload,
 )
 from utility.airtable_client import get_credentials, push_record
@@ -67,8 +73,8 @@ def _render_stepper(stage: int):
 def _render_stage_fetch():
     st.subheader("Step 1 — Fetch data from BigQuery")
     st.caption(
-        "Runs the same binomial export used in Data Export, restricted to "
-        "exactly one control (A) and one variation (B)."
+        "Same experiment data as Data Export's binomial/continuous modes, "
+        "restricted to exactly one control (A) and one variation (B)."
     )
 
     # The OAuth redirect starts a fresh Streamlit session with a blank
@@ -88,6 +94,33 @@ def _render_stage_fetch():
     start_date, end_date = render_date_range()
 
     st.divider()
+    st.subheader("Data to fetch")
+    col1, col2 = st.columns(2)
+    with col1:
+        want_binomial = st.checkbox(
+            "Binomial (conversion rate / AOV)",
+            value=True,
+            key="autofetch_want_binomial",
+            help="Enables Frequentist and Bayesian analysis in the next step.",
+        )
+    with col2:
+        want_continuous = st.checkbox(
+            "Continuous (revenue per visitor)",
+            value=False,
+            key="autofetch_want_continuous",
+            help="Enables Continuous Analysis in the next step.",
+        )
+    if not want_binomial and not want_continuous:
+        st.warning("Select at least one data set — Binomial, Continuous, or both.")
+        return
+    if want_binomial and want_continuous:
+        st.info(
+            "Both selected — events_* is scanned once and shared between them, "
+            "instead of scanning it twice.",
+            icon="💡",
+        )
+
+    st.divider()
     param_key, match_strategy, exp_prefix, experiments = render_variant_inputs(
         project, dataset, start_date, end_date,
         key_prefix="autofetch",
@@ -104,45 +137,89 @@ def _render_stage_fetch():
         )
         return
 
-    params = BinomialParams(
-        project=project,
-        dataset=dataset,
-        start_date=start_date,
-        end_date=end_date,
-        param_key=param_key,
-        match_strategy=cast(Literal["exact", "like"], match_strategy),
-        experiments=experiments,
-        post_exposure_filter=True,
-        kpi_transactions=True,
-        kpi_aov=True,
-        kpi_add_to_cart=False,
-        kpi_ideal=False,
-        kpi_device_split=False,
-        kpi_login=False,
-        kpi_create_account=False,
-    )
-    need_page_location, need_payment_type = binomial_shared_scan_flags(params)
+    match_strategy = cast(Literal["exact", "like"], match_strategy)
+
+    binomial_params: Optional[BinomialParams] = None
+    if want_binomial:
+        binomial_params = BinomialParams(
+            project=project,
+            dataset=dataset,
+            start_date=start_date,
+            end_date=end_date,
+            param_key=param_key,
+            match_strategy=match_strategy,
+            experiments=experiments,
+            post_exposure_filter=True,
+            kpi_transactions=True,
+            kpi_aov=True,
+            kpi_add_to_cart=False,
+            kpi_ideal=False,
+            kpi_device_split=False,
+            kpi_login=False,
+            kpi_create_account=False,
+        )
+
+    continuous_params: Optional[ContinuousParams] = None
+    if want_continuous:
+        continuous_params = ContinuousParams(
+            project=project,
+            dataset=dataset,
+            start_date=start_date,
+            end_date=end_date,
+            param_key=param_key,
+            match_strategy=match_strategy,
+            experiments=experiments,
+            device_filter="all",
+            query_mode="all_users",  # RPV — non-buyers included, matches run_continuous_analysis's per-visitor assumption
+            post_exposure_filter=True,
+        )
+
+    need_page_location, need_payment_type = binomial_shared_scan_flags(binomial_params)
     shared_scan_select = build_shared_scan_select(
         project, dataset, start_date, end_date, param_key,
         need_page_location, need_payment_type,
     )
-    sql = build_experiment_single_output_sql(shared_scan_select, build_binomial_from_shared_scan(params))
-    render_sql_viewer(sql, key="auto_sql")
 
-    render_execution_gate(project, sql, result_key="auto_query_result", allow_preview=True)
+    if binomial_params and continuous_params:
+        create_temp_sql = build_experiment_shared_scan_temp_table_sql(shared_scan_select)
+        binomial_sql   = build_experiment_session_output_sql(build_binomial_from_shared_scan(binomial_params))
+        continuous_sql = build_experiment_session_output_sql(build_continuous_from_shared_scan(continuous_params))
 
-    df = st.session_state.get("auto_query_result")
-    if df is None:
+        render_sql_viewer(
+            f"{create_temp_sql}\n{binomial_sql}\n{continuous_sql}",
+            key="auto_sql",
+        )
+        render_combined_execution_gate(
+            project, dataset, shared_scan_select, create_temp_sql,
+            {"binomial": binomial_sql, "continuous": continuous_sql},
+            result_key_prefix="auto",
+        )
+    else:
+        label = "binomial" if binomial_params else "continuous"
+        chain = (
+            build_binomial_from_shared_scan(binomial_params) if binomial_params
+            else build_continuous_from_shared_scan(continuous_params)
+        )
+        sql = build_experiment_single_output_sql(shared_scan_select, chain)
+        render_sql_viewer(sql, key="auto_sql")
+        render_execution_gate(project, sql, result_key=f"auto_{label}_result", allow_preview=True)
+
+    df_binomial = st.session_state.get("auto_binomial_result")
+    df_continuous = st.session_state.get("auto_continuous_result")
+    if df_binomial is None and df_continuous is None:
         return
 
-    row_labels = set(df["experience_variant_label"])
-    if not {"A", "B"}.issubset(row_labels):
-        st.error("Query result is missing rows for control (A) and/or variation (B).")
+    if df_binomial is not None and not {"A", "B"}.issubset(set(df_binomial["experience_variant_label"])):
+        st.error("Binomial result is missing rows for control (A) and/or variation (B).")
+        return
+    if df_continuous is not None and not {"A", "B"}.issubset(set(df_continuous["experience_variant_label"])):
+        st.error("Continuous result is missing rows for control (A) and/or variation (B).")
         return
 
     st.divider()
     if st.button("Continue to choose analysis method(s) →", type="primary"):
-        st.session_state["auto_df"] = df
+        st.session_state["auto_df_binomial"] = df_binomial
+        st.session_state["auto_df_continuous"] = df_continuous
         st.session_state["auto_stage"] = 2
         st.rerun()
 
@@ -162,54 +239,93 @@ def _variant_from_row(row, label: str) -> VariantData:
 
 
 def _render_stage_configure():
-    df = st.session_state.get("auto_df")
-    if df is None:
+    df_binomial = st.session_state.get("auto_df_binomial")
+    df_continuous = st.session_state.get("auto_df_continuous")
+    if df_binomial is None and df_continuous is None:
         st.session_state["auto_stage"] = 1
         st.rerun()
         return
 
     st.subheader("Step 2 — Choose analysis method(s)")
 
-    control = _variant_from_row(df[df["experience_variant_label"] == "A"].iloc[0], "Control")
-    variation = _variant_from_row(df[df["experience_variant_label"] == "B"].iloc[0], "Variation")
+    control = variation = None
+    if df_binomial is not None:
+        control = _variant_from_row(df_binomial[df_binomial["experience_variant_label"] == "A"].iloc[0], "Control")
+        variation = _variant_from_row(df_binomial[df_binomial["experience_variant_label"] == "B"].iloc[0], "Variation")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Control — visitors", f"{control.visitors:,}")
-        rate = control.conversions / control.visitors if control.visitors else 0.0
-        st.metric("Control — conversions", f"{control.conversions:,}", help=f"Rate: {rate:.2%}")
-        st.metric("Control — AOV", f"€{control.aov:,.2f}")
-    with col2:
-        st.metric("Variation — visitors", f"{variation.visitors:,}")
-        rate = variation.conversions / variation.visitors if variation.visitors else 0.0
-        st.metric("Variation — conversions", f"{variation.conversions:,}", help=f"Rate: {rate:.2%}")
-        st.metric("Variation — AOV", f"€{variation.aov:,.2f}")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Control — visitors", f"{control.visitors:,}")
+            rate = control.conversions / control.visitors if control.visitors else 0.0
+            st.metric("Control — conversions", f"{control.conversions:,}", help=f"Rate: {rate:.2%}")
+            st.metric("Control — AOV", f"€{control.aov:,.2f}")
+        with col2:
+            st.metric("Variation — visitors", f"{variation.visitors:,}")
+            rate = variation.conversions / variation.visitors if variation.visitors else 0.0
+            st.metric("Variation — conversions", f"{variation.conversions:,}", help=f"Rate: {rate:.2%}")
+            st.metric("Variation — AOV", f"€{variation.aov:,.2f}")
+
+    if df_continuous is not None:
+        st.markdown("**Continuous data — revenue per visitor**")
+        cont_summary = (
+            df_continuous.assign(purchase_revenue=pd.to_numeric(df_continuous["purchase_revenue"], errors="coerce").fillna(0.0))
+            .groupby("experience_variant_label")["purchase_revenue"]
+            .agg(["mean", "count"])
+            .rename(columns={"mean": "revenue per visitor", "count": "visitors"})
+        )
+        st.dataframe(cont_summary, use_container_width=True)
 
     st.divider()
     st.markdown("**Analysis method(s)**")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        use_frequentist = st.checkbox("Frequentist Analysis", value=True, key="auto_use_frequentist")
+        use_frequentist = st.checkbox(
+            "Frequentist Analysis", value=df_binomial is not None,
+            disabled=df_binomial is None, key="auto_use_frequentist",
+            help=None if df_binomial is not None else "Requires binomial data — fetch it in step 1.",
+        )
     with c2:
-        use_bayesian = st.checkbox("Bayesian Analysis", value=True, key="auto_use_bayesian")
+        use_bayesian = st.checkbox(
+            "Bayesian Analysis", value=df_binomial is not None,
+            disabled=df_binomial is None, key="auto_use_bayesian",
+            help=None if df_binomial is not None else "Requires binomial data — fetch it in step 1.",
+        )
     with c3:
+        use_continuous = st.checkbox(
+            "Continuous Analysis", value=df_continuous is not None,
+            disabled=df_continuous is None, key="auto_use_continuous",
+            help=None if df_continuous is not None else "Requires continuous data — fetch it in step 1.",
+        )
+    with c4:
         st.checkbox(
             "Pre-Test Analysis", value=False, disabled=True,
             key="auto_use_pretest", help="Coming soon.",
         )
 
-    if not use_frequentist and not use_bayesian:
+    # Streamlit persists a checkbox's checked state across reruns even while
+    # disabled=True, so a method checked before a re-fetch dropped its data
+    # would otherwise stay "on" here despite being greyed out in the UI.
+    use_frequentist = use_frequentist and df_binomial is not None
+    use_bayesian = use_bayesian and df_binomial is not None
+    use_continuous = use_continuous and df_continuous is not None
+
+    if not use_frequentist and not use_bayesian and not use_continuous:
         st.warning("Select at least one analysis method to continue.")
         return
 
     start = st.session_state.get("start_date")
     end = st.session_state.get("end_date")
     runtime_days = max((end - start).days + 1, 1) if start and end else 1
-    daily_visitors = (control.visitors + variation.visitors) / runtime_days
+    if control is not None and variation is not None:
+        total_visitors = control.visitors + variation.visitors
+    else:
+        # Per-visitor rows (RPV query mode) — one row per exposed user.
+        total_visitors = len(df_continuous)
+    daily_visitors = total_visitors / runtime_days
 
     st.divider()
-    if use_frequentist:
-        with st.expander("Frequentist settings", expanded=True):
+    if use_frequentist or use_continuous:
+        with st.expander("Significance settings", expanded=True):
             fc1, fc2 = st.columns(2)
             with fc1:
                 confidence_level = st.slider(
@@ -248,17 +364,22 @@ def _render_stage_configure():
             )
         st.caption(f"Test runtime: {runtime_days} day(s) · Daily visitors: {daily_visitors:,.0f}")
 
-    revenue_source = "frequentist"
-    if use_frequentist and use_bayesian:
+    active_methods = [
+        m for m, using in (
+            ("Frequentist", use_frequentist),
+            ("Bayesian", use_bayesian),
+            ("Continuous", use_continuous),
+        ) if using
+    ]
+    revenue_source = active_methods[0].lower()
+    if len(active_methods) > 1:
         choice = st.radio(
             "Use for the shared 'effect on revenue' field:",
-            options=["Frequentist", "Bayesian"],
+            options=active_methods,
             horizontal=True,
             key="auto_revenue_source_radio",
         )
         revenue_source = choice.lower()
-    elif use_bayesian:
-        revenue_source = "bayesian"
 
     st.divider()
     col_back, col_next = st.columns(2)
@@ -285,6 +406,16 @@ def _render_stage_configure():
                     projection_days=int(projection_days),
                     n_samples=int(n_samples),
                 )
+            if use_continuous:
+                results["continuous"] = run_continuous_analysis(
+                    df_continuous,
+                    control_label="A",
+                    variation_label="B",
+                    daily_visitors=daily_visitors,
+                    projection_days=int(projection_days),
+                    confidence_level=confidence_level,
+                    tail=tail,
+                )
             st.session_state["auto_control"] = control
             st.session_state["auto_variation"] = variation
             st.session_state["auto_results"] = results
@@ -305,7 +436,7 @@ def _render_stage_results():
     results = st.session_state.get("auto_results")
     control = st.session_state.get("auto_control")
     variation = st.session_state.get("auto_variation")
-    if not results or control is None or variation is None:
+    if not results:
         st.session_state["auto_stage"] = 2
         st.rerun()
         return
@@ -314,6 +445,7 @@ def _render_stage_results():
 
     freq = results.get("frequentist")
     bayes = results.get("bayesian")
+    cont = results.get("continuous")
 
     if freq:
         st.markdown("### Frequentist")
@@ -346,8 +478,23 @@ def _render_stage_results():
         st.caption(bayes["conclusion"])
         st.divider()
 
+    if cont:
+        st.markdown("### Continuous")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Test used", cont["test_name"])
+        c2.metric("P-value", f"{cont['p_value']:.4f}")
+        c3.metric("Significant?", "Yes" if cont["is_significant"] else "No")
+        ci_low, ci_high = cont["effect_on_revenue_ci"]
+        st.metric(
+            f"Effect on revenue ({cont['projection_days']}d)",
+            _fmt_money(cont["effect_on_revenue"]),
+            help=f"CI: {_fmt_money(ci_low)} to {_fmt_money(ci_high)}",
+        )
+        st.caption(cont["conclusion"])
+        st.divider()
+
     revenue_source = st.session_state.get("auto_revenue_source", "frequentist")
-    payload = build_airtable_payload(control, variation, freq, bayes, revenue_source=revenue_source)
+    payload = build_airtable_payload(control, variation, freq, bayes, cont, revenue_source=revenue_source)
     st.session_state["auto_payload"] = payload
 
     st.markdown("**Airtable payload preview**")
