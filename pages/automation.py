@@ -22,7 +22,13 @@ from utility.bq_ui_components import (
     render_execution_gate,
     render_sql_viewer,
 )
-from utility.sql_builder import BinomialParams, build_binomial
+from utility.sql_builder import (
+    BinomialParams,
+    binomial_shared_scan_flags,
+    build_shared_scan_select,
+    build_binomial_from_shared_scan,
+    build_experiment_single_output_sql,
+)
 from utility.automation_engine import (
     VariantData,
     TAILS,
@@ -115,7 +121,12 @@ def _render_stage_fetch():
         kpi_login=False,
         kpi_create_account=False,
     )
-    sql = build_binomial(params)
+    need_page_location, need_payment_type = binomial_shared_scan_flags(params)
+    shared_scan_select = build_shared_scan_select(
+        project, dataset, start_date, end_date, param_key,
+        need_page_location, need_payment_type,
+    )
+    sql = build_experiment_single_output_sql(shared_scan_select, build_binomial_from_shared_scan(params))
     render_sql_viewer(sql, key="auto_sql")
 
     render_execution_gate(project, sql, result_key="auto_query_result", allow_preview=True)
