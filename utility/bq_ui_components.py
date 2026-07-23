@@ -10,8 +10,8 @@ import streamlit as st
 from utility.bq_client import (
     is_authenticated, get_auth_url, exchange_code_for_credentials,
     get_redirect_uri, sign_out, list_projects, list_datasets, dry_run,
-    run_preview, run_query, df_to_csv_bytes, export_to_sheets,
-    autodetect_variants, autodetect_kpis
+    get_monthly_usage, run_preview, run_query, run_combined_export,
+    df_to_csv_bytes, export_to_sheets, autodetect_variants, autodetect_kpis
 )
 from utility.sql_builder import VariantPair, ExperimentConfig
 
@@ -531,6 +531,90 @@ def render_execution_gate(
     if df is not None:
         st.dataframe(df, use_container_width=True)
         render_export_options(df, result_key, project)
+
+
+# ---------------------------------------------------------------------------
+# Combined (shared-scan, two-output) execution gate
+# ---------------------------------------------------------------------------
+
+def render_combined_execution_gate(
+    project: str,
+    dataset: str,
+    shared_scan_select: str,
+    create_temp_sql: str,
+    select_sqls: dict[str, str],
+    result_key_prefix: str,
+) -> None:
+    """
+    Pre-execution check + run for the two-output (binomial + continuous)
+    shared-scan case — shared by the Data Export "Experiment data" mode and
+    the Automation wizard's fetch step. Dry-runs the bare shared-scan probe
+    for a real cost estimate (unlike a full script, which BQ can't dry-run
+    at all), then runs the shared scan once via a BigQuery session and both
+    outputs against it, storing each result under
+    f"{result_key_prefix}_{label}_result".
+    """
+    st.divider()
+    st.subheader("Pre-execution check")
+
+    with st.spinner("Estimating scan cost…"):
+        cost = dry_run(project, shared_scan_select)
+
+    if cost["error"]:
+        st.error(f"Dry-run failed: {cost['error']}")
+        return
+
+    with st.spinner("Fetching monthly usage…"):
+        usage = get_monthly_usage(project, dataset)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(
+            "Shared scan (both outputs)",
+            cost["display"],
+            help="Estimated bytes scanned once and reused for both outputs — this is the whole query cost, not per-output.",
+        )
+    with col2:
+        st.metric(
+            "Used this month",
+            usage["used_display"] if not usage["error"] else "Unavailable",
+        )
+    with col3:
+        st.metric(
+            "Remaining free tier",
+            usage["remaining_display"] if not usage["error"] else "Unavailable",
+        )
+
+    if not usage["error"]:
+        used_pct = usage["used_pct"] / 100
+        st.progress(
+            min(used_pct, 1.0),
+            text=f"{usage['used_display']} of 1 TB used this month ({usage['used_pct']}%)",
+        )
+
+    st.caption(
+        "Preview isn't available for the combined output — cost is dominated by the "
+        "shared scan above, not by row count."
+    )
+
+    st.markdown("---")
+    if st.button("✅ Run full query", type="primary", key=f"{result_key_prefix}_combined_run"):
+        with st.spinner("Running the shared scan, then both outputs…"):
+            try:
+                results = run_combined_export(project, create_temp_sql, select_sqls)
+                for label, df in results.items():
+                    st.session_state[f"{result_key_prefix}_{label}_result"] = df
+                st.session_state.pop(f"monthly_usage_{project}", None)
+                st.success(", ".join(f"{label}: {len(df):,} rows" for label, df in results.items()))
+            except Exception as e:
+                st.error(f"Query failed: {e}")
+
+    for label in select_sqls:
+        df_result = st.session_state.get(f"{result_key_prefix}_{label}_result")
+        if df_result is not None:
+            st.subheader(label.capitalize())
+            st.dataframe(df_result, use_container_width=True)
+            render_export_options(df_result, f"{result_key_prefix}_{label}", project)
 
 
 # ---------------------------------------------------------------------------

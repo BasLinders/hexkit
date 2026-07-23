@@ -12,7 +12,6 @@ from utility.bq_client import (
     get_monthly_usage,
     run_query,
     run_preview,
-    run_combined_export,
     df_to_csv_bytes,
     export_to_sheets,
     autodetect_variants,
@@ -26,6 +25,7 @@ from utility.bq_ui_components import (
     render_kpi_checkboxes,
     render_sql_viewer,
     render_export_options,
+    render_combined_execution_gate,
 )
 from utility.sql_builder import (
     BaselineParams,
@@ -738,7 +738,7 @@ def _run_experiment_mode(project: str, dataset: str, selected: dict) -> None:
     as a plain CTE), routed through the existing single-result execution
     gate below, same as any other mode. Both selected -> shared_scan is
     materialized once via a BigQuery session and each output is read from
-    it as its own query, via _render_combined_execution_gate.
+    it as its own query, via the shared render_combined_execution_gate.
     """
     bp: Optional[BinomialParams] = selected.get("binomial")
     cp: Optional[ContinuousParams] = selected.get("continuous")
@@ -761,9 +761,10 @@ def _run_experiment_mode(project: str, dataset: str, selected: dict) -> None:
             f"{create_temp_sql}\n{binomial_sql}\n{continuous_sql}",
             key="experiment_combined_sql",
         )
-        _render_combined_execution_gate(
+        render_combined_execution_gate(
             project, dataset, shared_scan_select, create_temp_sql,
             {"binomial": binomial_sql, "continuous": continuous_sql},
+            result_key_prefix="experiment",
         )
     else:
         label = "binomial" if bp else "continuous"
@@ -772,83 +773,6 @@ def _run_experiment_mode(project: str, dataset: str, selected: dict) -> None:
 
         render_sql_viewer(sql, key=f"experiment_{label}_sql")
         _render_execution_gate(project, dataset, sql, f"experiment_{label}")
-
-
-def _render_combined_execution_gate(
-    project: str,
-    dataset: str,
-    shared_scan_select: str,
-    create_temp_sql: str,
-    select_sqls: dict[str, str],
-) -> None:
-    """
-    Pre-execution check + run for the two-output (binomial + continuous)
-    case. Dry-runs the bare shared-scan probe for a real cost estimate
-    (unlike sequential mode's script, which BQ can't dry-run at all), then
-    runs the shared scan once via a BigQuery session and both outputs
-    against it, storing each result under its own session-state key.
-    """
-    st.divider()
-    st.subheader("Pre-execution check")
-
-    with st.spinner("Estimating scan cost…"):
-        cost = dry_run(project, shared_scan_select)
-
-    if cost["error"]:
-        st.error(f"Dry-run failed: {cost['error']}")
-        return
-
-    with st.spinner("Fetching monthly usage…"):
-        usage = get_monthly_usage(project, dataset)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric(
-            "Shared scan (both outputs)",
-            cost["display"],
-            help="Estimated bytes scanned once and reused for both outputs — this is the whole query cost, not per-output.",
-        )
-    with col2:
-        st.metric(
-            "Used this month",
-            usage["used_display"] if not usage["error"] else "Unavailable",
-        )
-    with col3:
-        st.metric(
-            "Remaining free tier",
-            usage["remaining_display"] if not usage["error"] else "Unavailable",
-        )
-
-    if not usage["error"]:
-        used_pct = usage["used_pct"] / 100
-        st.progress(
-            min(used_pct, 1.0),
-            text=f"{usage['used_display']} of 1 TB used this month ({usage['used_pct']}%)",
-        )
-
-    st.caption(
-        "Preview isn't available for the combined output — cost is dominated by the "
-        "shared scan above, not by row count."
-    )
-
-    st.markdown("---")
-    if st.button("✅ Run full query", type="primary", key="experiment_combined_run"):
-        with st.spinner("Running the shared scan, then both outputs…"):
-            try:
-                results = run_combined_export(project, create_temp_sql, select_sqls)
-                for label, df in results.items():
-                    st.session_state[f"experiment_{label}_result"] = df
-                st.session_state.pop(f"monthly_usage_{project}", None)
-                st.success(", ".join(f"{label}: {len(df):,} rows" for label, df in results.items()))
-            except Exception as e:
-                st.error(f"Query failed: {e}")
-
-    for label in select_sqls:
-        df_result = st.session_state.get(f"experiment_{label}_result")
-        if df_result is not None:
-            st.subheader(label.capitalize())
-            st.dataframe(df_result, use_container_width=True)
-            _render_export_row(df_result, f"experiment_{label}", project)
 
 
 def _render_export_row(df, key_prefix: str, project: str) -> None:
