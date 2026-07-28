@@ -1458,8 +1458,8 @@ def render_seasonal_mode(kpi_type: str) -> None:
         return
 
     try:
-        df = pd.read_csv(uploaded_file)
-        df.columns = [c.lower() for c in df.columns]
+        df = pd.read_csv(uploaded_file, sep=None, engine="python", encoding="utf-8-sig")
+        df.columns = [c.strip().lower() for c in df.columns]
         if "date" in df.columns:
             df = df.rename(columns={"date": "ds"})
 
