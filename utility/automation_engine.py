@@ -6,6 +6,7 @@ Kept separate from pages/automation.py so it stays testable without Streamlit.
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -23,6 +24,7 @@ from foe.core.models import (
 from foe.frequentist.operations import FrequentistEngine
 from foe.bayesian.operations import BayesianEngine
 from foe.continuous.operations import ContinuousMetricEngine
+from foe.pretest.operations import PretestEngine
 
 # The Send step discovers each destination base/table's real field names live
 # via Airtable's metadata API (see utility/airtable_client.list_tables) and
@@ -31,6 +33,8 @@ from foe.continuous.operations import ContinuousMetricEngine
 # assignment UI, and a same-name-match hint to auto-preselect a sensible
 # default when a base happens to already use these names.
 FIELD_LABELS = {
+    "start_date": "Start date",
+    "end_date": "End date",
     "visitors_control": "Visitors — Control",
     "visitors_variation": "Visitors — Variation",
     "conversions_control": "Conversions — Control",
@@ -40,9 +44,13 @@ FIELD_LABELS = {
     "continuous_p_value": "P-value (Continuous)",
     "continuous_test_name": "Test used (Continuous)",
     "effect_on_revenue": "Effect on revenue",
+    "pretest_mde_table": "Pre-test MDE table",
+    "ai_conclusion": "AI conclusion",
 }
 
 DEFAULT_FIELD_NAME_HINTS = {
+    "start_date": "start date",
+    "end_date": "end date",
     "visitors_control": "visitors - control",
     "visitors_variation": "visitors - variation",
     "conversions_control": "conversions - control",
@@ -52,6 +60,8 @@ DEFAULT_FIELD_NAME_HINTS = {
     "continuous_p_value": "p-value (continuous)",
     "continuous_test_name": "test used (continuous)",
     "effect_on_revenue": "effect on revenue",
+    "pretest_mde_table": "pre-test mde table",
+    "ai_conclusion": "ai conclusion",
 }
 
 _TAIL_MAP = {
@@ -263,6 +273,46 @@ def run_continuous_analysis(
     }
 
 
+def run_pretest_analysis(
+    weekly_visitors: float,
+    weekly_conversions: float,
+    weeks_used: int,
+    kpi_label: str,
+    confidence_level: float,
+    tail: Literal["Two-sided", "Greater", "Less"],
+    trust_pct: float = 80.0,
+) -> dict:
+    """
+    Runs the FOE PretestEngine's 6-week MDE table on a pre-experiment baseline,
+    fixed to num_variants=2 (this automation flow only supports one control +
+    one variation). `weekly_visitors`/`weekly_conversions` are the pre-period
+    total for the chosen KPI, already averaged down to a single full
+    Monday-Sunday week (see automation.py's baseline-fetch step, which sums
+    the whole pre-period and divides by the number of weeks queried).
+    """
+    alternative = _TAIL_MAP[tail]
+    risk_pct = confidence_level * 100
+
+    result = PretestEngine.calculate_mde_table(
+        num_variants=2,
+        baseline_visitors=int(round(weekly_visitors)),
+        baseline_conversions=int(round(weekly_conversions)),
+        risk_pct=risk_pct,
+        trust_pct=trust_pct,
+        alternative=alternative,
+    )
+
+    return {
+        "method": "pretest",
+        "kpi": kpi_label,
+        "weekly_visitors": weekly_visitors,
+        "weekly_conversions": weekly_conversions,
+        "weeks_used": weeks_used,
+        "table": result["table"],
+        "conclusion": result["conclusion"],
+    }
+
+
 def build_airtable_payload(
     control: Optional[VariantData],
     variation: Optional[VariantData],
@@ -270,6 +320,10 @@ def build_airtable_payload(
     bayesian_result: Optional[dict] = None,
     continuous_result: Optional[dict] = None,
     revenue_source: Literal["frequentist", "bayesian", "continuous"] = "frequentist",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    pretest_result: Optional[dict] = None,
+    ai_conclusion: Optional[str] = None,
 ) -> dict:
     """
     Builds the automation result keyed by internal semantic names (e.g.
@@ -279,6 +333,11 @@ def build_airtable_payload(
     translates via apply_field_map.
     """
     fields: dict = {}
+    if start_date:
+        fields["start_date"] = start_date
+    if end_date:
+        fields["end_date"] = end_date
+
     if control is not None and variation is not None:
         fields.update({
             "visitors_control": control.visitors,
@@ -286,6 +345,12 @@ def build_airtable_payload(
             "conversions_control": control.conversions,
             "conversions_variation": variation.conversions,
         })
+
+    if pretest_result:
+        fields["pretest_mde_table"] = json.dumps(pretest_result["table"])
+
+    if ai_conclusion:
+        fields["ai_conclusion"] = ai_conclusion
 
     if frequentist_result:
         fields["p_value"] = round(frequentist_result["p_value"], 6)

@@ -10,6 +10,7 @@ if not st.session_state.get("admin_authenticated") and "code" not in st.query_pa
 
 import json
 import math
+from datetime import date, datetime, timedelta
 from typing import Literal, Optional, cast
 
 import pandas as pd
@@ -24,9 +25,11 @@ from utility.bq_ui_components import (
     render_sql_viewer,
 )
 from utility.sql_builder import (
+    BaselineParams,
     BinomialParams,
     ContinuousParams,
     binomial_shared_scan_flags,
+    build_baseline,
     build_shared_scan_select,
     build_binomial_from_shared_scan,
     build_continuous_from_shared_scan,
@@ -41,14 +44,42 @@ from utility.automation_engine import (
     run_frequentist_analysis,
     run_bayesian_analysis,
     run_continuous_analysis,
+    run_pretest_analysis,
     build_airtable_payload,
     apply_field_map,
     best_match_field,
 )
 from utility.airtable_client import get_credentials, push_record, list_bases, list_tables
+from utility import gemini_client
 
 
-STEPS = ["1. Fetch data", "2. Choose analysis", "3. Review results", "4. Send results"]
+STEPS = [
+    "1. Fetch data",
+    "2. Choose analysis",
+    "3. Review results",
+    "4. AI conclusion",
+    "5. Send results",
+]
+
+PRETEST_KPI_OPTIONS = {
+    "Transactions (purchases)": "purchase",
+    "Add to cart": "add_to_cart",
+}
+
+
+def _monday_on_or_before(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+
+def _pretest_baseline_range(experiment_start: date, weeks_before: int) -> tuple[date, date]:
+    """
+    Full Monday-Sunday weeks immediately preceding the week the experiment
+    starts in. If `experiment_start` isn't itself a Monday, the partial
+    week before it is excluded entirely, since only full weeks are wanted.
+    """
+    baseline_end = _monday_on_or_before(experiment_start) - timedelta(days=1)  # preceding Sunday
+    baseline_start = baseline_end - timedelta(days=7 * weeks_before - 1)  # N full weeks, Monday-aligned
+    return baseline_start, baseline_end
 
 
 def _reset_automation_state():
@@ -95,6 +126,62 @@ def _render_stage_fetch():
     st.divider()
     st.subheader("Date range")
     start_date, end_date = render_date_range()
+
+    st.divider()
+    st.subheader("Pre-test baseline (optional)")
+    st.caption(
+        "Feeds the Pre-Test Analysis method in the next step — projects the "
+        "MDE this experiment's traffic could detect, using site traffic from "
+        "before the experiment started as the baseline."
+    )
+    want_pretest = st.checkbox(
+        "Fetch pre-test baseline data",
+        value=False,
+        key="autofetch_want_pretest",
+    )
+    if want_pretest:
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            weeks_before = st.number_input(
+                "Full weeks (Mon-Sun) of baseline data before the experiment start date",
+                min_value=1, max_value=52, value=4, step=1,
+                key="autofetch_pretest_weeks",
+            )
+        with pc2:
+            kpi_choice = st.selectbox(
+                "Conversion KPI to use as baseline",
+                options=list(PRETEST_KPI_OPTIONS.keys()),
+                key="autofetch_pretest_kpi",
+            )
+
+        try:
+            experiment_start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        except ValueError:
+            experiment_start = None
+
+        if experiment_start is None:
+            st.warning("Set a valid experiment start date above first.")
+        else:
+            baseline_start, baseline_end = _pretest_baseline_range(experiment_start, int(weeks_before))
+            st.caption(
+                f"Baseline period: **{baseline_start}** to **{baseline_end}** "
+                f"({int(weeks_before)} full week(s), Monday-Sunday)."
+            )
+
+            baseline_params = BaselineParams(
+                project=project,
+                dataset=dataset,
+                start_date=str(baseline_start),
+                end_date=str(baseline_end),
+                output_type="binomial",
+                output_shape="aggregate",
+                kpi_add_to_cart=(PRETEST_KPI_OPTIONS[kpi_choice] == "add_to_cart"),
+            )
+            baseline_sql = build_baseline(baseline_params)
+            render_sql_viewer(baseline_sql, key="auto_pretest_sql")
+            render_execution_gate(
+                project, baseline_sql, result_key="auto_pretest_result", allow_preview=True,
+            )
 
     st.divider()
     st.subheader("Data to fetch")
@@ -223,6 +310,27 @@ def _render_stage_fetch():
     if st.button("Continue to choose analysis method(s) →", type="primary"):
         st.session_state["auto_df_binomial"] = df_binomial
         st.session_state["auto_df_continuous"] = df_continuous
+
+        df_pretest = st.session_state.get("auto_pretest_result")
+        st.session_state["auto_df_pretest"] = df_pretest
+        if df_pretest is not None and not df_pretest.empty:
+            weeks = int(st.session_state.get("autofetch_pretest_weeks", 1))
+            kpi_choice = st.session_state.get("autofetch_pretest_kpi", "Transactions (purchases)")
+            row = df_pretest.iloc[0]
+            conversions_col = (
+                "total_add_to_cart_conversions"
+                if PRETEST_KPI_OPTIONS[kpi_choice] == "add_to_cart"
+                else "total_conversions"
+            )
+            st.session_state["auto_pretest_meta"] = {
+                "weeks": weeks,
+                "kpi_label": kpi_choice,
+                "total_visitors": float(row["total_visitors"]),
+                "total_conversions": float(row[conversions_col]),
+            }
+        else:
+            st.session_state["auto_pretest_meta"] = None
+
         st.session_state["auto_stage"] = 2
         st.rerun()
 
@@ -244,6 +352,7 @@ def _variant_from_row(row, label: str) -> VariantData:
 def _render_stage_configure():
     df_binomial = st.session_state.get("auto_df_binomial")
     df_continuous = st.session_state.get("auto_df_continuous")
+    pretest_meta = st.session_state.get("auto_pretest_meta")
     if df_binomial is None and df_continuous is None:
         st.session_state["auto_stage"] = 1
         st.rerun()
@@ -300,9 +409,10 @@ def _render_stage_configure():
             help=None if df_continuous is not None else "Requires continuous data — fetch it in step 1.",
         )
     with c4:
-        st.checkbox(
-            "Pre-Test Analysis", value=False, disabled=True,
-            key="auto_use_pretest", help="Coming soon.",
+        use_pretest = st.checkbox(
+            "Pre-Test Analysis", value=pretest_meta is not None,
+            disabled=pretest_meta is None, key="auto_use_pretest",
+            help=None if pretest_meta is not None else "Requires pre-test baseline data — fetch it in step 1.",
         )
 
     # Streamlit persists a checkbox's checked state across reruns even while
@@ -311,8 +421,9 @@ def _render_stage_configure():
     use_frequentist = use_frequentist and df_binomial is not None
     use_bayesian = use_bayesian and df_binomial is not None
     use_continuous = use_continuous and df_continuous is not None
+    use_pretest = use_pretest and pretest_meta is not None
 
-    if not use_frequentist and not use_bayesian and not use_continuous:
+    if not use_frequentist and not use_bayesian and not use_continuous and not use_pretest:
         st.warning("Select at least one analysis method to continue.")
         return
 
@@ -327,7 +438,7 @@ def _render_stage_configure():
     daily_visitors = total_visitors / runtime_days
 
     st.divider()
-    if use_frequentist or use_continuous:
+    if use_frequentist or use_continuous or use_pretest:
         with st.expander("Significance settings", expanded=True):
             fc1, fc2 = st.columns(2)
             with fc1:
@@ -373,6 +484,21 @@ def _render_stage_configure():
     else:
         continuous_mode = "rpv"
 
+    if use_pretest:
+        with st.expander("Pre-test settings", expanded=True):
+            trust_pct = st.slider(
+                "Power / trustworthiness target (%)", min_value=50, max_value=99,
+                value=80, step=1, key="auto_pretest_trust",
+            )
+            weekly_visitors = pretest_meta["total_visitors"] / pretest_meta["weeks"]
+            weekly_conversions = pretest_meta["total_conversions"] / pretest_meta["weeks"]
+            st.caption(
+                f"Baseline: {pretest_meta['kpi_label']} over {pretest_meta['weeks']} week(s) → "
+                f"{weekly_visitors:,.0f} visitors/week, {weekly_conversions:,.1f} conversions/week."
+            )
+    else:
+        trust_pct = 80
+
     with st.expander("Revenue projection", expanded=True):
         rc1, rc2 = st.columns(2)
         with rc1:
@@ -394,7 +520,7 @@ def _render_stage_configure():
             ("Continuous", use_continuous),
         ) if using
     ]
-    revenue_source = active_methods[0].lower()
+    revenue_source = active_methods[0].lower() if active_methods else "frequentist"
     if len(active_methods) > 1:
         choice = st.radio(
             "Use for the shared 'effect on revenue' field:",
@@ -440,6 +566,16 @@ def _render_stage_configure():
                     tail=tail,
                     mode=continuous_mode,
                 )
+            if use_pretest:
+                results["pretest"] = run_pretest_analysis(
+                    weekly_visitors=pretest_meta["total_visitors"] / pretest_meta["weeks"],
+                    weekly_conversions=pretest_meta["total_conversions"] / pretest_meta["weeks"],
+                    weeks_used=pretest_meta["weeks"],
+                    kpi_label=pretest_meta["kpi_label"],
+                    confidence_level=confidence_level,
+                    tail=tail,
+                    trust_pct=trust_pct,
+                )
             st.session_state["auto_control"] = control
             st.session_state["auto_variation"] = variation
             st.session_state["auto_results"] = results
@@ -470,6 +606,7 @@ def _render_stage_results():
     freq = results.get("frequentist")
     bayes = results.get("bayesian")
     cont = results.get("continuous")
+    pretest = results.get("pretest")
 
     if freq:
         st.markdown("### Frequentist")
@@ -518,8 +655,27 @@ def _render_stage_results():
         st.caption(cont["conclusion"])
         st.divider()
 
+    if pretest:
+        st.markdown("### Pre-Test Analysis")
+        st.caption(
+            f"Baseline: {pretest['kpi']} · {pretest['weeks_used']} week(s) · "
+            f"{pretest['weekly_visitors']:,.0f} visitors/week, "
+            f"{pretest['weekly_conversions']:,.1f} conversions/week."
+        )
+        mde_df = pd.DataFrame(pretest["table"])
+        st.dataframe(mde_df, use_container_width=True)
+        st.caption(pretest["conclusion"])
+        st.divider()
+
+    start_dt = st.session_state.get("start_date")
+    end_dt = st.session_state.get("end_date")
     revenue_source = st.session_state.get("auto_revenue_source", "frequentist")
-    payload = build_airtable_payload(control, variation, freq, bayes, cont, revenue_source=revenue_source)
+    payload = build_airtable_payload(
+        control, variation, freq, bayes, cont, revenue_source=revenue_source,
+        start_date=str(start_dt) if start_dt else None,
+        end_date=str(end_dt) if end_dt else None,
+        pretest_result=pretest,
+    )
     st.session_state["auto_payload"] = payload
 
     st.markdown("**Result summary**")
@@ -532,13 +688,84 @@ def _render_stage_results():
             st.session_state["auto_stage"] = 2
             st.rerun()
     with col_next:
-        if st.button("Continue to send →", type="primary"):
+        if st.button("Continue to AI conclusion →", type="primary"):
             st.session_state["auto_stage"] = 4
             st.rerun()
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — Send results
+# Step 4 — AI conclusion (optional)
+# ---------------------------------------------------------------------------
+
+def _render_stage_ai():
+    payload = st.session_state.get("auto_payload")
+    results = st.session_state.get("auto_results") or {}
+    if payload is None:
+        st.session_state["auto_stage"] = 3
+        st.rerun()
+        return
+
+    st.subheader("Step 4 — AI conclusion (optional)")
+    st.caption(
+        "Sends the result payload to Gemini for a short written interpretation. "
+        "Entirely optional — skip straight to sending if you don't want one."
+    )
+
+    ai_input = {
+        "payload": payload,
+        "conclusions": {
+            method: result["conclusion"]
+            for method, result in results.items()
+            if result.get("conclusion")
+        },
+    }
+
+    with st.expander("Data that would be sent to Gemini", expanded=False):
+        st.json(ai_input)
+
+    if not gemini_client.is_configured():
+        st.info(
+            "No Gemini API key configured — set `GEMINI_API_KEY` in Streamlit secrets "
+            "to enable this step. You can still continue without an AI conclusion."
+        )
+    else:
+        if st.button("🤖 Generate AI conclusion", type="primary"):
+            with st.spinner("Asking Gemini…"):
+                result = gemini_client.generate_conclusion(ai_input)
+            if result["ok"]:
+                st.session_state["auto_ai_conclusion"] = result["text"]
+            else:
+                st.error(f"Gemini request failed: {result['error']}")
+
+    ai_conclusion = st.session_state.get("auto_ai_conclusion")
+    if ai_conclusion:
+        st.markdown("**Conclusion**")
+        st.markdown(ai_conclusion)
+        include = st.checkbox(
+            "Include this conclusion in the Airtable payload", value=True, key="auto_ai_include",
+        )
+        payload = dict(payload)
+        if include:
+            payload["ai_conclusion"] = ai_conclusion
+        else:
+            payload.pop("ai_conclusion", None)
+        st.session_state["auto_payload"] = payload
+
+    st.divider()
+    col_back, col_next = st.columns(2)
+    with col_back:
+        if st.button("← Back to results"):
+            st.session_state["auto_stage"] = 3
+            st.rerun()
+    with col_next:
+        label = "Continue to send →" if ai_conclusion else "Skip — continue to send →"
+        if st.button(label, type="primary"):
+            st.session_state["auto_stage"] = 5
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — Send results
 # ---------------------------------------------------------------------------
 
 def _render_json_download(payload: dict):
@@ -551,19 +778,19 @@ def _render_json_download(payload: dict):
 
 
 def _render_back_to_results_button():
-    if st.button("← Back to results"):
-        st.session_state["auto_stage"] = 3
+    if st.button("← Back to AI conclusion"):
+        st.session_state["auto_stage"] = 4
         st.rerun()
 
 
 def _render_stage_send():
     payload = st.session_state.get("auto_payload")
     if payload is None:
-        st.session_state["auto_stage"] = 3
+        st.session_state["auto_stage"] = 4
         st.rerun()
         return
 
-    st.subheader("Step 4 — Send results")
+    st.subheader("Step 5 — Send results")
 
     st.markdown("#### Airtable")
     creds = get_credentials()
@@ -603,110 +830,125 @@ def _render_stage_send():
         return
 
     base_ids = list(bases.keys())
-    prior_base = st.session_state.get("airtable_base_id") or creds["base_id"]
-    base_id = st.selectbox(
-        "Send to (base)",
-        options=base_ids,
-        index=base_ids.index(prior_base) if prior_base in base_ids else 0,
-        format_func=lambda bid: bases.get(bid, bid),
-        key="airtable_base_id",
+    prior_bases = st.session_state.get("airtable_base_ids") or (
+        [creds["base_id"]] if creds["base_id"] in base_ids else []
     )
-
-    # --- Table discovery ---------------------------------------------------
-    tables_cache_key = f"airtable_tables_{base_id}"
-    if tables_cache_key not in st.session_state:
-        with st.spinner("Loading tables…"):
-            result = list_tables(api_key, base_id)
-        if not result["ok"]:
-            st.error(f"Couldn't list tables in this base: {result['error']}")
-            st.divider()
-            _render_json_download(payload)
-            _render_back_to_results_button()
-            return
-        st.session_state[tables_cache_key] = result["tables"]
-
-    tables = st.session_state[tables_cache_key]
-    if not tables:
-        st.warning("This base has no tables.")
+    default_bases = [b for b in prior_bases if b in base_ids] or base_ids[:1]
+    selected_base_ids = st.multiselect(
+        "Send to (base(s))",
+        options=base_ids,
+        default=default_bases,
+        format_func=lambda bid: bases.get(bid, bid),
+        key="airtable_base_ids",
+        help="Pick every base that should receive this result. Each base gets its "
+             "own table selection and field mapping below.",
+    )
+    if not selected_base_ids:
+        st.info("Select at least one base above to continue.")
         st.divider()
         _render_json_download(payload)
         _render_back_to_results_button()
         return
 
-    table_names = [t["name"] for t in tables]
-    stored_selection = st.session_state.get("airtable_table_names", [])
-    default_selection = [n for n in stored_selection if n in table_names] or table_names[:1]
-    selected_names = st.multiselect(
-        "Tables — send this result to each one selected",
-        options=table_names,
-        default=default_selection,
-        key="airtable_table_names",
-        help="Pick every table that should receive this result — e.g. an internal "
-             "tracking table plus one or more client tables in the same base. Each "
-             "gets its own field mapping below.",
+    # --- Table discovery + selection per base -------------------------------
+    tables_by_base: dict[str, list] = {}
+    for base_id in selected_base_ids:
+        tables_cache_key = f"airtable_tables_{base_id}"
+        if tables_cache_key not in st.session_state:
+            with st.spinner(f"Loading tables for {bases.get(base_id, base_id)}…"):
+                result = list_tables(api_key, base_id)
+            if not result["ok"]:
+                st.error(f"Couldn't list tables in {bases.get(base_id, base_id)}: {result['error']}")
+                st.divider()
+                _render_json_download(payload)
+                _render_back_to_results_button()
+                return
+            st.session_state[tables_cache_key] = result["tables"]
+        tables_by_base[base_id] = st.session_state[tables_cache_key]
+
+    st.divider()
+    st.markdown("#### Tables and field mapping")
+    st.caption(
+        "Pick tables per base, then assign each computed value to a column. "
+        "Remembered per base/table, so you only need to set this up once."
     )
-    if not selected_names:
+
+    # (base_id, table) pairs the user wants to send to, across every selected base.
+    selected_pairs: list[tuple[str, dict]] = []
+    for base_id, base_tab in zip(selected_base_ids, st.tabs([bases.get(b, b) for b in selected_base_ids])):
+        with base_tab:
+            tables = tables_by_base[base_id]
+            if not tables:
+                st.warning("This base has no tables.")
+                continue
+
+            table_names = [t["name"] for t in tables]
+            names_key = f"airtable_table_names_{base_id}"
+            stored_selection = st.session_state.get(names_key, [])
+            default_selection = [n for n in stored_selection if n in table_names] or table_names[:1]
+            selected_names = st.multiselect(
+                "Tables — send this result to each one selected",
+                options=table_names,
+                default=default_selection,
+                key=names_key,
+            )
+            selected_tables = [t for t in tables if t["name"] in selected_names]
+
+            for tab, table in zip(st.tabs(selected_names), selected_tables):
+                with tab:
+                    field_options = ["— Skip —"] + table["fields"]
+                    mapping_key = f"airtable_fieldmap_{base_id}_{table['id']}"
+                    stored_mapping: dict = st.session_state.get(mapping_key, {})
+
+                    field_map: dict = {}
+                    for key in payload:
+                        label = FIELD_LABELS.get(key, key)
+                        default = stored_mapping.get(key) or best_match_field(key, table["fields"])
+                        default_idx = field_options.index(default) if default in field_options else 0
+                        chosen = st.selectbox(
+                            label, options=field_options, index=default_idx,
+                            key=f"{mapping_key}_{key}",
+                        )
+                        if chosen != "— Skip —":
+                            field_map[key] = chosen
+
+                    st.session_state[mapping_key] = field_map
+                    selected_pairs.append((base_id, table))
+
+    if not selected_pairs:
         st.info("Select at least one table above to continue.")
         st.divider()
         _render_json_download(payload)
         _render_back_to_results_button()
         return
 
-    selected_tables = [t for t in tables if t["name"] in selected_names]
+    def _fields_for(base_id: str, table: dict) -> dict:
+        mapping_key = f"airtable_fieldmap_{base_id}_{table['id']}"
+        return apply_field_map(payload, st.session_state.get(mapping_key, {}))
 
-    # --- Field assignment, one tab per selected table -----------------------
-    st.divider()
-    st.markdown("#### Field mapping")
-    st.caption(
-        "Assign each computed value to a column in each table. Remembered per "
-        "base/table, so you only need to set this up once."
-    )
-
-    field_maps: dict = {}
-    for tab, table in zip(st.tabs(selected_names), selected_tables):
-        with tab:
-            field_options = ["— Skip —"] + table["fields"]
-            mapping_key = f"airtable_fieldmap_{base_id}_{table['id']}"
-            stored_mapping: dict = st.session_state.get(mapping_key, {})
-
-            field_map: dict = {}
-            for key in payload:
-                label = FIELD_LABELS.get(key, key)
-                default = stored_mapping.get(key) or best_match_field(key, table["fields"])
-                default_idx = field_options.index(default) if default in field_options else 0
-                chosen = st.selectbox(
-                    label, options=field_options, index=default_idx,
-                    key=f"{mapping_key}_{key}",
-                )
-                if chosen != "— Skip —":
-                    field_map[key] = chosen
-
-            st.session_state[mapping_key] = field_map
-            field_maps[table["id"]] = field_map
-
-    final_fields_by_table = {
-        table["id"]: apply_field_map(payload, field_maps[table["id"]])
-        for table in selected_tables
-    }
-    ready_tables = [t for t in selected_tables if final_fields_by_table[t["id"]]]
-    skipped_tables = [t for t in selected_tables if t not in ready_tables]
+    ready_pairs = [(b, t) for b, t in selected_pairs if _fields_for(b, t)]
+    skipped_pairs = [(b, t) for b, t in selected_pairs if not _fields_for(b, t)]
 
     with st.expander("Preview what will be sent", expanded=False):
-        st.json({t["name"]: final_fields_by_table[t["id"]] for t in selected_tables})
+        st.json({
+            f"{bases.get(b, b)} → {t['name']}": _fields_for(b, t)
+            for b, t in selected_pairs
+        })
 
-    if st.button("🚀 Send to Airtable", type="primary", disabled=not ready_tables):
-        with st.spinner(f"Sending to {len(ready_tables)} table(s)…"):
+    if st.button("🚀 Send to Airtable", type="primary", disabled=not ready_pairs):
+        with st.spinner(f"Sending to {len(ready_pairs)} table(s) across {len(selected_base_ids)} base(s)…"):
             send_results = [
-                (table["name"], push_record(base_id, table["id"], api_key, final_fields_by_table[table["id"]]))
-                for table in ready_tables
+                (f"{bases.get(b, b)} → {t['name']}", push_record(b, t["id"], api_key, _fields_for(b, t)))
+                for b, t in ready_pairs
             ]
         for name, result in send_results:
             if result["ok"]:
                 st.success(f"{name}: record created ({result['record_id']})")
             else:
                 st.error(f"{name}: {result['error']}")
-        if skipped_tables:
-            st.caption(f"Skipped (no fields mapped): {', '.join(t['name'] for t in skipped_tables)}")
+        if skipped_pairs:
+            skipped_names = ", ".join(f"{bases.get(b, b)} → {t['name']}" for b, t in skipped_pairs)
+            st.caption(f"Skipped (no fields mapped): {skipped_names}")
 
     st.divider()
     st.markdown("#### Other destinations")
@@ -743,6 +985,8 @@ def run():
     elif stage == 3:
         _render_stage_results()
     elif stage == 4:
+        _render_stage_ai()
+    elif stage == 5:
         _render_stage_send()
 
 

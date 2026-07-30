@@ -24,4 +24,5 @@ patsy
 db-dtypes
 requests>=2.31.0
 pydantic>=2.0.0
+google-genai>=0.3.0
 foe @ git+https://github.com/BasLinders/first-order-engine.git@main
