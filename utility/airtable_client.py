@@ -73,6 +73,62 @@ def push_record(base_id: str, table_name: str, api_key: str, fields: dict[str, A
         return {"ok": False, "record_id": None, "error": str(e)}
 
 
+def update_record(base_id: str, table_name: str, api_key: str, record_id: str, fields: dict[str, Any]) -> dict:
+    """
+    Patches an existing record (partial update — untouched fields keep their
+    current value). Used when the Send step's record lookup finds an existing
+    row (e.g. by an experiment-ID field) that this result should be appended
+    to, rather than always creating a new record.
+    Returns {"ok": bool, "record_id": Optional[str], "error": Optional[str]}.
+    """
+    url = f"{API_URL}/{base_id}/{table_name}/{record_id}"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"fields": fields, "typecast": True}
+
+    try:
+        resp = requests.patch(url, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        record = resp.json()
+        return {"ok": True, "record_id": record["id"], "error": None}
+    except requests.exceptions.HTTPError as e:
+        return {"ok": False, "record_id": None, "error": _extract_error(resp) or str(e)}
+    except Exception as e:
+        return {"ok": False, "record_id": None, "error": str(e)}
+
+
+def search_records(
+    base_id: str, table_name: str, api_key: str, field_name: str, search_term: str, max_records: int = 25,
+) -> dict:
+    """
+    Finds existing records whose `field_name` value contains `search_term`
+    (case-insensitive substring match), via Airtable's `filterByFormula`.
+    Used by the Send step to look up an existing record (e.g. by an
+    experiment-ID field, often an Airtable autonumber) so a result can be
+    appended to it instead of always creating a new record.
+    Returns {"ok": bool, "records": [{"id", "fields"}], "error": Optional[str]}.
+    """
+    escaped_field = field_name.replace('"', '\\"')
+    escaped_term = search_term.replace("\\", "\\\\").replace('"', '\\"')
+    formula = f'SEARCH(LOWER("{escaped_term}"), LOWER({{{escaped_field}}}))'
+
+    url = f"{API_URL}/{base_id}/{table_name}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    params = {"filterByFormula": formula, "maxRecords": max_records}
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        resp.raise_for_status()
+        records = [
+            {"id": r["id"], "fields": r.get("fields", {})}
+            for r in resp.json().get("records", [])
+        ]
+        return {"ok": True, "records": records, "error": None}
+    except requests.exceptions.HTTPError as e:
+        return {"ok": False, "records": [], "error": _extract_error(resp) or str(e)}
+    except Exception as e:
+        return {"ok": False, "records": [], "error": str(e)}
+
+
 def list_bases(api_key: str) -> dict:
     """
     Lists every Airtable base this PAT can see, via the metadata API
