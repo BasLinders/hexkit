@@ -181,28 +181,50 @@ def run_continuous_analysis(
     confidence_level: float = 0.95,
     tail: Literal["Two-sided", "Greater", "Less"] = "Two-sided",
     kpi: str = "purchase_revenue",
+    mode: Literal["rpv", "rpt"] = "rpv",
 ) -> dict:
     """
-    Runs the FOE ContinuousMetricEngine on row-level revenue-per-visitor data
-    (the heuristic path auto-selects Mann-Whitney / ANOVA / Welch / Negative-
-    Binomial as appropriate), plus a revenue-impact projection.
+    Runs the FOE ContinuousMetricEngine on row-level revenue data via the
+    Gamma / two-part likelihood-ratio path (rather than the generic heuristic
+    decision tree), since revenue is non-negative and right-skewed — the
+    Gamma family models that shape directly instead of picking a generic test
+    via a normality/variance decision tree. Also computes a revenue-impact
+    projection.
 
-    Assumes per-visitor data — automation.py's continuous fetch always uses
-    the "all_users" (RPV) query mode, whose LEFT JOIN leaves non-buyers as
-    NULL rather than 0; zero-filled here so they're correctly treated as
-    non-converting visitors rather than dropped.
+    automation.py's continuous fetch always uses the "all_users" (LEFT JOIN)
+    query mode, so every exposed visitor is a row, non-buyers as NULL revenue
+    (zero-filled below) rather than dropped — this is what makes both modes
+    below possible from the *same* fetched data:
+
+    mode="rpv" (revenue per visitor): every row counts as-is — measures
+    conversion-rate AND spend effects together (AnalysisUnit.PER_VISITOR).
+    mode="rpt" (revenue per transaction): only buyers should count, so zero-
+    revenue rows are stripped before analysis (AnalysisUnit.PER_TRANSACTION)
+    — isolates the order-value effect alone. Each variant's total exposed
+    visitor count is taken from the data *before* that stripping and passed
+    through to the monetary projection regardless of mode, since FOE's
+    PER_TRANSACTION business case needs it to derive an order rate (n
+    orders / total visitors) — without it, a per-order lift can't be scaled
+    to daily traffic.
     """
     alternative = _TAIL_MAP[tail]
     alpha = 1.0 - confidence_level
 
     work = df.copy()
     work[kpi] = pd.to_numeric(work[kpi], errors="coerce").fillna(0.0)
+    visitor_counts = work["experience_variant_label"].value_counts().to_dict()
+
+    if mode == "rpt":
+        work = work[work[kpi] != 0.0]
+        unit = AnalysisUnit.PER_TRANSACTION
+    else:
+        unit = AnalysisUnit.PER_VISITOR
 
     config = ContinuousMetricConfig(
         kpi=kpi,
         group_col="experience_variant_label",
-        approach=ContinuousApproach.HEURISTIC,
-        unit=AnalysisUnit.PER_VISITOR,
+        approach=ContinuousApproach.GAMMA_GLM,
+        unit=unit,
         control_label=control_label,
         alpha=alpha,
     )
@@ -213,8 +235,9 @@ def run_continuous_analysis(
     monetary_list = engine.run_business_case(
         group_stats=group_stats,
         control_label=control_label,
-        unit=AnalysisUnit.PER_VISITOR,
+        unit=unit,
         daily_visitors=daily_visitors,
+        visitor_counts=visitor_counts,
         alpha=alpha,
         alternative=alternative,
         projection_period=projection_days,
@@ -227,6 +250,7 @@ def run_continuous_analysis(
 
     return {
         "method": "continuous",
+        "mode": mode,
         "kpi": kpi,
         "test_name": result.test_name,
         "p_value": result.p_value,
