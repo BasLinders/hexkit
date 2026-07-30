@@ -46,6 +46,7 @@ FIELD_LABELS = {
     "effect_on_revenue": "Effect on revenue",
     "pretest_mde_table": "Pre-test MDE table",
     "ai_conclusion": "AI conclusion",
+    "description": "Description",
 }
 
 DEFAULT_FIELD_NAME_HINTS = {
@@ -62,6 +63,7 @@ DEFAULT_FIELD_NAME_HINTS = {
     "effect_on_revenue": "effect on revenue",
     "pretest_mde_table": "pre-test mde table",
     "ai_conclusion": "ai conclusion",
+    "description": "description",
 }
 
 _TAIL_MAP = {

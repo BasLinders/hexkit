@@ -49,7 +49,9 @@ from utility.automation_engine import (
     apply_field_map,
     best_match_field,
 )
-from utility.airtable_client import get_credentials, push_record, list_bases, list_tables
+from utility.airtable_client import (
+    get_credentials, push_record, update_record, search_records, list_bases, list_tables,
+)
 from utility import gemini_client
 
 
@@ -80,6 +82,19 @@ def _pretest_baseline_range(experiment_start: date, weeks_before: int) -> tuple[
     baseline_end = _monday_on_or_before(experiment_start) - timedelta(days=1)  # preceding Sunday
     baseline_start = baseline_end - timedelta(days=7 * weeks_before - 1)  # N full weeks, Monday-aligned
     return baseline_start, baseline_end
+
+
+_ID_FIELD_HINTS = ("experiment id", "experiment_id", "test id", "test_id", "id")
+
+
+def _guess_id_field(fields: list[str]) -> Optional[str]:
+    """Best-effort default for 'which field identifies existing records' —
+    e.g. an Airtable autonumber field named 'Experiment ID'."""
+    lowered = {f.lower(): f for f in fields}
+    for hint in _ID_FIELD_HINTS:
+        if hint in lowered:
+            return lowered[hint]
+    return None
 
 
 def _reset_automation_state():
@@ -867,14 +882,16 @@ def _render_stage_send():
         tables_by_base[base_id] = st.session_state[tables_cache_key]
 
     st.divider()
-    st.markdown("#### Tables and field mapping")
+    st.markdown("#### Tables, record lookup, and field mapping")
     st.caption(
-        "Pick tables per base, then assign each computed value to a column. "
-        "Remembered per base/table, so you only need to set this up once."
+        "Pick tables per base. For each table, either find an existing record "
+        "to append this result to, or create a new one. Field mapping is "
+        "remembered per base/table, so you only need to set it up once."
     )
 
-    # (base_id, table) pairs the user wants to send to, across every selected base.
-    selected_pairs: list[tuple[str, dict]] = []
+    # One entry per (base, table) the user wants to send to, across every
+    # selected base — each carries its own create/update mode and fields.
+    send_plan: list[dict] = []
     for base_id, base_tab in zip(selected_base_ids, st.tabs([bases.get(b, b) for b in selected_base_ids])):
         with base_tab:
             tables = tables_by_base[base_id]
@@ -896,58 +913,145 @@ def _render_stage_send():
 
             for tab, table in zip(st.tabs(selected_names), selected_tables):
                 with tab:
+                    lookup_key = f"airtable_lookup_{base_id}_{table['id']}"
+
+                    st.markdown("**Existing record**")
+                    id_field_options = ["— Always create new —"] + table["fields"]
+                    default_id_field = _guess_id_field(table["fields"])
+                    default_idx = (
+                        id_field_options.index(default_id_field)
+                        if default_id_field in id_field_options else 0
+                    )
+                    id_field = st.selectbox(
+                        "Field to search on (e.g. an experiment ID Airtable generated)",
+                        options=id_field_options, index=default_idx,
+                        key=f"{lookup_key}_idfield",
+                    )
+
+                    mode = "create"
+                    record_id: Optional[str] = None
+                    if id_field != "— Always create new —":
+                        search_col, btn_col = st.columns([3, 1])
+                        with search_col:
+                            search_term = st.text_input(
+                                "Search for existing record (matches part of the ID)",
+                                key=f"{lookup_key}_term",
+                            )
+                        with btn_col:
+                            st.write("")
+                            search_clicked = st.button("🔍 Search", key=f"{lookup_key}_btn")
+
+                        if search_clicked and search_term.strip():
+                            with st.spinner("Searching…"):
+                                result = search_records(
+                                    base_id, table["id"], api_key, id_field, search_term.strip(),
+                                )
+                            if result["ok"]:
+                                st.session_state[f"{lookup_key}_results"] = result["records"]
+                            else:
+                                st.error(f"Search failed: {result['error']}")
+
+                        matches = st.session_state.get(f"{lookup_key}_results", [])
+                        match_options = ["+ Create new record"] + [
+                            f"{r['fields'].get(id_field, '(blank)')}  ·  …{r['id'][-6:]}"
+                            for r in matches
+                        ]
+                        choice = st.selectbox(
+                            "Record to update", options=match_options,
+                            key=f"{lookup_key}_choice",
+                            help="Pick a match to append this result to it, or keep "
+                                 "'Create new record' to add a new row instead.",
+                        )
+                        if choice != "+ Create new record":
+                            record_id = matches[match_options.index(choice) - 1]["id"]
+                            mode = "update"
+
+                    description = ""
+                    if mode == "create":
+                        description = st.text_input(
+                            "Short description for this new record",
+                            key=f"{lookup_key}_description",
+                            help="Required when creating a new record — shows up as a "
+                                 "mappable field below, same as the computed results.",
+                        )
+                        if not description.strip():
+                            st.warning(
+                                "Enter a short description (or search for an existing "
+                                "record above) to enable sending for this table."
+                            )
+
+                    table_payload = dict(payload)
+                    if mode == "create" and description.strip():
+                        table_payload["description"] = description.strip()
+
+                    st.markdown("**Field mapping**")
                     field_options = ["— Skip —"] + table["fields"]
                     mapping_key = f"airtable_fieldmap_{base_id}_{table['id']}"
                     stored_mapping: dict = st.session_state.get(mapping_key, {})
 
                     field_map: dict = {}
-                    for key in payload:
+                    for key in table_payload:
                         label = FIELD_LABELS.get(key, key)
                         default = stored_mapping.get(key) or best_match_field(key, table["fields"])
-                        default_idx = field_options.index(default) if default in field_options else 0
+                        field_default_idx = field_options.index(default) if default in field_options else 0
                         chosen = st.selectbox(
-                            label, options=field_options, index=default_idx,
+                            label, options=field_options, index=field_default_idx,
                             key=f"{mapping_key}_{key}",
                         )
                         if chosen != "— Skip —":
                             field_map[key] = chosen
 
                     st.session_state[mapping_key] = field_map
-                    selected_pairs.append((base_id, table))
 
-    if not selected_pairs:
-        st.info("Select at least one table above to continue.")
+                    if mode == "update" or description.strip():
+                        send_plan.append({
+                            "base_id": base_id,
+                            "table": table,
+                            "mode": mode,
+                            "record_id": record_id,
+                            "fields": apply_field_map(table_payload, field_map),
+                        })
+
+    if not send_plan:
+        st.info(
+            "Select at least one table above, and either provide a description "
+            "(new record) or pick an existing record to update, to continue."
+        )
         st.divider()
         _render_json_download(payload)
         _render_back_to_results_button()
         return
 
-    def _fields_for(base_id: str, table: dict) -> dict:
-        mapping_key = f"airtable_fieldmap_{base_id}_{table['id']}"
-        return apply_field_map(payload, st.session_state.get(mapping_key, {}))
+    ready_plan = [p for p in send_plan if p["fields"]]
+    skipped_plan = [p for p in send_plan if not p["fields"]]
 
-    ready_pairs = [(b, t) for b, t in selected_pairs if _fields_for(b, t)]
-    skipped_pairs = [(b, t) for b, t in selected_pairs if not _fields_for(b, t)]
+    def _label(p: dict) -> str:
+        base_name = bases.get(p["base_id"], p["base_id"])
+        verb = "update existing" if p["mode"] == "update" else "create new"
+        return f"{base_name} → {p['table']['name']} ({verb})"
 
     with st.expander("Preview what will be sent", expanded=False):
-        st.json({
-            f"{bases.get(b, b)} → {t['name']}": _fields_for(b, t)
-            for b, t in selected_pairs
-        })
+        st.json({_label(p): p["fields"] for p in send_plan})
 
-    if st.button("🚀 Send to Airtable", type="primary", disabled=not ready_pairs):
-        with st.spinner(f"Sending to {len(ready_pairs)} table(s) across {len(selected_base_ids)} base(s)…"):
+    if st.button("🚀 Send to Airtable", type="primary", disabled=not ready_plan):
+        with st.spinner(f"Sending to {len(ready_plan)} table(s) across {len(selected_base_ids)} base(s)…"):
             send_results = [
-                (f"{bases.get(b, b)} → {t['name']}", push_record(b, t["id"], api_key, _fields_for(b, t)))
-                for b, t in ready_pairs
+                (
+                    _label(p),
+                    update_record(p["base_id"], p["table"]["id"], api_key, p["record_id"], p["fields"])
+                    if p["mode"] == "update"
+                    else push_record(p["base_id"], p["table"]["id"], api_key, p["fields"]),
+                )
+                for p in ready_plan
             ]
         for name, result in send_results:
             if result["ok"]:
-                st.success(f"{name}: record created ({result['record_id']})")
+                verb = "updated" if "update existing" in name else "created"
+                st.success(f"{name}: record {verb} ({result['record_id']})")
             else:
                 st.error(f"{name}: {result['error']}")
-        if skipped_pairs:
-            skipped_names = ", ".join(f"{bases.get(b, b)} → {t['name']}" for b, t in skipped_pairs)
+        if skipped_plan:
+            skipped_names = ", ".join(_label(p) for p in skipped_plan)
             st.caption(f"Skipped (no fields mapped): {skipped_names}")
 
     st.divider()
