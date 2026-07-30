@@ -353,6 +353,26 @@ def _render_stage_configure():
     else:
         n_samples = 100_000
 
+    if use_continuous:
+        with st.expander("Continuous settings", expanded=True):
+            continuous_mode = st.radio(
+                "Metric definition",
+                options=["rpv", "rpt"],
+                format_func=lambda m: (
+                    "Revenue per visitor (RPV)" if m == "rpv" else "Revenue per transaction (RPT)"
+                ),
+                horizontal=True,
+                key="auto_continuous_mode",
+                help=(
+                    "RPV: every exposed visitor counts, non-buyers as €0 — captures both "
+                    "conversion-rate and spend effects together. RPT: only buyers count "
+                    "(zero-revenue rows stripped before analysis) — isolates the order-value "
+                    "effect alone. Both use the same fetched data; only the calculation differs."
+                ),
+            )
+    else:
+        continuous_mode = "rpv"
+
     with st.expander("Revenue projection", expanded=True):
         rc1, rc2 = st.columns(2)
         with rc1:
@@ -418,6 +438,7 @@ def _render_stage_configure():
                     projection_days=int(projection_days),
                     confidence_level=confidence_level,
                     tail=tail,
+                    mode=continuous_mode,
                 )
             st.session_state["auto_control"] = control
             st.session_state["auto_variation"] = variation
@@ -482,7 +503,8 @@ def _render_stage_results():
         st.divider()
 
     if cont:
-        st.markdown("### Continuous")
+        mode_label = "RPV" if cont.get("mode", "rpv") == "rpv" else "RPT"
+        st.markdown(f"### Continuous ({mode_label})")
         c1, c2, c3 = st.columns(3)
         c1.metric("Test used", cont["test_name"])
         c2.metric("P-value", f"{cont['p_value']:.4f}")
