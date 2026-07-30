@@ -24,9 +24,25 @@ from foe.frequentist.operations import FrequentistEngine
 from foe.bayesian.operations import BayesianEngine
 from foe.continuous.operations import ContinuousMetricEngine
 
-# Provisional — the real Airtable base's field names aren't known yet.
-# Update this mapping once they are; nothing else in this module needs to change.
-AIRTABLE_FIELD_MAP = {
+# The Send step discovers each destination base/table's real field names live
+# via Airtable's metadata API (see utility/airtable_client.list_tables) and
+# lets the user assign them — no hardcoded-per-base mapping to maintain here.
+# These two dicts are just cosmetic/convenience: friendly labels for the
+# assignment UI, and a same-name-match hint to auto-preselect a sensible
+# default when a base happens to already use these names.
+FIELD_LABELS = {
+    "visitors_control": "Visitors — Control",
+    "visitors_variation": "Visitors — Variation",
+    "conversions_control": "Conversions — Control",
+    "conversions_variation": "Conversions — Variation",
+    "p_value": "P-value (Frequentist)",
+    "probability_pct": "Probability to beat control % (Bayesian)",
+    "continuous_p_value": "P-value (Continuous)",
+    "continuous_test_name": "Test used (Continuous)",
+    "effect_on_revenue": "Effect on revenue",
+}
+
+DEFAULT_FIELD_NAME_HINTS = {
     "visitors_control": "visitors - control",
     "visitors_variation": "visitors - variation",
     "conversions_control": "conversions - control",
@@ -231,23 +247,29 @@ def build_airtable_payload(
     continuous_result: Optional[dict] = None,
     revenue_source: Literal["frequentist", "bayesian", "continuous"] = "frequentist",
 ) -> dict:
-    """Maps engine outputs onto Airtable field names via AIRTABLE_FIELD_MAP."""
+    """
+    Builds the automation result keyed by internal semantic names (e.g.
+    "visitors_control", "p_value") — NOT Airtable field names. Which base and
+    table this is headed to (and therefore which field names exist) isn't
+    known yet at this point in the flow; the Send step resolves that live and
+    translates via apply_field_map.
+    """
     fields: dict = {}
     if control is not None and variation is not None:
         fields.update({
-            AIRTABLE_FIELD_MAP["visitors_control"]: control.visitors,
-            AIRTABLE_FIELD_MAP["visitors_variation"]: variation.visitors,
-            AIRTABLE_FIELD_MAP["conversions_control"]: control.conversions,
-            AIRTABLE_FIELD_MAP["conversions_variation"]: variation.conversions,
+            "visitors_control": control.visitors,
+            "visitors_variation": variation.visitors,
+            "conversions_control": control.conversions,
+            "conversions_variation": variation.conversions,
         })
 
     if frequentist_result:
-        fields[AIRTABLE_FIELD_MAP["p_value"]] = round(frequentist_result["p_value"], 6)
+        fields["p_value"] = round(frequentist_result["p_value"], 6)
     if bayesian_result:
-        fields[AIRTABLE_FIELD_MAP["probability_pct"]] = round(bayesian_result["probability_pct"], 2)
+        fields["probability_pct"] = round(bayesian_result["probability_pct"], 2)
     if continuous_result:
-        fields[AIRTABLE_FIELD_MAP["continuous_p_value"]] = round(continuous_result["p_value"], 6)
-        fields[AIRTABLE_FIELD_MAP["continuous_test_name"]] = continuous_result["test_name"]
+        fields["continuous_p_value"] = round(continuous_result["p_value"], 6)
+        fields["continuous_test_name"] = continuous_result["test_name"]
 
     revenue_result = {
         "frequentist": frequentist_result,
@@ -255,6 +277,37 @@ def build_airtable_payload(
         "continuous": continuous_result,
     }.get(revenue_source) or frequentist_result or bayesian_result or continuous_result
     if revenue_result:
-        fields[AIRTABLE_FIELD_MAP["effect_on_revenue"]] = round(revenue_result["effect_on_revenue"], 2)
+        fields["effect_on_revenue"] = round(revenue_result["effect_on_revenue"], 2)
 
     return fields
+
+
+def apply_field_map(payload: dict, field_map: dict) -> dict:
+    """
+    Translates an internal-key payload (from build_airtable_payload) into
+    Airtable's actual field names for the chosen base/table, per field_map
+    (internal key -> Airtable field name). Keys with no chosen mapping are
+    omitted rather than sent under their internal name.
+    """
+    return {
+        field_map[key]: value
+        for key, value in payload.items()
+        if field_map.get(key)
+    }
+
+
+def best_match_field(internal_key: str, available_fields: list) -> Optional[str]:
+    """
+    Case-insensitive exact match of internal_key's default hint (see
+    DEFAULT_FIELD_NAME_HINTS) against a table's real field names — used only
+    to auto-preselect a sensible default in the assignment UI. Returns None
+    if there's no hint or no match, leaving the choice to the user.
+    """
+    hint = DEFAULT_FIELD_NAME_HINTS.get(internal_key, "")
+    if not hint:
+        return None
+    hint_lower = hint.lower()
+    for field in available_fields:
+        if field.lower() == hint_lower:
+            return field
+    return None

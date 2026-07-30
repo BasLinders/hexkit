@@ -37,12 +37,15 @@ from utility.sql_builder import (
 from utility.automation_engine import (
     VariantData,
     TAILS,
+    FIELD_LABELS,
     run_frequentist_analysis,
     run_bayesian_analysis,
     run_continuous_analysis,
     build_airtable_payload,
+    apply_field_map,
+    best_match_field,
 )
-from utility.airtable_client import get_credentials, push_record
+from utility.airtable_client import get_credentials, push_record, list_bases, list_tables
 
 
 STEPS = ["1. Fetch data", "2. Choose analysis", "3. Review results", "4. Send results"]
@@ -497,8 +500,8 @@ def _render_stage_results():
     payload = build_airtable_payload(control, variation, freq, bayes, cont, revenue_source=revenue_source)
     st.session_state["auto_payload"] = payload
 
-    st.markdown("**Airtable payload preview**")
-    st.caption("Field names are provisional — see `AIRTABLE_FIELD_MAP` in utility/automation_engine.py.")
+    st.markdown("**Result summary**")
+    st.caption("Airtable field names are chosen in the next step, based on the base/table you send to.")
     st.json(payload)
 
     col_back, col_next = st.columns(2)
@@ -516,6 +519,21 @@ def _render_stage_results():
 # Step 4 — Send results
 # ---------------------------------------------------------------------------
 
+def _render_json_download(payload: dict):
+    st.download_button(
+        "⬇️ Download raw result as JSON",
+        data=json.dumps(payload, indent=2).encode(),
+        file_name="automation_payload.json",
+        mime="application/json",
+    )
+
+
+def _render_back_to_results_button():
+    if st.button("← Back to results"):
+        st.session_state["auto_stage"] = 3
+        st.rerun()
+
+
 def _render_stage_send():
     payload = st.session_state.get("auto_payload")
     if payload is None:
@@ -527,47 +545,154 @@ def _render_stage_send():
 
     st.markdown("#### Airtable")
     creds = get_credentials()
-    col1, col2 = st.columns(2)
-    with col1:
-        base_id = st.text_input("Base ID", value=creds["base_id"], key="airtable_base_id")
-    with col2:
-        table_name = st.text_input("Table name", value=creds["table_name"], key="airtable_table_name")
-    api_key = st.text_input(
-        "API key (personal access token)", value=creds["api_key"],
-        type="password", key="airtable_api_key",
-    )
-    st.caption(
-        "No Airtable token is configured yet — set `AIRTABLE_API_KEY`, `AIRTABLE_BASE_ID` "
-        "and `AIRTABLE_TABLE_NAME` in Streamlit secrets to prefill these, or paste them "
-        "here for a one-off send (kept in this session only, never written to disk)."
+    api_key = creds["api_key"]
+
+    if not api_key:
+        st.warning(
+            "No Airtable token is configured — set `AIRTABLE_API_KEY` in Streamlit secrets "
+            "(a single personal access token with the `schema.bases:read` scope, granted "
+            "access to every base/workspace results should be sent to). It's an operational "
+            "secret, not something entered here."
+        )
+        st.divider()
+        _render_json_download(payload)
+        _render_back_to_results_button()
+        return
+
+    # --- Base discovery --------------------------------------------------
+    if st.session_state.get("airtable_bases_for_key") != api_key:
+        with st.spinner("Loading Airtable bases…"):
+            result = list_bases(api_key)
+        if not result["ok"]:
+            st.error(f"Couldn't list Airtable bases: {result['error']}")
+            st.divider()
+            _render_json_download(payload)
+            _render_back_to_results_button()
+            return
+        st.session_state["airtable_bases_cache"] = result["bases"]
+        st.session_state["airtable_bases_for_key"] = api_key
+
+    bases: dict = st.session_state["airtable_bases_cache"]
+    if not bases:
+        st.warning("This token can't see any bases — check its access under Airtable's token settings.")
+        st.divider()
+        _render_json_download(payload)
+        _render_back_to_results_button()
+        return
+
+    base_ids = list(bases.keys())
+    prior_base = st.session_state.get("airtable_base_id") or creds["base_id"]
+    base_id = st.selectbox(
+        "Send to (base)",
+        options=base_ids,
+        index=base_ids.index(prior_base) if prior_base in base_ids else 0,
+        format_func=lambda bid: bases.get(bid, bid),
+        key="airtable_base_id",
     )
 
-    if st.button(
-        "🚀 Send to Airtable", type="primary",
-        disabled=not (base_id and table_name and api_key),
-    ):
-        with st.spinner("Sending to Airtable…"):
-            result = push_record(base_id, table_name, api_key, payload)
-        if result["ok"]:
-            st.success(f"Record created: {result['record_id']}")
-        else:
-            st.error(f"Airtable request failed: {result['error']}")
+    # --- Table discovery ---------------------------------------------------
+    tables_cache_key = f"airtable_tables_{base_id}"
+    if tables_cache_key not in st.session_state:
+        with st.spinner("Loading tables…"):
+            result = list_tables(api_key, base_id)
+        if not result["ok"]:
+            st.error(f"Couldn't list tables in this base: {result['error']}")
+            st.divider()
+            _render_json_download(payload)
+            _render_back_to_results_button()
+            return
+        st.session_state[tables_cache_key] = result["tables"]
+
+    tables = st.session_state[tables_cache_key]
+    if not tables:
+        st.warning("This base has no tables.")
+        st.divider()
+        _render_json_download(payload)
+        _render_back_to_results_button()
+        return
+
+    table_names = [t["name"] for t in tables]
+    stored_selection = st.session_state.get("airtable_table_names", [])
+    default_selection = [n for n in stored_selection if n in table_names] or table_names[:1]
+    selected_names = st.multiselect(
+        "Tables — send this result to each one selected",
+        options=table_names,
+        default=default_selection,
+        key="airtable_table_names",
+        help="Pick every table that should receive this result — e.g. an internal "
+             "tracking table plus one or more client tables in the same base. Each "
+             "gets its own field mapping below.",
+    )
+    if not selected_names:
+        st.info("Select at least one table above to continue.")
+        st.divider()
+        _render_json_download(payload)
+        _render_back_to_results_button()
+        return
+
+    selected_tables = [t for t in tables if t["name"] in selected_names]
+
+    # --- Field assignment, one tab per selected table -----------------------
+    st.divider()
+    st.markdown("#### Field mapping")
+    st.caption(
+        "Assign each computed value to a column in each table. Remembered per "
+        "base/table, so you only need to set this up once."
+    )
+
+    field_maps: dict = {}
+    for tab, table in zip(st.tabs(selected_names), selected_tables):
+        with tab:
+            field_options = ["— Skip —"] + table["fields"]
+            mapping_key = f"airtable_fieldmap_{base_id}_{table['id']}"
+            stored_mapping: dict = st.session_state.get(mapping_key, {})
+
+            field_map: dict = {}
+            for key in payload:
+                label = FIELD_LABELS.get(key, key)
+                default = stored_mapping.get(key) or best_match_field(key, table["fields"])
+                default_idx = field_options.index(default) if default in field_options else 0
+                chosen = st.selectbox(
+                    label, options=field_options, index=default_idx,
+                    key=f"{mapping_key}_{key}",
+                )
+                if chosen != "— Skip —":
+                    field_map[key] = chosen
+
+            st.session_state[mapping_key] = field_map
+            field_maps[table["id"]] = field_map
+
+    final_fields_by_table = {
+        table["id"]: apply_field_map(payload, field_maps[table["id"]])
+        for table in selected_tables
+    }
+    ready_tables = [t for t in selected_tables if final_fields_by_table[t["id"]]]
+    skipped_tables = [t for t in selected_tables if t not in ready_tables]
+
+    with st.expander("Preview what will be sent", expanded=False):
+        st.json({t["name"]: final_fields_by_table[t["id"]] for t in selected_tables})
+
+    if st.button("🚀 Send to Airtable", type="primary", disabled=not ready_tables):
+        with st.spinner(f"Sending to {len(ready_tables)} table(s)…"):
+            send_results = [
+                (table["name"], push_record(base_id, table["id"], api_key, final_fields_by_table[table["id"]]))
+                for table in ready_tables
+            ]
+        for name, result in send_results:
+            if result["ok"]:
+                st.success(f"{name}: record created ({result['record_id']})")
+            else:
+                st.error(f"{name}: {result['error']}")
+        if skipped_tables:
+            st.caption(f"Skipped (no fields mapped): {', '.join(t['name'] for t in skipped_tables)}")
 
     st.divider()
     st.markdown("#### Other destinations")
     st.caption("More destinations (Slack, HubSpot, …) can be wired in here later.")
 
     st.divider()
-    st.download_button(
-        "⬇️ Download payload as JSON",
-        data=json.dumps(payload, indent=2).encode(),
-        file_name="automation_payload.json",
-        mime="application/json",
-    )
-
-    if st.button("← Back to results"):
-        st.session_state["auto_stage"] = 3
-        st.rerun()
+    _render_json_download(payload)
+    _render_back_to_results_button()
 
 
 # ---------------------------------------------------------------------------
