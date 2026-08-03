@@ -97,6 +97,28 @@ def _guess_id_field(fields: list[str]) -> Optional[str]:
     return None
 
 
+_HYPOTHESIS_FIELD_HINTS = ("hypothesis",)
+
+
+def _guess_hypothesis_field(fields: list[str]) -> Optional[str]:
+    lowered = {f.lower(): f for f in fields}
+    for hint in _HYPOTHESIS_FIELD_HINTS:
+        if hint in lowered:
+            return lowered[hint]
+    return None
+
+
+_CUSTOM_CODE_FIELD_HINTS = ("custom code", "code")
+
+
+def _guess_custom_code_field(fields: list[str]) -> Optional[str]:
+    lowered = {f.lower(): f for f in fields}
+    for hint in _CUSTOM_CODE_FIELD_HINTS:
+        if hint in lowered:
+            return lowered[hint]
+    return None
+
+
 def _reset_automation_state():
     for key in list(st.session_state.keys()):
         if key.startswith("auto_") or key.startswith("autofetch_"):
@@ -169,6 +191,44 @@ def _render_stage_fetch():
                 key="autofetch_pretest_kpi",
             )
 
+        use_page_filter = st.toggle(
+            "Enable page filter",
+            value=False,
+            key="autofetch_pretest_use_filter",
+            help=(
+                "When enabled, only baseline users who visited a matching page "
+                "are included. Useful for scoping the baseline to a specific "
+                "section of the site — e.g. a product category or checkout flow."
+            ),
+        )
+        page_filter_type = None
+        page_filter_value = ""
+        if use_page_filter:
+            fc1, fc2 = st.columns([1, 2])
+            with fc1:
+                page_filter_type = cast(
+                    Literal["regex", "contains"],
+                    st.radio(
+                        "Filter type",
+                        options=["contains", "regex"],
+                        format_func=lambda x: "URL contains" if x == "contains" else "Regex pattern",
+                        horizontal=True,
+                        key="autofetch_pretest_filter_type",
+                    ),
+                )
+            with fc2:
+                page_filter_value = st.text_input(
+                    "Filter value",
+                    placeholder=".html  |  /products/  |  \\.html$",
+                    key="autofetch_pretest_filter_value",
+                    help=(
+                        "The string or pattern to match against page_location. "
+                        "Regex uses BigQuery REGEXP_CONTAINS syntax. Matching is case-sensitive."
+                    ),
+                )
+            if not page_filter_value:
+                st.warning("Enter a filter value or disable the page filter.")
+
         try:
             experiment_start = datetime.strptime(start_date, "%Y-%m-%d").date()
         except ValueError:
@@ -191,6 +251,8 @@ def _render_stage_fetch():
                 output_type="binomial",
                 output_shape="aggregate",
                 kpi_add_to_cart=(PRETEST_KPI_OPTIONS[kpi_choice] == "add_to_cart"),
+                page_filter_type=page_filter_type if page_filter_value else None,
+                page_filter_value=page_filter_value,
             )
             baseline_sql = build_baseline(baseline_params)
             render_sql_viewer(baseline_sql, key="auto_pretest_sql")
@@ -325,6 +387,7 @@ def _render_stage_fetch():
     if st.button("Continue to choose analysis method(s) →", type="primary"):
         st.session_state["auto_df_binomial"] = df_binomial
         st.session_state["auto_df_continuous"] = df_continuous
+        st.session_state["auto_exp_prefix"] = exp_prefix
 
         df_pretest = st.session_state.get("auto_pretest_result")
         st.session_state["auto_df_pretest"] = df_pretest
@@ -537,6 +600,18 @@ def _render_stage_configure():
     ]
     revenue_source = active_methods[0].lower() if active_methods else "frequentist"
     if len(active_methods) > 1:
+        # Frequentist/Bayesian default to checked whenever Binomial data was
+        # fetched (Streamlit's checkbox `value=` only applies once, on first
+        # render — see the checkboxes above), so this radio's options can
+        # silently change shape without the user touching either checkbox.
+        # If the active set changed since the last run, drop the stale
+        # session_state pick instead of carrying over a choice made for a
+        # different combination of methods (e.g. "Bayesian" picked back when
+        # Continuous wasn't active yet, silently kept once it is).
+        if st.session_state.get("auto_revenue_source_methods") != active_methods:
+            st.session_state.pop("auto_revenue_source_radio", None)
+            st.session_state["auto_revenue_source_methods"] = active_methods
+
         choice = st.radio(
             "Use for the shared 'effect on revenue' field:",
             options=active_methods,
@@ -544,6 +619,8 @@ def _render_stage_configure():
             key="auto_revenue_source_radio",
         )
         revenue_source = choice.lower()
+
+    st.info(f"💰 'Effect on revenue' will be sent from: **{revenue_source.capitalize()}**.")
 
     st.divider()
     col_back, col_next = st.columns(2)
@@ -623,8 +700,17 @@ def _render_stage_results():
     cont = results.get("continuous")
     pretest = results.get("pretest")
 
+    # Which method's effect_on_revenue actually feeds the shared Airtable
+    # field — decided back in Step 2 (see the radio there), surfaced again
+    # here per-method so it's never ambiguous which number is really used,
+    # even if the three methods' monetary estimates disagree substantially.
+    revenue_source = st.session_state.get("auto_revenue_source", "frequentist")
+
+    def _revenue_tag(method: str) -> str:
+        return " 💰 *(used for shared 'effect on revenue')*" if revenue_source == method else ""
+
     if freq:
-        st.markdown("### Frequentist")
+        st.markdown(f"### Frequentist{_revenue_tag('frequentist')}")
         c1, c2, c3 = st.columns(3)
         c1.metric("P-value", f"{freq['p_value']:.4f}")
         c2.metric("Significant?", "Yes" if freq["is_significant"] else "No")
@@ -639,7 +725,7 @@ def _render_stage_results():
         st.divider()
 
     if bayes:
-        st.markdown("### Bayesian")
+        st.markdown(f"### Bayesian{_revenue_tag('bayesian')}")
         c1, c2, c3 = st.columns(3)
         c1.metric("Probability to beat control", f"{bayes['probability_pct']:.1f}%")
         c2.metric("Probability to be best", f"{bayes['prob_being_best']:.1%}")
@@ -656,7 +742,7 @@ def _render_stage_results():
 
     if cont:
         mode_label = "RPV" if cont.get("mode", "rpv") == "rpv" else "RPT"
-        st.markdown(f"### Continuous ({mode_label})")
+        st.markdown(f"### Continuous ({mode_label}){_revenue_tag('continuous')}")
         c1, c2, c3 = st.columns(3)
         c1.metric("Test used", cont["test_name"])
         c2.metric("P-value", f"{cont['p_value']:.4f}")
@@ -684,7 +770,6 @@ def _render_stage_results():
 
     start_dt = st.session_state.get("start_date")
     end_dt = st.session_state.get("end_date")
-    revenue_source = st.session_state.get("auto_revenue_source", "frequentist")
     payload = build_airtable_payload(
         control, variation, freq, bayes, cont, revenue_source=revenue_source,
         start_date=str(start_dt) if start_dt else None,
@@ -694,7 +779,11 @@ def _render_stage_results():
     st.session_state["auto_payload"] = payload
 
     st.markdown("**Result summary**")
-    st.caption("Airtable field names are chosen in the next step, based on the base/table you send to.")
+    st.caption(
+        f"💰 'effect_on_revenue' below is sourced from **{revenue_source.capitalize()}** "
+        "— change the source in Step 2 if that's not what you expected. "
+        "Airtable field names are chosen in the next step, based on the base/table you send to."
+    )
     st.json(payload)
 
     col_back, col_next = st.columns(2)
@@ -712,6 +801,63 @@ def _render_stage_results():
 # Step 4 — AI conclusion (optional)
 # ---------------------------------------------------------------------------
 
+def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
+    """
+    Searches the configured default Airtable base/table (AIRTABLE_BASE_ID/
+    AIRTABLE_TABLE_NAME) for the record matching this experiment (Step 1's
+    exp_prefix, via the same id-field guess the Send step uses). Shared by
+    the Hypothesis gate (required, blocks generation) and the Custom Code
+    lookup (optional context for Gemini) so both reuse one round-trip.
+    Returns (table_field_names, matched_record_fields_or_None, message).
+    """
+    exp_prefix = st.session_state.get("auto_exp_prefix")
+    creds = get_credentials()
+    api_key, base_id, table_name = creds["api_key"], creds["base_id"], creds["table_name"]
+
+    if not (api_key and base_id and table_name):
+        return [], None, (
+            "Airtable isn't fully configured (AIRTABLE_API_KEY/BASE_ID/TABLE_NAME) — "
+            "can't look up the experiment record."
+        )
+    if not exp_prefix:
+        return [], None, "No experiment ID from Step 1 to look up."
+
+    tables_result = list_tables(api_key, base_id)
+    if not tables_result["ok"]:
+        return [], None, f"Couldn't load Airtable tables: {tables_result['error']}"
+
+    table = next(
+        (t for t in tables_result["tables"] if table_name in (t["id"], t["name"])),
+        None,
+    )
+    if table is None:
+        return [], None, f"Configured table '{table_name}' wasn't found in the base."
+
+    id_field = _guess_id_field(table["fields"])
+    if not id_field:
+        return table["fields"], None, "Couldn't find an ID field on the configured table."
+
+    search_result = search_records(base_id, table["id"], api_key, id_field, exp_prefix)
+    if not search_result["ok"]:
+        return table["fields"], None, f"Airtable lookup failed: {search_result['error']}"
+
+    matches = search_result["records"]
+    if not matches:
+        return table["fields"], None, f"No Airtable record found yet for experiment '{exp_prefix}'."
+
+    # Prefer a match that already has a Hypothesis filled in, if more than one
+    # record matched the search term — otherwise just take the first.
+    hypothesis_field = _guess_hypothesis_field(table["fields"])
+    if hypothesis_field:
+        with_hypothesis = next(
+            (r for r in matches if str(r["fields"].get(hypothesis_field, "")).strip()), None,
+        )
+        if with_hypothesis:
+            return table["fields"], with_hypothesis["fields"], f"Matched Airtable record for '{exp_prefix}'."
+
+    return table["fields"], matches[0]["fields"], f"Matched Airtable record for '{exp_prefix}'."
+
+
 def _render_stage_ai():
     payload = st.session_state.get("auto_payload")
     results = st.session_state.get("auto_results") or {}
@@ -726,6 +872,20 @@ def _render_stage_ai():
         "Entirely optional — skip straight to sending if you don't want one."
     )
 
+    table_fields, record_fields, lookup_message = _lookup_experiment_record()
+
+    hypothesis_field = _guess_hypothesis_field(table_fields) if table_fields else None
+    hypothesis_ok = bool(
+        record_fields is not None and hypothesis_field
+        and str(record_fields.get(hypothesis_field, "")).strip()
+    )
+
+    custom_code_field = _guess_custom_code_field(table_fields) if table_fields else None
+    custom_code = (
+        str(record_fields.get(custom_code_field, "")).strip()
+        if record_fields is not None and custom_code_field else ""
+    )
+
     ai_input = {
         "payload": payload,
         "conclusions": {
@@ -734,6 +894,10 @@ def _render_stage_ai():
             if result.get("conclusion")
         },
     }
+    if custom_code:
+        # Optional context, not gated on — helps Gemini interpret what was
+        # actually being tested (e.g. which element/variant the code touches).
+        ai_input["custom_code"] = custom_code
 
     with st.expander("Data that would be sent to Gemini", expanded=False):
         st.json(ai_input)
@@ -744,7 +908,16 @@ def _render_stage_ai():
             "to enable this step. You can still continue without an AI conclusion."
         )
     else:
-        if st.button("🤖 Generate AI conclusion", type="primary"):
+        if not hypothesis_ok:
+            st.warning(
+                f"{lookup_message} Document the Hypothesis in Airtable first — "
+                "an AI conclusion can't be generated without it."
+            )
+        generate_clicked = st.button(
+            "🤖 Generate AI conclusion", type="primary",
+            disabled=not hypothesis_ok, key="auto_generate_ai_btn",
+        )
+        if generate_clicked:
             with st.spinner("Asking Gemini…"):
                 result = gemini_client.generate_conclusion(ai_input)
             if result["ok"]:
@@ -902,7 +1075,14 @@ def _render_stage_send():
             table_names = [t["name"] for t in tables]
             names_key = f"airtable_table_names_{base_id}"
             stored_selection = st.session_state.get(names_key, [])
-            default_selection = [n for n in stored_selection if n in table_names] or table_names[:1]
+            experiment_tables = [n for n in table_names if n.lower() == "experiments"] or [
+                n for n in table_names if "experiments" in n.lower()
+            ]
+            default_selection = (
+                [n for n in stored_selection if n in table_names]
+                or experiment_tables
+                or table_names[:1]
+            )
             selected_names = st.multiselect(
                 "Tables — send this result to each one selected",
                 options=table_names,

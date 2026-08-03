@@ -6,7 +6,6 @@ Kept separate from pages/automation.py so it stays testable without Streamlit.
 """
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -49,21 +48,24 @@ FIELD_LABELS = {
     "description": "Description",
 }
 
-DEFAULT_FIELD_NAME_HINTS = {
-    "start_date": "start date",
-    "end_date": "end date",
-    "visitors_control": "visitors - control",
-    "visitors_variation": "visitors - variation",
-    "conversions_control": "conversions - control",
-    "conversions_variation": "conversions - variation",
-    "probability_pct": "probability (%)",
-    "p_value": "p-value",
-    "continuous_p_value": "p-value (continuous)",
-    "continuous_test_name": "test used (continuous)",
-    "effect_on_revenue": "effect on revenue",
-    "pretest_mde_table": "pre-test mde table",
-    "ai_conclusion": "ai conclusion",
-    "description": "description",
+# Each key maps to a list of candidate names, tried in order — covers common
+# English/Dutch naming variants since Airtable bases here aren't necessarily
+# English (e.g. "Startdatum" instead of "Start date").
+DEFAULT_FIELD_NAME_HINTS: dict[str, list[str]] = {
+    "start_date": ["start date", "startdate", "startdatum"],
+    "end_date": ["end date", "enddate", "einddatum"],
+    "visitors_control": ["visitors - control", "visitors control"],
+    "visitors_variation": ["visitors - variation", "visitors variation"],
+    "conversions_control": ["conversions - control", "conversions control"],
+    "conversions_variation": ["conversions - variation", "conversions variation"],
+    "probability_pct": ["probability (%)", "probability"],
+    "p_value": ["p-value"],
+    "continuous_p_value": ["p-value (continuous)"],
+    "continuous_test_name": ["test used (continuous)"],
+    "effect_on_revenue": ["effect on revenue", "effect op omzet"],
+    "pretest_mde_table": ["pre-test mde table"],
+    "ai_conclusion": ["ai conclusion"],
+    "description": ["description"],
 }
 
 _TAIL_MAP = {
@@ -315,6 +317,22 @@ def run_pretest_analysis(
     }
 
 
+def format_pretest_table(table: list[dict]) -> str:
+    """
+    Renders the pre-test MDE table as plain text, one line per week, instead
+    of json.dumps(...) — Airtable long-text fields don't render JSON or
+    markdown tables, so a JSON blob just shows up as raw markup in the field.
+    """
+    lines = []
+    for row in table:
+        size_key = next((k for k in row if k not in ("Week", "MDE")), None)
+        size_label = size_key.replace("_", " ").lower() if size_key else ""
+        size_val = row.get(size_key) if size_key else None
+        size_part = f"{size_val:,} {size_label}" if size_val is not None else ""
+        lines.append(f"Week {row['Week']}: {size_part} — MDE {row['MDE']:.2%}")
+    return "\n".join(lines)
+
+
 def build_airtable_payload(
     control: Optional[VariantData],
     variation: Optional[VariantData],
@@ -349,7 +367,7 @@ def build_airtable_payload(
         })
 
     if pretest_result:
-        fields["pretest_mde_table"] = json.dumps(pretest_result["table"])
+        fields["pretest_mde_table"] = format_pretest_table(pretest_result["table"])
 
     if ai_conclusion:
         fields["ai_conclusion"] = ai_conclusion
@@ -357,7 +375,10 @@ def build_airtable_payload(
     if frequentist_result:
         fields["p_value"] = round(frequentist_result["p_value"], 6)
     if bayesian_result:
-        fields["probability_pct"] = round(bayesian_result["probability_pct"], 2)
+        # Airtable's own Percent field format multiplies the stored value by
+        # 100 for display, so it expects a raw proportion (0-1) — sending the
+        # already-computed percentage (e.g. 83.42) makes Airtable show 8342%.
+        fields["probability_pct"] = round(bayesian_result["probability_pct"] / 100, 6)
     if continuous_result:
         fields["continuous_p_value"] = round(continuous_result["p_value"], 6)
         fields["continuous_test_name"] = continuous_result["test_name"]
@@ -387,18 +408,40 @@ def apply_field_map(payload: dict, field_map: dict) -> dict:
     }
 
 
+def _normalize_field_name(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
 def best_match_field(internal_key: str, available_fields: list) -> Optional[str]:
     """
-    Case-insensitive exact match of internal_key's default hint (see
-    DEFAULT_FIELD_NAME_HINTS) against a table's real field names — used only
-    to auto-preselect a sensible default in the assignment UI. Returns None
-    if there's no hint or no match, leaving the choice to the user.
+    Matches internal_key's default hints (see DEFAULT_FIELD_NAME_HINTS)
+    against a table's real field names — used only to auto-preselect a
+    sensible default in the assignment UI. Returns None if there's no hint
+    or no match, leaving the choice to the user.
+
+    Tries, in order: case-insensitive exact match against any hint, then a
+    normalized (spaces/punctuation stripped) exact match, then a normalized
+    substring match — e.g. "start_date" matches a field named "Test start
+    date" or "Startdatum" even though neither is an exact hint.
     """
-    hint = DEFAULT_FIELD_NAME_HINTS.get(internal_key, "")
-    if not hint:
+    hints = DEFAULT_FIELD_NAME_HINTS.get(internal_key, [])
+    if not hints:
         return None
-    hint_lower = hint.lower()
-    for field in available_fields:
-        if field.lower() == hint_lower:
-            return field
+
+    lowered = {f.lower(): f for f in available_fields}
+    for hint in hints:
+        if hint.lower() in lowered:
+            return lowered[hint.lower()]
+
+    normalized_fields = {_normalize_field_name(f): f for f in available_fields}
+    for hint in hints:
+        norm_hint = _normalize_field_name(hint)
+        if norm_hint in normalized_fields:
+            return normalized_fields[norm_hint]
+
+    for hint in hints:
+        norm_hint = _normalize_field_name(hint)
+        for norm_field, original in normalized_fields.items():
+            if norm_hint in norm_field or norm_field in norm_hint:
+                return original
     return None
