@@ -680,7 +680,7 @@ def _read_continuous_values(key_prefix: str) -> np.ndarray | None:
         uploaded = st.file_uploader("Upload CSV", type=["csv"], key=f"{key_prefix}_csv")
         if uploaded is not None:
             try:
-                dfc = pd.read_csv(uploaded)
+                dfc = pd.read_csv(uploaded, sep=None, engine="python", encoding="utf-8-sig")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Could not read CSV: {exc}")
                 return None
