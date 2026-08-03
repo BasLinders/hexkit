@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 import streamlit as st
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.6-flash"
 
 _PROMPT_INSTRUCTIONS = """\
 You are a conversion-rate-optimization analyst reviewing the results of an
