@@ -1075,8 +1075,8 @@ def _render_stage_send():
             table_names = [t["name"] for t in tables]
             names_key = f"airtable_table_names_{base_id}"
             stored_selection = st.session_state.get(names_key, [])
-            experiment_tables = [n for n in table_names if n.lower() == "experiment"] or [
-                n for n in table_names if "experiment" in n.lower()
+            experiment_tables = [n for n in table_names if n.lower() == "experiments"] or [
+                n for n in table_names if "experiments" in n.lower()
             ]
             default_selection = (
                 [n for n in stored_selection if n in table_names]
