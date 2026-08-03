@@ -19,14 +19,18 @@ _PROMPT_INSTRUCTIONS = """\
 You are a conversion-rate-optimization analyst reviewing the results of an
 A/B test. Below is a JSON object with the computed statistics (frequentist,
 Bayesian, and/or continuous-metric analysis, and an optional pre-test MDE
-projection) for a control ("Control") vs. a variation ("Variation").
+projection) for a control ("Control") vs. a variation ("Variation"). It may
+also include a "custom_code" field — the actual implementation code for the
+variation — use it only to understand what was really being tested, not as
+something to comment on directly.
 
-Write a short, plain-language conclusion (3-6 sentences) a stakeholder
-without a statistics background could act on. Cover:
+Write a short, plain-language conclusion (3-6 sentences), IN DUTCH, that a
+stakeholder without a statistics background could act on. Cover:
 - Whether the result is statistically significant / conclusive, and how confident to be.
 - The practical size of the effect (uplift, revenue impact) if available.
 - A clear recommendation: ship the variation, keep testing, or stop/iterate.
 Do not restate raw numbers already visible in the data verbatim; interpret them.
+Respond entirely in Dutch, including the recommendation.
 
 Data:
 """
