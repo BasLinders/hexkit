@@ -24,11 +24,17 @@ also include a "custom_code" field — the actual implementation code for the
 variation — use it only to understand what was really being tested, not as
 something to comment on directly.
 
+Make sure that you structure your answer thorougly by KPI. Each KPI should have a headline like this before summarizing the results:
+KPI: [KPI] ([test type], [Percentage] Confidence, [Percentage] Power)
+
 Write a short, plain-language conclusion (3-6 sentences), IN DUTCH, that a
 stakeholder without a statistics background could act on. Cover:
-- Whether the result is statistically significant / conclusive, and how confident to be.
-- The practical size of the effect (uplift, revenue impact) if available.
-- A clear recommendation: ship the variation, keep testing, or stop/iterate.
+- Whether the result is statistically significant / conclusive, and how confident to be (per KPI).
+- The practical size of the effect (uplift, revenue impact) if available (per KPI).
+- A clear recommendation: ship the variation, keep testing, or stop/iterate (based on all KPIs).
+- If there is sufficient data to infer it, also write a possible explanation from a psychological angle using known principles, fallacies, biases (based on all KPIs).
+- Be cautious in your final conclusions and rather use 'the data suggests' instead of 'it is clear that'. when drawing a conclusion. Use a scientific mind, but plain and concise language to communicate the findings.
+
 Do not restate raw numbers already visible in the data verbatim; interpret them.
 Respond entirely in Dutch, including the recommendation.
 
