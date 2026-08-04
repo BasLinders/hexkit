@@ -48,6 +48,7 @@ from utility.automation_engine import (
     build_airtable_payload,
     apply_field_map,
     best_match_field,
+    guess_field_by_hints,
 )
 from utility.airtable_client import (
     get_credentials, push_record, update_record, search_records, list_bases, list_tables,
@@ -84,39 +85,33 @@ def _pretest_baseline_range(experiment_start: date, weeks_before: int) -> tuple[
     return baseline_start, baseline_end
 
 
+# Each is tried via guess_field_by_hints — exact match first, then a
+# normalized (spaces/punctuation stripped) exact match, then a normalized
+# substring match — so naming variants (incl. Dutch, since these bases
+# aren't necessarily English) still resolve without an exact hint hit.
 _ID_FIELD_HINTS = ("experiment id", "experiment_id", "test id", "test_id", "id")
 
 
 def _guess_id_field(fields: list[str]) -> Optional[str]:
     """Best-effort default for 'which field identifies existing records' —
     e.g. an Airtable autonumber field named 'Experiment ID'."""
-    lowered = {f.lower(): f for f in fields}
-    for hint in _ID_FIELD_HINTS:
-        if hint in lowered:
-            return lowered[hint]
-    return None
+    return guess_field_by_hints(_ID_FIELD_HINTS, fields)
 
 
-_HYPOTHESIS_FIELD_HINTS = ("hypothesis",)
+_HYPOTHESIS_FIELD_HINTS = ("hypothesis", "hypothese")
 
 
 def _guess_hypothesis_field(fields: list[str]) -> Optional[str]:
-    lowered = {f.lower(): f for f in fields}
-    for hint in _HYPOTHESIS_FIELD_HINTS:
-        if hint in lowered:
-            return lowered[hint]
-    return None
+    return guess_field_by_hints(_HYPOTHESIS_FIELD_HINTS, fields)
 
 
-_CUSTOM_CODE_FIELD_HINTS = ("custom code", "code")
+_CUSTOM_CODE_FIELD_HINTS = (
+    "custom code", "code", "custom js", "js code", "code snippet", "aangepaste code",
+)
 
 
 def _guess_custom_code_field(fields: list[str]) -> Optional[str]:
-    lowered = {f.lower(): f for f in fields}
-    for hint in _CUSTOM_CODE_FIELD_HINTS:
-        if hint in lowered:
-            return lowered[hint]
-    return None
+    return guess_field_by_hints(_CUSTOM_CODE_FIELD_HINTS, fields)
 
 
 def _reset_automation_state():

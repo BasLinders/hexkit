@@ -412,19 +412,18 @@ def _normalize_field_name(name: str) -> str:
     return "".join(ch for ch in name.lower() if ch.isalnum())
 
 
-def best_match_field(internal_key: str, available_fields: list) -> Optional[str]:
+def guess_field_by_hints(hints: list[str], available_fields: list) -> Optional[str]:
     """
-    Matches internal_key's default hints (see DEFAULT_FIELD_NAME_HINTS)
-    against a table's real field names — used only to auto-preselect a
-    sensible default in the assignment UI. Returns None if there's no hint
-    or no match, leaving the choice to the user.
+    Matches a list of candidate names against a table's real field names —
+    shared by best_match_field (Airtable-push field assignment) and
+    automation.py's read-side lookups (experiment ID, Hypothesis, Custom
+    Code fields on an existing record). Returns None if there's no match.
 
     Tries, in order: case-insensitive exact match against any hint, then a
     normalized (spaces/punctuation stripped) exact match, then a normalized
     substring match — e.g. "start_date" matches a field named "Test start
     date" or "Startdatum" even though neither is an exact hint.
     """
-    hints = DEFAULT_FIELD_NAME_HINTS.get(internal_key, [])
     if not hints:
         return None
 
@@ -445,3 +444,13 @@ def best_match_field(internal_key: str, available_fields: list) -> Optional[str]
             if norm_hint in norm_field or norm_field in norm_hint:
                 return original
     return None
+
+
+def best_match_field(internal_key: str, available_fields: list) -> Optional[str]:
+    """
+    Matches internal_key's default hints (see DEFAULT_FIELD_NAME_HINTS)
+    against a table's real field names — used only to auto-preselect a
+    sensible default in the assignment UI. Returns None if there's no hint
+    or no match, leaving the choice to the user.
+    """
+    return guess_field_by_hints(DEFAULT_FIELD_NAME_HINTS.get(internal_key, []), available_fields)
