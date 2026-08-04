@@ -45,7 +45,7 @@ FIELD_LABELS = {
     "effect_on_revenue": "Effect on revenue",
     "pretest_mde_table": "Pre-test MDE table",
     "ai_conclusion": "AI conclusion",
-    "description": "Description",
+    "description": "Short description",
 }
 
 # Each key maps to a list of candidate names, tried in order — covers common
@@ -63,8 +63,8 @@ DEFAULT_FIELD_NAME_HINTS: dict[str, list[str]] = {
     "continuous_p_value": ["p-value (continuous)"],
     "continuous_test_name": ["test used (continuous)"],
     "effect_on_revenue": ["effect on revenue", "effect op omzet"],
-    "pretest_mde_table": ["pre-test mde table"],
-    "ai_conclusion": ["ai conclusion"],
+    "pretest_mde_table": ["pre-test mde table", "pre-test analysis"],
+    "ai_conclusion": ["ai conclusion", "conclusion", "conclusie"],
     "description": ["description"],
 }
 
