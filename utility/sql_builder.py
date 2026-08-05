@@ -798,7 +798,7 @@ SELECT
   ed.transaction_id
 FROM variant_data vd
 {join_type} ecommerce_data ed ON vd.user_pseudo_id = ed.user_pseudo_id
-INNER JOIN device_data      dd ON vd.user_pseudo_id = dd.device_user_pseudo_id
+LEFT JOIN device_data       dd ON vd.user_pseudo_id = dd.device_user_pseudo_id
 WHERE ('{p.device_filter}' = 'all' OR dd.primary_device = '{p.device_filter}')
 ORDER BY ed.purchase_revenue DESC{limit_clause};
 """
@@ -1313,7 +1313,7 @@ SELECT
   ed.transaction_id
 FROM variant_data vd
 {join_type} ecommerce_data ed ON vd.user_pseudo_id = ed.user_pseudo_id
-INNER JOIN device_data      dd ON vd.user_pseudo_id = dd.device_user_pseudo_id
+LEFT JOIN device_data       dd ON vd.user_pseudo_id = dd.device_user_pseudo_id
 {filter_join}WHERE ('{p.device_filter}' = 'all' OR dd.primary_device = '{p.device_filter}')
 ORDER BY ed.purchase_revenue DESC"""
 
