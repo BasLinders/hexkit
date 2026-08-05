@@ -420,8 +420,16 @@ def _render_stage_fetch():
         except ValueError:
             st.session_state["auto_runtime_days"] = 1
 
-        df_pretest = st.session_state.get("auto_pretest_result")
-        df_pretest_daily = st.session_state.get("auto_pretest_daily_result")
+        # Gated on the current want_pretest checkbox state, same reason as the
+        # want_binomial/want_continuous gate above: without it, unchecking
+        # "Fetch pre-test baseline data" after a previous fetch (e.g. going
+        # back and deciding not to use it this run) wouldn't actually drop
+        # the stale result -- the elif below would still pick it up and build
+        # auto_pretest_meta from it, silently keeping Pre-Test Analysis
+        # available with baseline data from a possibly different
+        # weeks/KPI/experiment configuration.
+        df_pretest = st.session_state.get("auto_pretest_result") if want_pretest else None
+        df_pretest_daily = st.session_state.get("auto_pretest_daily_result") if want_pretest else None
         st.session_state["auto_df_pretest"] = df_pretest
         use_seasonal = want_pretest and bool(st.session_state.get("autofetch_pretest_seasonal", False))
         kpi_choice = st.session_state.get("autofetch_pretest_kpi", "Transactions (purchases)")
