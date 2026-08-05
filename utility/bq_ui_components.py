@@ -332,11 +332,32 @@ def render_variant_inputs(
                     with col_str:
                         st.text(variant_str)
                     with col_sel:
+                        # Scoped by exp_id + the variant string itself, not
+                        # just position (vi) -- _label_opts never changes, so
+                        # a position-scoped key has no "options changed under
+                        # a stale key" fallback to even warn on: switching to
+                        # a different experiment ID and re-detecting (e.g.
+                        # via "Back to data fetch") silently keeps whatever
+                        # label was assigned at that same position before,
+                        # attached to whatever string now happens to sit
+                        # there. If the two experiments' variant strings
+                        # don't happen to sort in the same relative order,
+                        # that silently swaps which string means Control (A)
+                        # vs Variation (B) -- confirmed via a live Streamlit
+                        # test, with labels_present still coming out exactly
+                        # {"A", "B"} either way, so the existing "no A
+                        # assigned" guard below never catches it. Scoping by
+                        # exp_id + variant_str instead means a genuinely new
+                        # experiment's detection always starts from fresh
+                        # defaults, while re-detecting the SAME experiment
+                        # (e.g. after widening the date range) still
+                        # correctly remembers prior manual assignments for
+                        # strings it already knows about.
                         assigned = st.selectbox(
                             "Label",
                             options=_label_opts,
                             index=default_idx,
-                            key=f"{key_prefix}_exp_{exp_idx}_assign_{vi}",
+                            key=f"{key_prefix}_exp_{exp_idx}_{exp_id}_assign_{variant_str}",
                             label_visibility="collapsed",
                         )
 
