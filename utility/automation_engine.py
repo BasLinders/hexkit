@@ -233,8 +233,22 @@ def run_bayesian_analysis(
     engine = BayesianEngine()
     prob_result = engine.run_probability_analysis(data, n_samples=n_samples)[0]
 
+    # BayesianEngine._sample_aov draws AOV samples via
+    # np.log(mean_aov) -- an AOV of exactly 0.0 (VariantData.aov defaults to
+    # 0.0 when a variant has zero conversions, e.g. very early in a test)
+    # sends that straight to log(0) = -inf, raising a RuntimeWarning on every
+    # such run. It doesn't crash -- exp(-inf) underflows cleanly to 0.0,
+    # which is the right degenerate answer (no order data to model an AOV
+    # distribution from) -- but relying on float underflow instead of an
+    # explicit guard is fragile. Clamped to a negligible epsilon instead:
+    # indistinguishable from 0 in any reported figure (every downstream
+    # value rounds to cents) but keeps log() finite.
+    _AOV_EPSILON = 1e-6
     biz_case = BusinessCaseInput(
-        aovs={control.label: control.aov, variation.label: variation.aov},
+        aovs={
+            control.label: control.aov or _AOV_EPSILON,
+            variation.label: variation.aov or _AOV_EPSILON,
+        },
         runtime_days=runtime_days,
         projection_period=projection_days,
     )
