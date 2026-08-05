@@ -49,6 +49,7 @@ from utility.automation_engine import (
     run_continuous_analysis,
     run_pretest_analysis,
     run_pretest_analysis_seasonal,
+    collapse_to_per_visitor,
     build_airtable_payload,
     apply_field_map,
     best_match_field,
@@ -378,8 +379,15 @@ def _render_stage_fetch():
             project, sql, result_key=f"auto_{label}_result", allow_preview=True, dataset=dataset,
         )
 
-    df_binomial = st.session_state.get("auto_binomial_result")
-    df_continuous = st.session_state.get("auto_continuous_result")
+    # Gated on the current want_binomial/want_continuous checkbox state, not
+    # just whether a result happens to be cached under these keys -- without
+    # that gate, unchecking one after a previous combined fetch (e.g. after
+    # seeing the continuous scan's cost estimate) would silently carry the
+    # stale result forward into Step 2/3 with no warning, even mismatched
+    # against a since-changed experiment ID, date range, or filter if the
+    # user also changed those before re-fetching just the other one.
+    df_binomial = st.session_state.get("auto_binomial_result") if want_binomial else None
+    df_continuous = st.session_state.get("auto_continuous_result") if want_continuous else None
     if df_binomial is None and df_continuous is None:
         return
 
@@ -491,6 +499,16 @@ def _render_stage_configure():
         st.rerun()
         return
 
+    # The raw continuous fetch is one row per (visitor, order) pair, not one
+    # row per visitor -- see collapse_to_per_visitor's docstring. Computed
+    # once here and reused everywhere in this function that needs a visitor
+    # count or a per-visitor revenue figure (the preview table below,
+    # total_visitors, daily_visitors_continuous), so none of them can drift
+    # out of sync on what "visitor" means by re-deriving it locally.
+    per_visitor_continuous = (
+        collapse_to_per_visitor(df_continuous) if df_continuous is not None else None
+    )
+
     st.subheader("Step 2 — Choose analysis method(s)")
 
     control = variation = None
@@ -510,10 +528,10 @@ def _render_stage_configure():
             st.metric("Variation — conversions", f"{variation.conversions:,}", help=f"Rate: {rate:.2%}")
             st.metric("Variation — AOV", f"€{variation.aov:,.2f}")
 
-    if df_continuous is not None:
+    if per_visitor_continuous is not None:
         st.markdown("**Continuous data — revenue per visitor**")
         cont_summary = (
-            df_continuous.assign(purchase_revenue=pd.to_numeric(df_continuous["purchase_revenue"], errors="coerce").fillna(0.0))
+            per_visitor_continuous
             .groupby("experience_variant_label")["purchase_revenue"]
             .agg(["mean", "count"])
             .rename(columns={"mean": "revenue per visitor", "count": "visitors"})
@@ -569,8 +587,11 @@ def _render_stage_configure():
     if control is not None and variation is not None:
         total_visitors = control.visitors + variation.visitors
     else:
-        # Per-visitor rows (RPV query mode) — one row per exposed user.
-        total_visitors = len(df_continuous)
+        # per_visitor_continuous is already collapsed to one row per exposed
+        # visitor (see collapse_to_per_visitor) -- unlike df_continuous
+        # itself, which is one row per (visitor, order) and would over-count
+        # any repeat purchaser.
+        total_visitors = len(per_visitor_continuous)
     daily_visitors = total_visitors / runtime_days
 
     # Continuous's own population can differ from Binomial's even for the
@@ -582,9 +603,10 @@ def _render_stage_configure():
     # its own, potentially smaller population) would systematically over- or
     # under-state its monetary projection — so Continuous gets its own,
     # computed from its own fetched rows regardless of whether Binomial was
-    # also fetched.
+    # also fetched. Uses per_visitor_continuous's row count, not
+    # len(df_continuous), for the same reason as total_visitors above.
     daily_visitors_continuous = (
-        len(df_continuous) / runtime_days if df_continuous is not None else daily_visitors
+        len(per_visitor_continuous) / runtime_days if per_visitor_continuous is not None else daily_visitors
     )
 
     st.divider()

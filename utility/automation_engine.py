@@ -271,6 +271,40 @@ def run_bayesian_analysis(
     }
 
 
+def collapse_to_per_visitor(df: "pd.DataFrame", kpi: str = "purchase_revenue") -> "pd.DataFrame":
+    """
+    Collapses a raw continuous fetch to exactly one row per (variant, visitor),
+    summing `kpi` across any separate orders a visitor placed in the date range.
+
+    automation.py's continuous fetch (build_continuous_from_shared_scan) is
+    one row per (visitor, order) pair, not one row per visitor -- its
+    ecommerce_data CTE groups by (user, transaction) to preserve per-order
+    values for RPT mode, and the final SELECT joins that back to one-row-per-
+    user variant_data on user_pseudo_id alone. A visitor with 2+ separate
+    purchases in range therefore gets 2+ rows; non-buyers (NULL revenue from
+    the LEFT JOIN, zero-filled here) get exactly one.
+
+    Every "per visitor" computation -- RPV's mean and its significance test,
+    a "how many visitors" count, revenue-per-visitor summaries, the future
+    daily-visitor scale used for revenue projections -- needs one row per
+    visitor, or it silently over-counts the population and under-counts
+    revenue-per-visitor for any repeat purchaser. This is the one place that
+    collapse happens; every one of those call sites should build on this
+    (or on `df["variant_user_pseudo_id"].nunique()` for a plain count) rather
+    than re-deriving it locally, so they can't drift out of sync on what
+    "visitor" means.
+
+    RPT mode wants the raw per-order rows instead (each order is its own
+    observation) -- do not use this for that path.
+    """
+    work = df.copy()
+    work[kpi] = pd.to_numeric(work[kpi], errors="coerce").fillna(0.0)
+    return (
+        work.groupby(["experience_variant_label", "variant_user_pseudo_id"], as_index=False)[kpi]
+        .sum()
+    )
+
+
 def run_continuous_analysis(
     df: "pd.DataFrame",
     control_label: str,
@@ -319,22 +353,21 @@ def run_continuous_analysis(
     alternative = _TAIL_MAP[tail]
     alpha = 1.0 - confidence_level
 
+    # per_visitor is already collapsed to one row per (variant, visitor), so
+    # a plain per-variant row count on it IS the true visitor_counts -- no
+    # separate nunique() needed, and it can't drift from what the RPV branch
+    # below actually analyzes since both come from the same collapse.
+    per_visitor = collapse_to_per_visitor(df, kpi)
+    visitor_counts = per_visitor.groupby("experience_variant_label").size().to_dict()
+
     work = df.copy()
     work[kpi] = pd.to_numeric(work[kpi], errors="coerce").fillna(0.0)
-    visitor_counts = (
-        work.groupby("experience_variant_label")["variant_user_pseudo_id"]
-        .nunique()
-        .to_dict()
-    )
 
     if mode == "rpt":
         work = work[work[kpi] != 0.0]
         unit = AnalysisUnit.PER_TRANSACTION
     else:
-        work = (
-            work.groupby(["experience_variant_label", "variant_user_pseudo_id"], as_index=False)[kpi]
-            .sum()
-        )
+        work = per_visitor
         unit = AnalysisUnit.PER_VISITOR
 
     config = ContinuousMetricConfig(
