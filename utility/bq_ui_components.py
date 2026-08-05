@@ -590,9 +590,14 @@ def render_execution_gate(
     sql: str,
     result_key: str = "query_result",
     allow_preview: bool = True,
+    dataset: Optional[str] = None,
 ):
     """
-    Always runs dry-run and shows bytes.
+    Always runs dry-run and shows bytes. When `dataset` is given, also shows
+    this project's monthly usage against the 1 TB/month free tier — a single
+    query's own scan can look negligible in isolation while still adding to a
+    budget that's already mostly spent from earlier runs this month, which a
+    per-query estimate alone won't surface.
     Offers optional preview (25 rows).
     Shows confirm button to run full query.
     """
@@ -606,11 +611,56 @@ def render_execution_gate(
         st.error(f"Dry-run failed: {cost['error']}")
         return
 
-    col1, col2 = st.columns(2)
+    usage: Optional[dict] = None
+    if dataset:
+        with st.spinner("Fetching monthly usage…"):
+            usage = get_monthly_usage(project, dataset)
+
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Estimated scan", cost["display"])
+        st.metric(
+            "This query", cost["display"],
+            help="Estimated bytes scanned by this query (BigQuery dry-run).",
+        )
     with col2:
-        st.metric("Free tier usage", f"{cost['free_tier_pct']}%", help="Based on 1 TB/month free tier")
+        if usage is not None:
+            st.metric(
+                "Used this month",
+                usage["used_display"] if not usage["error"] else "Unavailable",
+                help=(
+                    "Bytes processed by all queries in this project since the 1st of "
+                    "the month. Sourced from INFORMATION_SCHEMA.JOBS_BY_PROJECT. "
+                    "Cached for 5 minutes."
+                ),
+            )
+        else:
+            st.metric("Free tier usage", f"{cost['free_tier_pct']}%", help="Based on 1 TB/month free tier")
+    with col3:
+        if usage is not None:
+            st.metric(
+                "Remaining free tier",
+                usage["remaining_display"] if not usage["error"] else "Unavailable",
+            )
+
+    if usage is not None and not usage["error"]:
+        used_pct = usage["used_pct"] / 100  # st.progress expects 0.0-1.0
+        st.progress(
+            min(used_pct, 1.0),
+            text=f"{usage['used_display']} of 1 TB used this month ({usage['used_pct']}%)",
+        )
+        if usage["remaining_bytes"] > 0:
+            query_pct_of_remaining = round((cost["bytes"] / usage["remaining_bytes"]) * 100, 3)
+            st.caption(
+                f"This query consumes **{query_pct_of_remaining}%** "
+                f"of your remaining {usage['remaining_display']} budget."
+            )
+    elif usage is not None and usage.get("permission_denied"):
+        st.caption(
+            "ℹ️ Monthly usage unavailable — "
+            "the authenticated account needs `bigquery.jobs.list` at project level."
+        )
+    elif usage is not None:
+        st.caption(f"ℹ️ Monthly usage unavailable: {usage['error']}")
 
     if allow_preview:
         if st.button("👁️ Preview (25 rows)", key=f"{result_key}_preview_btn"):

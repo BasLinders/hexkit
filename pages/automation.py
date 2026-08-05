@@ -221,6 +221,7 @@ def _render_stage_fetch():
             render_sql_viewer(baseline_sql, key="auto_pretest_sql")
             render_execution_gate(
                 project, baseline_sql, result_key="auto_pretest_result", allow_preview=True,
+                dataset=dataset,
             )
 
     st.divider()
@@ -341,7 +342,9 @@ def _render_stage_fetch():
         )
         sql = build_experiment_single_output_sql(shared_scan_select, chain)
         render_sql_viewer(sql, key="auto_sql")
-        render_execution_gate(project, sql, result_key=f"auto_{label}_result", allow_preview=True)
+        render_execution_gate(
+            project, sql, result_key=f"auto_{label}_result", allow_preview=True, dataset=dataset,
+        )
 
     df_binomial = st.session_state.get("auto_binomial_result")
     df_continuous = st.session_state.get("auto_continuous_result")

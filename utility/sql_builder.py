@@ -233,7 +233,7 @@ DECLARE start_date STRING DEFAULT '{p.start_date}';
 DECLARE end_date   STRING DEFAULT '{p.end_date}';
 
 WITH{user_filter_cte}
-dummy AS (SELECT 1)  -- placeholder when no page filter
+dummy AS (SELECT 1)  -- placeholder when no user filter
 
 SELECT{select_cols}
 FROM {table} AS main
@@ -268,7 +268,7 @@ DECLARE start_date STRING DEFAULT '{p.start_date}';
 DECLARE end_date   STRING DEFAULT '{p.end_date}';
 
 WITH{user_filter_cte}
-dummy AS (SELECT 1)  -- placeholder when no page filter
+dummy AS (SELECT 1)  -- placeholder when no user filter
 
 SELECT{select_cols}
 FROM {table} AS main
@@ -293,7 +293,7 @@ DECLARE start_date STRING DEFAULT '{p.start_date}';
 DECLARE end_date   STRING DEFAULT '{p.end_date}';
 
 WITH{user_filter_cte}
-dummy AS (SELECT 1)  -- placeholder when no page filter
+dummy AS (SELECT 1)  -- placeholder when no user filter
 
 SELECT
   main.user_pseudo_id AS user_pseudo_id,
