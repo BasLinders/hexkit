@@ -803,6 +803,19 @@ def _render_stage_configure():
             st.session_state["auto_variation"] = variation
             st.session_state["auto_results"] = results
             st.session_state["auto_revenue_source"] = revenue_source
+
+            # A previously-generated AI conclusion (Step 4) describes a
+            # specific set of results -- nothing else invalidates it, so
+            # without this it would silently survive a re-run with different
+            # settings (confidence level, active methods, revenue source,
+            # ...) and get re-attached to a new payload with different
+            # numbers, with no indication the text no longer describes them.
+            # Dropping it here forces Step 4 to start from "not generated
+            # yet" after any change, rather than an explicit regenerate being
+            # something the user has to remember to do on their own.
+            st.session_state.pop("auto_ai_conclusion", None)
+            st.session_state.pop("auto_ai_include", None)
+
             st.session_state["auto_stage"] = 3
             st.rerun()
 
