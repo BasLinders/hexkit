@@ -398,6 +398,13 @@ def format_pretest_table(table: list[dict]) -> str:
     Renders the pre-test MDE table as plain text, one line per week, instead
     of json.dumps(...) — Airtable long-text fields don't render JSON or
     markdown tables, so a JSON blob just shows up as raw markup in the field.
+
+    row['MDE'] is already a percentage (PretestEngine._relative_mde multiplies
+    by 100 internally, matching pre_test_analysis.py's own relative_mde_pct
+    convention) -- NOT a 0-1 fraction. Using Python's ':.2%' format spec here
+    would multiply it by 100 a second time (12.42 -> "1242.29%" instead of
+    "12.42%"), inflating every MDE in the table by exactly 100x before it
+    ever reaches Airtable.
     """
     lines = []
     for row in table:
@@ -405,7 +412,7 @@ def format_pretest_table(table: list[dict]) -> str:
         size_label = size_key.replace("_", " ").lower() if size_key else ""
         size_val = row.get(size_key) if size_key else None
         size_part = f"{size_val:,} {size_label}" if size_val is not None else ""
-        lines.append(f"Week {row['Week']}: {size_part} — MDE {row['MDE']:.2%}")
+        lines.append(f"Week {row['Week']}: {size_part} — MDE {row['MDE']:.2f}%")
     return "\n".join(lines)
 
 
