@@ -42,6 +42,8 @@ from utility.automation_engine import (
     VariantData,
     TAILS,
     FIELD_LABELS,
+    MONETARY_METHOD_NOTES,
+    MONETARY_METHOD_GUIDANCE,
     run_frequentist_analysis,
     run_bayesian_analysis,
     run_continuous_analysis,
@@ -684,6 +686,22 @@ def _render_stage_results():
     def _revenue_tag(method: str) -> str:
         return " 💰 *(used for shared 'effect on revenue')*" if revenue_source == method else ""
 
+    def _render_monetary_notes(method: str):
+        notes = MONETARY_METHOD_NOTES.get(method)
+        if not notes:
+            return
+        with st.expander(f"Pros & cons of {method.capitalize()}'s monetary estimate"):
+            st.markdown("**Pros**")
+            for point in notes["pros"]:
+                st.markdown(f"- {point}")
+            st.markdown("**Cons**")
+            for point in notes["cons"]:
+                st.markdown(f"- {point}")
+
+    active_monetary_methods = [m for m in ("frequentist", "bayesian", "continuous") if results.get(m)]
+    if len(active_monetary_methods) > 1:
+        st.info(f"💡 {MONETARY_METHOD_GUIDANCE}", icon="💡")
+
     if freq:
         st.markdown(f"### Frequentist{_revenue_tag('frequentist')}")
         c1, c2, c3 = st.columns(3)
@@ -697,6 +715,9 @@ def _render_stage_results():
             help=f"CI: {_fmt_money(ci_low)} to {_fmt_money(ci_high)}",
         )
         st.caption(freq["conclusion"])
+        if freq.get("monetary_conclusion"):
+            st.caption(freq["monetary_conclusion"])
+        _render_monetary_notes("frequentist")
         st.divider()
 
     if bayes:
@@ -713,6 +734,9 @@ def _render_stage_results():
             ),
         )
         st.caption(bayes["conclusion"])
+        if bayes.get("monetary_conclusion"):
+            st.caption(bayes["monetary_conclusion"])
+        _render_monetary_notes("bayesian")
         st.divider()
 
     if cont:
@@ -729,6 +753,9 @@ def _render_stage_results():
             help=f"CI: {_fmt_money(ci_low)} to {_fmt_money(ci_high)}",
         )
         st.caption(cont["conclusion"])
+        if cont.get("monetary_conclusion"):
+            st.caption(cont["monetary_conclusion"])
+        _render_monetary_notes("continuous")
         st.divider()
 
     if pretest:
@@ -863,12 +890,35 @@ def _render_stage_ai():
 
     ai_input = {
         "payload": payload,
+        # Each method's own written-output methods: "conclusion" is the
+        # statistical read (significance only); "monetary_conclusion" (where
+        # available) is the money-framed narrative — handles one-sided CI
+        # wording, non-significant hedging, and Bayesian's risk/reward
+        # framing correctly, which payload's bare numeric fields don't.
         "conclusions": {
-            method: result["conclusion"]
+            method: {
+                key: result[key]
+                for key in ("conclusion", "monetary_conclusion")
+                if result.get(key)
+            }
             for method, result in results.items()
-            if result.get("conclusion")
+            if result.get("conclusion") or result.get("monetary_conclusion")
         },
     }
+    active_monetary_methods = [
+        m for m in ("frequentist", "bayesian", "continuous") if results.get(m)
+    ]
+    if active_monetary_methods:
+        # Lets Gemini reason about which method's "effect on revenue" is most
+        # defensible for this specific experiment (sample size, whether the
+        # KPI is a rate or revenue itself, significance status) rather than
+        # treating the three as interchangeable — same notes shown to the
+        # human in Step 3.
+        ai_input["monetary_method_notes"] = {
+            m: MONETARY_METHOD_NOTES[m] for m in active_monetary_methods
+        }
+        if len(active_monetary_methods) > 1:
+            ai_input["monetary_method_guidance"] = MONETARY_METHOD_GUIDANCE
     if custom_code:
         # Optional context, not gated on — helps Gemini interpret what was
         # actually being tested (e.g. which element/variant the code touches).

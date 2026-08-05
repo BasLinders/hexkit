@@ -76,6 +76,59 @@ _TAIL_MAP = {
 
 TAILS = list(_TAIL_MAP.keys())
 
+# Each method's monetary estimate rests on different assumptions and is
+# appropriate in different situations -- surfaced both in the Step 3 UI and
+# in the AI-conclusion payload, so a human (or Gemini) picking which
+# "effect on revenue" number to trust for a given experiment can weigh the
+# trade-offs rather than treating all three as interchangeable.
+MONETARY_METHOD_NOTES: dict[str, dict[str, list[str]]] = {
+    "frequentist": {
+        "pros": [
+            "Deterministic, closed-form estimate tied directly to the same confidence interval as the significance test -- no simulation noise, identical result every run.",
+            "Correctly handles one-sided tests: an unbounded CI renders as an explicit 'at least X' / 'at most Y' claim rather than a fabricated number.",
+            "Cheapest to compute and the easiest of the three to explain to a non-technical audience.",
+        ],
+        "cons": [
+            "Decomposes revenue into rate x AOV separately, rather than modelling revenue's actual (right-skewed, non-negative) distribution.",
+            "Relies on a normal approximation (CLT); the interval can be less reliable on small samples or highly variable AOV.",
+            "A non-significant result renders only as a blunt 'treat as illustrative' hedge -- no expected-value read on whether shipping anyway would be a reasonable bet.",
+        ],
+    },
+    "bayesian": {
+        "pros": [
+            "Full posterior distribution, not just a point estimate + CI -- captures asymmetric uncertainty naturally instead of assuming a symmetric normal spread.",
+            "Separates expected upside from expected downside risk explicitly, giving a decision-theoretic 'is this bet worth it' read even before conventional significance is reached.",
+            "A lift prior guards against small-sample overestimation of implausibly large effects.",
+        ],
+        "cons": [
+            "Monte Carlo based -- more expensive to compute, and the exact figure carries sampling noise across runs (controlled by the sample-size setting, but never fully eliminated).",
+            "Always produces an expected-value number, even for a genuinely inconclusive result -- read alongside prob_beat_control/prob_being_best, never the money figure alone.",
+            "AOV is modelled as log-normal with an assumed variability (CV); if that's a poor match for the real order-value distribution, the estimate's spread (not its mean) is affected.",
+        ],
+    },
+    "continuous": {
+        "pros": [
+            "Uses the actual row-level revenue data directly (Gamma-fitted), rather than reconstructing revenue from rate x AOV -- the most direct measure when revenue itself is the KPI.",
+            "RPV vs RPT isolates whether an effect comes from more people converting, from each buyer spending more, or both.",
+            "Correctly models revenue's right-skewed, non-negative shape instead of assuming normality on the raw values.",
+        ],
+        "cons": [
+            "Still uses a normal-approximation (delta-method) CI on top of the Gamma-fitted group means -- inherits the same CLT caveats as Frequentist, just applied to fitted statistics instead of a raw proportion.",
+            "RPT counts buyers only, so its effective sample size can be much smaller than RPV's -- wider, less stable intervals on modest traffic.",
+            "Needs the separate continuous/row-level data fetch (extra BigQuery scan cost) that the other two methods don't require.",
+        ],
+    },
+}
+
+MONETARY_METHOD_GUIDANCE = (
+    "Rough guide to which source tends to fit best: a rate-based test with fairly stable AOV -- "
+    "Frequentist or Bayesian on binomial data is simplest and cheapest. Revenue or AOV itself is the "
+    "KPI (pricing, upsell, merchandising) -- Continuous is the most direct measure. Small sample or a "
+    "pre-significance ship/hold decision -- Bayesian's expected-value framing is more informative than "
+    "a flat non-significant verdict. Need a simple, easily-defensible number for a non-technical or "
+    "finance audience -- Frequentist's closed-form CI is the most transparent."
+)
+
 
 @dataclass
 class VariantData:
@@ -125,6 +178,13 @@ def run_frequentist_analysis(
         se_aov_chal=se_aov_var,
     )
 
+    monetary_conclusion = FrequentistEngine.generate_monetary_conclusion(
+        variant_name=variation.label,
+        monetary_result=monetary,
+        is_significant=result.is_significant,
+        alternative=alternative,
+    )
+
     return {
         "method": "frequentist",
         "p_value": result.p_value,
@@ -132,6 +192,7 @@ def run_frequentist_analysis(
         "uplift": result.uplift,
         "ci_diff": result.ci_diff,
         "conclusion": result.conclusion,
+        "monetary_conclusion": monetary_conclusion,
         "effect_on_revenue": monetary["point_estimate"],
         "effect_on_revenue_ci": (monetary["ci_low"], monetary["ci_high"]),
         "projection_days": projection_days,
@@ -179,6 +240,11 @@ def run_bayesian_analysis(
         "expected_uplift": prob_result.expected_uplift,
         "expected_loss": prob_result.expected_loss,
         "conclusion": prob_result.conclusion,
+        # generate_bayesian_conclusion's output, already computed inside
+        # run_monetary_projection (Strong Winner / Clear Loser / Asymmetric
+        # Bet / Inconclusive framing) — prob_result.conclusion above is
+        # probability-only and never mentions money at all.
+        "monetary_conclusion": monetary["conclusion"],
         "effect_on_revenue": monetary["expected_total_contribution"],
         "expected_revenue_uplift": monetary["expected_uplift"],
         "expected_revenue_risk": monetary["expected_risk"],
@@ -262,6 +328,15 @@ def run_continuous_analysis(
         monetary_list[0] if monetary_list else None,
     )
 
+    monetary_conclusion = (
+        ContinuousMetricEngine.generate_monetary_conclusion(
+            variant_name=variation_label,
+            monetary_result=monetary,
+            is_significant=result.is_significant,
+        )
+        if monetary else None
+    )
+
     return {
         "method": "continuous",
         "mode": mode,
@@ -270,6 +345,7 @@ def run_continuous_analysis(
         "p_value": result.p_value,
         "is_significant": result.is_significant,
         "conclusion": result.conclusion,
+        "monetary_conclusion": monetary_conclusion,
         "summary_stats": result.summary_stats,
         "effect_on_revenue": monetary["point_estimate"] if monetary else 0.0,
         "effect_on_revenue_ci": (monetary["ci_low"], monetary["ci_high"]) if monetary else (0.0, 0.0),

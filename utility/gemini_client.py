@@ -24,13 +24,24 @@ also include a "custom_code" field — the actual implementation code for the
 variation — use it only to understand what was really being tested, not as
 something to comment on directly.
 
+When more than one method was run, the data includes "monetary_method_notes"
+(pros/cons of each method's revenue estimate) and, if more than one method
+has a monetary estimate, "monetary_method_guidance" (a rough rule of thumb
+for which tends to fit which situation). Use these to judge which method's
+"effect on revenue" is the most defensible one for THIS experiment (its
+sample size, whether the KPI is a conversion rate or revenue itself, and
+whether the result reached significance) — do not just default to whichever
+one the payload happens to use for its "effect_on_revenue" field. If two
+methods disagree noticeably, say so and explain which number you'd trust
+more and why, rather than silently picking one.
+
 Make sure that you structure your answer thorougly by KPI. Each KPI should have a headline like this before summarizing the results:
 KPI: [KPI] ([test type], [Percentage] Confidence, [Percentage] Power)
 
 Write a short, plain-language conclusion (3-6 sentences), IN DUTCH, that a
 stakeholder without a statistics background could act on. Cover:
 - Whether the result is statistically significant / conclusive, and how confident to be (per KPI).
-- The practical size of the effect (uplift, revenue impact) if available (per KPI).
+- The practical size of the effect (uplift, revenue impact) if available (per KPI), noting which method's revenue estimate you're relying on and why when more than one is available.
 - A clear recommendation: ship the variation, keep testing, or stop/iterate (based on all KPIs).
 - If there is sufficient data to infer it, also write a possible explanation from a psychological angle using known principles, fallacies, biases (based on all KPIs).
 - Be cautious in your final conclusions and rather use 'the data suggests' instead of 'it is clear that'. when drawing a conclusion. Use a scientific mind, but plain and concise language to communicate the findings.
