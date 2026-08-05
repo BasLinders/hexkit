@@ -3,6 +3,7 @@
 # ============================================================================
 
 from __future__ import annotations
+from dataclasses import replace
 from typing import Literal, Optional, Union, cast
 
 import streamlit as st
@@ -700,9 +701,23 @@ def _run_experiment_mode(project: str, dataset: str, selected: dict) -> None:
     Builds and executes SQL for the merged binomial/continuous "Experiment
     data" mode. One output selected -> a single ordinary query (shared_scan
     as a plain CTE), routed through the existing single-result execution
-    gate below, same as any other mode. Both selected -> shared_scan is
-    materialized once via a BigQuery session and each output is read from
-    it as its own query, via the shared render_combined_execution_gate.
+    gate below, same as any other mode. Both selected, or multi-experiment
+    mode queuing more than one experiment -> shared_scan is materialized
+    once via a BigQuery session and each output/experiment combination is
+    read from it as its own query, via the shared render_combined_execution_gate.
+
+    Multi-experiment mode (bp.experiments has more than one entry — only
+    reachable for binomial-only, since show_multi_experiment is forced off
+    whenever continuous is also selected) used to silently query only
+    experiments[0]: build_binomial_from_shared_scan/build_continuous_from_shared_scan
+    both only ever read p.experiments[0], so every experiment past the first
+    was configured by the user but never actually queried, with no error or
+    warning. Rather than teaching those two (already-complex) builders to
+    union N experiments' worth of CTEs internally, each experiment gets its
+    own params copy (dataclasses.replace with experiments=[exp]) and its own
+    downstream query against the one shared shared_scan — the same pattern
+    already used for the binomial+continuous-both-selected case, just keyed
+    by experiment instead of by output type.
     """
     bp: Optional[BinomialParams] = selected.get("binomial")
     cp: Optional[ContinuousParams] = selected.get("continuous")
@@ -716,7 +731,28 @@ def _run_experiment_mode(project: str, dataset: str, selected: dict) -> None:
         need_page_location, need_payment_type,
     )
 
-    if bp and cp:
+    multi_experiment = len(ref.experiments) > 1
+
+    if multi_experiment:
+        # Only reachable for binomial-only (continuous forces single-experiment
+        # via show_multi_experiment=want_binomial and not want_continuous).
+        create_temp_sql = build_experiment_shared_scan_temp_table_sql(shared_scan_select)
+        select_sqls: dict[str, str] = {}
+        sql_blocks = [create_temp_sql]
+        for exp in bp.experiments:
+            exp_bp = replace(bp, experiments=[exp])
+            exp_sql = build_experiment_session_output_sql(build_binomial_from_shared_scan(exp_bp))
+            label = f"experiment_{exp.experiment_id}" if exp.experiment_id else f"experiment_{len(select_sqls) + 1}"
+            select_sqls[label] = exp_sql
+            sql_blocks.append(f"-- Experiment {exp.experiment_id}\n{exp_sql}")
+
+        render_sql_viewer("\n".join(sql_blocks), key="experiment_multi_sql")
+        render_combined_execution_gate(
+            project, dataset, shared_scan_select, create_temp_sql,
+            select_sqls,
+            result_key_prefix="experiment",
+        )
+    elif bp and cp:
         create_temp_sql = build_experiment_shared_scan_temp_table_sql(shared_scan_select)
         binomial_sql   = build_experiment_session_output_sql(build_binomial_from_shared_scan(bp))
         continuous_sql = build_experiment_session_output_sql(build_continuous_from_shared_scan(cp))
