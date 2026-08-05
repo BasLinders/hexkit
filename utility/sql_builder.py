@@ -54,8 +54,12 @@ class BaselineParams:
     # Adds add-to-cart conversion counts alongside the purchase-based ones.
     # Binomial only — revenue mode has no "conversion" concept to extend.
     kpi_add_to_cart: bool = False
-    page_filter_type: Optional[Literal["regex", "contains"]] = None  # None = no filter
-    page_filter_value: str = ""
+    # "contains"/"regex" scope to users who visited a matching page_view URL;
+    # "event" scopes to users who fired a specific event at least once during
+    # the date range — more robust than a URL match whenever the URL itself
+    # can't differentiate page types. None = no filter.
+    filter_type: Optional[Literal["contains", "regex", "event"]] = None
+    filter_value: str = ""
 
 
 @dataclass
@@ -77,6 +81,11 @@ class BinomialParams:
     # KPI toggles — cost-warning group (adds page_view scan)
     kpi_login: bool = False
     kpi_create_account: bool = False
+    # Same semantics as BaselineParams.filter_type/filter_value — scopes the
+    # experiment population to users who visited a matching page or fired a
+    # specific event, at any point in the date range.
+    filter_type: Optional[Literal["contains", "regex", "event"]] = None
+    filter_value: str = ""
 
 
 @dataclass
@@ -91,6 +100,8 @@ class ContinuousParams:
     device_filter: Literal["all", "desktop", "mobile"] = "all"
     query_mode: Literal["all_users", "revenue_only"] = "all_users"
     post_exposure_filter: bool = True
+    filter_type: Optional[Literal["contains", "regex", "event"]] = None
+    filter_value: str = ""
 
 
 @dataclass
@@ -129,16 +140,31 @@ class InteractionParams:
 # BASELINE
 # ---------------------------------------------------------------------------
 
-def _baseline_page_filter(p: BaselineParams, table: str, suffix: str) -> tuple[str, str]:
-    """Builds the optional page-view filter CTE + join clause shared by all baseline shapes."""
-    if not (p.page_filter_type and p.page_filter_value):
+def _baseline_user_filter(p: BaselineParams, table: str, suffix: str) -> tuple[str, str]:
+    """
+    Builds the optional user-filter CTE + join clause shared by all baseline
+    shapes. "contains"/"regex" scope to users who visited a matching
+    page_view URL; "event" scopes to users who fired a specific event at
+    least once during the date range — more robust than a URL match whenever
+    the URL itself can't differentiate page types.
+    """
+    if not (p.filter_type and p.filter_value):
         return "", ""
-    if p.page_filter_type == "regex":
-        page_condition = f"AND REGEXP_CONTAINS(params.value.string_value, r'{p.page_filter_value}')"
+    if p.filter_type == "event":
+        cte = f"""
+filtered_users AS (
+  SELECT DISTINCT user_pseudo_id
+  FROM {table}
+  WHERE {suffix}
+    AND event_name = '{p.filter_value}'
+),"""
     else:
-        page_condition = f"AND params.value.string_value LIKE '%{p.page_filter_value}%'"
-    cte = f"""
-view_page_users AS (
+        if p.filter_type == "regex":
+            page_condition = f"AND REGEXP_CONTAINS(params.value.string_value, r'{p.filter_value}')"
+        else:
+            page_condition = f"AND params.value.string_value LIKE '%{p.filter_value}%'"
+        cte = f"""
+filtered_users AS (
   SELECT DISTINCT user_pseudo_id
   FROM {table}, UNNEST(event_params) AS params
   WHERE {suffix}
@@ -146,7 +172,7 @@ view_page_users AS (
     AND params.key = 'page_location'
     {page_condition}
 ),"""
-    join = "INNER JOIN view_page_users ON main.user_pseudo_id = view_page_users.user_pseudo_id"
+    join = "INNER JOIN filtered_users ON main.user_pseudo_id = filtered_users.user_pseudo_id"
     return cte, join
 
 
@@ -161,7 +187,7 @@ def build_baseline(p: BaselineParams, limit: int = 0) -> str:
 def _build_baseline_aggregate(p: BaselineParams, limit: int = 0) -> str:
     table = _table_ref(p.project, p.dataset)
     suffix = _suffix_filter(p.start_date, p.end_date)
-    view_page_cte, join_clause = _baseline_page_filter(p, table, suffix)
+    user_filter_cte, join_clause = _baseline_user_filter(p, table, suffix)
     limit_clause = f"\nLIMIT {limit}" if limit else ""
 
     if p.output_type == "revenue":
@@ -206,7 +232,7 @@ def _build_baseline_aggregate(p: BaselineParams, limit: int = 0) -> str:
 DECLARE start_date STRING DEFAULT '{p.start_date}';
 DECLARE end_date   STRING DEFAULT '{p.end_date}';
 
-WITH{view_page_cte}
+WITH{user_filter_cte}
 dummy AS (SELECT 1)  -- placeholder when no page filter
 
 SELECT{select_cols}
@@ -219,7 +245,7 @@ WHERE main.{suffix}{limit_clause};
 def _build_baseline_daily(p: BaselineParams, limit: int = 0) -> str:
     table = _table_ref(p.project, p.dataset)
     suffix = _suffix_filter(p.start_date, p.end_date)
-    view_page_cte, join_clause = _baseline_page_filter(p, table, suffix)
+    user_filter_cte, join_clause = _baseline_user_filter(p, table, suffix)
     limit_clause = f"\nLIMIT {limit}" if limit else ""
 
     if p.output_type == "revenue":
@@ -241,7 +267,7 @@ def _build_baseline_daily(p: BaselineParams, limit: int = 0) -> str:
 DECLARE start_date STRING DEFAULT '{p.start_date}';
 DECLARE end_date   STRING DEFAULT '{p.end_date}';
 
-WITH{view_page_cte}
+WITH{user_filter_cte}
 dummy AS (SELECT 1)  -- placeholder when no page filter
 
 SELECT{select_cols}
@@ -259,14 +285,14 @@ def _build_baseline_per_user(p: BaselineParams, limit: int = 0) -> str:
     Revenue-only: a binomial baseline has no per-order raw value to fit."""
     table = _table_ref(p.project, p.dataset)
     suffix = _suffix_filter(p.start_date, p.end_date)
-    view_page_cte, join_clause = _baseline_page_filter(p, table, suffix)
+    user_filter_cte, join_clause = _baseline_user_filter(p, table, suffix)
     limit_clause = f"\nLIMIT {limit}" if limit else ""
 
     return f"""-- Baseline export (revenue, per-order raw values) — sample size preparation
 DECLARE start_date STRING DEFAULT '{p.start_date}';
 DECLARE end_date   STRING DEFAULT '{p.end_date}';
 
-WITH{view_page_cte}
+WITH{user_filter_cte}
 dummy AS (SELECT 1)  -- placeholder when no page filter
 
 SELECT
@@ -763,16 +789,25 @@ ORDER BY ed.purchase_revenue DESC{limit_clause};
 # session-scoped TEMP TABLE (both outputs, two queries against one scan) —
 # these functions don't know or care which.
 
-def binomial_shared_scan_flags(p: Optional[BinomialParams]) -> tuple[bool, bool]:
+def experiment_shared_scan_flags(
+    bp: Optional[BinomialParams], cp: Optional[ContinuousParams] = None,
+) -> tuple[bool, bool]:
     """
     Returns (need_page_location, need_payment_type) — the extra columns
-    build_binomial_from_shared_scan needs for its cost-warning KPIs
-    (login/create-account use page_location, iDEAL uses payment_type).
-    Continuous has no equivalent KPIs, so this only depends on binomial.
+    build_binomial_from_shared_scan / build_continuous_from_shared_scan need
+    for binomial's cost-warning KPIs (login/create-account use page_location,
+    iDEAL uses payment_type) and/or a "contains"/"regex" user filter on
+    either params (an "event" filter needs no extra column — event_name is
+    already always selected in shared_scan).
     """
-    if p is None:
-        return (False, False)
-    return (p.kpi_login or p.kpi_create_account, p.kpi_ideal)
+    need_page_location = False
+    need_payment_type = False
+    if bp is not None:
+        need_page_location = need_page_location or bp.kpi_login or bp.kpi_create_account or bp.filter_type in ("contains", "regex")
+        need_payment_type = need_payment_type or bp.kpi_ideal
+    if cp is not None:
+        need_page_location = need_page_location or cp.filter_type in ("contains", "regex")
+    return need_page_location, need_payment_type
 
 
 def build_shared_scan_select(
@@ -824,6 +859,32 @@ def build_shared_scan_select(
   FROM {table}
   WHERE {suffix}
     AND user_pseudo_id IS NOT NULL"""
+
+
+def _shared_scan_user_filter(filter_type: Optional[str], filter_value: str) -> str:
+    """
+    Optional filtered_users CTE, sourced from shared_scan rather than a fresh
+    table scan — shared_scan already carries every event row (incl.
+    event_name) in the date range, so an "event" filter is free; a
+    "contains"/"regex" filter needs shared_scan's optional page_location
+    column (see experiment_shared_scan_flags). Returns "" when disabled, and
+    the CTE body WITHOUT a trailing comma or trailing newline — callers splice
+    it into their own CTE chain and add a comma only if something follows it.
+    """
+    if not (filter_type and filter_value):
+        return ""
+    if filter_type == "event":
+        condition = f"event_name = '{filter_value}'"
+    elif filter_type == "regex":
+        condition = f"REGEXP_CONTAINS(page_location, r'{filter_value}')"
+    else:
+        condition = f"page_location LIKE '%{filter_value}%'"
+    return f"""
+filtered_users AS (
+  SELECT DISTINCT user_pseudo_id
+  FROM shared_scan
+  WHERE {condition}
+)"""
 
 
 def build_binomial_from_shared_scan(p: BinomialParams) -> str:
@@ -1086,12 +1147,19 @@ ideal_users AS (
 
     select_block = ",\n".join(select_cols)
 
-    return f"""{exposure_ctes}{ecommerce_cte}{device_cte}{optional_ctes}
+    filter_cte = _shared_scan_user_filter(p.filter_type, p.filter_value)
+    filter_cte_block = f"{filter_cte},\n" if filter_cte else ""
+    filter_join = (
+        "  INNER JOIN filtered_users fu ON vd.variant_user_pseudo_id = fu.user_pseudo_id\n"
+        if filter_cte else ""
+    )
+
+    return f"""{exposure_ctes}{ecommerce_cte}{device_cte}{optional_ctes}{filter_cte_block}
 final_data AS (
   SELECT
 {final_select}
   FROM variant_data vd
-{ecommerce_join}{device_join}{optional_joins}  WHERE vd.experience_variant_label != 'Other'
+{ecommerce_join}{device_join}{optional_joins}{filter_join}  WHERE vd.experience_variant_label != 'Other'
 )
 
 SELECT
@@ -1125,6 +1193,13 @@ def build_continuous_from_shared_scan(p: ContinuousParams) -> str:
     case_block = "\n".join(case_lines)
 
     join_type = "INNER JOIN" if p.query_mode == "revenue_only" else "LEFT JOIN"
+
+    filter_cte = _shared_scan_user_filter(p.filter_type, p.filter_value)
+    ecommerce_trailer = f",\n{filter_cte}\n" if filter_cte else "\n"
+    filter_join = (
+        "INNER JOIN filtered_users fu ON vd.user_pseudo_id = fu.user_pseudo_id\n"
+        if filter_cte else ""
+    )
 
     return f"""
 user_initial_exposure AS (
@@ -1175,8 +1250,7 @@ ecommerce_data AS (
     AND purchase_revenue IS NOT NULL
     AND purchase_revenue <> 0.0
   GROUP BY user_pseudo_id, transaction_id
-)
-
+){ecommerce_trailer}
 SELECT
   vd.user_pseudo_id        AS variant_user_pseudo_id,
   vd.experience_variant_label,
@@ -1186,7 +1260,7 @@ SELECT
 FROM variant_data vd
 {join_type} ecommerce_data ed ON vd.user_pseudo_id = ed.user_pseudo_id
 INNER JOIN device_data      dd ON vd.user_pseudo_id = dd.device_user_pseudo_id
-WHERE ('{p.device_filter}' = 'all' OR dd.primary_device = '{p.device_filter}')
+{filter_join}WHERE ('{p.device_filter}' = 'all' OR dd.primary_device = '{p.device_filter}')
 ORDER BY ed.purchase_revenue DESC"""
 
 
@@ -1546,6 +1620,32 @@ WHERE {suffix}
   AND params.value.string_value IS NOT NULL
 ORDER BY variant_string
 LIMIT 500;
+"""
+
+
+def build_autodetect_event_names_query(
+    project: str,
+    dataset: str,
+    start_date: str,
+    end_date: str,
+    limit: int = 100,
+) -> str:
+    """
+    Distinct event_name values in the date range, most frequent first — used
+    to let the user pick an event to filter users on, rather than guessing a
+    name blind. event_name is a flat top-level column (not a nested
+    event_params entry), so this is a cheap scan regardless of range length —
+    unlike autodetect_variants, no need to sample just the last day.
+    """
+    table = _table_ref(project, dataset)
+    suffix = _suffix_filter(start_date, end_date)
+    return f"""
+SELECT event_name, COUNT(*) AS event_count
+FROM {table}
+WHERE {suffix}
+GROUP BY event_name
+ORDER BY event_count DESC
+LIMIT {limit};
 """
 
 

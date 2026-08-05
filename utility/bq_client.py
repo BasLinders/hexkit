@@ -566,6 +566,21 @@ def autodetect_kpis(
     return df["event_name"].tolist() if not df.empty else []
 
 
+def autodetect_event_names(
+    project: str,
+    dataset: str,
+    start_date: str,
+    end_date: str,
+    limit: int = 100,
+) -> list[str]:
+    """Distinct event names in the date range, most frequent first — lets the
+    event-filter UI offer a real pick-list instead of a blind free-text guess."""
+    from utility.sql_builder import build_autodetect_event_names_query
+    sql = build_autodetect_event_names_query(project, dataset, start_date, end_date, limit)
+    df = run_query(project, sql)
+    return df["event_name"].tolist() if not df.empty else []
+
+
 # ---------------------------------------------------------------------------
 # Export helpers
 # ---------------------------------------------------------------------------
