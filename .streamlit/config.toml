@@ -1,0 +1,8 @@
+[server]
+# Explicitly disable Streamlit's experimental Starlette/ASGI server (default
+# is false, but Streamlit Cloud has been observed defaulting new builds onto
+# it anyway) — it has a real bug where its GZipResponder wrapper doesn't pass
+# thread_minimum_size, a keyword-only argument a newer Starlette release now
+# requires, breaking every single request. Falls back to the long-stable
+# Tornado server this app is actually built and tested against.
+useStarlette = false
