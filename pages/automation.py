@@ -415,8 +415,22 @@ def _render_stage_fetch():
         df_pretest = st.session_state.get("auto_pretest_result")
         df_pretest_daily = st.session_state.get("auto_pretest_daily_result")
         st.session_state["auto_df_pretest"] = df_pretest
-        use_seasonal = bool(st.session_state.get("autofetch_pretest_seasonal", False))
+        use_seasonal = want_pretest and bool(st.session_state.get("autofetch_pretest_seasonal", False))
         kpi_choice = st.session_state.get("autofetch_pretest_kpi", "Transactions (purchases)")
+
+        # Seasonal mode fetches a separate daily query (auto_pretest_daily_result)
+        # from the flat aggregate one -- toggling seasonal on doesn't retroactively
+        # fetch it. Without this check, falling through to the elif below would
+        # silently build a "seasonal": False result from a stale aggregate fetch
+        # (or an earlier experiment's), with no indication the toggle was ignored.
+        if use_seasonal and (df_pretest_daily is None or df_pretest_daily.empty):
+            st.warning(
+                "Seasonal forecast is turned on, but the daily baseline query "
+                "above hasn't been run yet — click '✅ Run full query' in the "
+                "pre-test section above, or turn off seasonal forecasting, "
+                "before continuing."
+            )
+            return
 
         if use_seasonal and df_pretest_daily is not None and not df_pretest_daily.empty:
             weeks = int(st.session_state.get("autofetch_pretest_weeks", 1))
@@ -1056,10 +1070,21 @@ def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
             f"{len(matches)} Airtable records matched '{exp_prefix}' on **{id_field}** — "
             "confirm which one this experiment's result actually belongs to."
         )
+        # Scoped per base/table/search-term, not a bare key — an unscoped key
+        # would keep the previous pick's value in session_state when the
+        # matched candidates change (a different base/table, or a second
+        # experiment's exp_prefix in the same session). Streamlit doesn't
+        # error when that stored value no longer matches the new options; it
+        # silently resets to the new list's first entry with no indication
+        # anything changed, discarding the "prefer a filled Hypothesis"
+        # default -- and that silently-reset pick is what pre-seeds Step 5's
+        # "existing record to update", risking a result landing on the wrong
+        # experiment's record.
+        choice_key = f"auto_lookup_record_choice_{base_id}_{table['id']}_{exp_prefix}"
         choice = st.selectbox(
             "Matched record", options=options,
             index=matches.index(default_match),
-            key="auto_lookup_record_choice",
+            key=choice_key,
         )
         matched = matches[options.index(choice)]
         message = f"Matched Airtable record for '{exp_prefix}' ({len(matches)} candidates — confirm above)."
