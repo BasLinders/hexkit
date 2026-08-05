@@ -366,6 +366,22 @@ def _render_stage_fetch():
         st.session_state["auto_df_continuous"] = df_continuous
         st.session_state["auto_exp_prefix"] = exp_prefix
 
+        # Computed from the local start_date/end_date (reliable right here,
+        # right after render_date_range) and stashed under an auto_-prefixed
+        # key rather than re-derived later from the bare start_date/end_date
+        # session-state keys — those are plain st.date_input widget state,
+        # not carried across an OAuth token-refresh redirect the way
+        # admin_authenticated is (see render_gcp_credentials_gate's
+        # extra_state above), so re-reading them live in Step 2 could
+        # silently reset runtime_days to 1 (today - today) mid-flow and
+        # inflate every "effect on revenue" projection by the true runtime.
+        try:
+            _start = datetime.strptime(start_date, "%Y-%m-%d").date()
+            _end = datetime.strptime(end_date, "%Y-%m-%d").date()
+            st.session_state["auto_runtime_days"] = max((_end - _start).days + 1, 1)
+        except ValueError:
+            st.session_state["auto_runtime_days"] = 1
+
         df_pretest = st.session_state.get("auto_pretest_result")
         st.session_state["auto_df_pretest"] = df_pretest
         if df_pretest is not None and not df_pretest.empty:
@@ -482,15 +498,32 @@ def _render_stage_configure():
         st.warning("Select at least one analysis method to continue.")
         return
 
-    start = st.session_state.get("start_date")
-    end = st.session_state.get("end_date")
-    runtime_days = max((end - start).days + 1, 1) if start and end else 1
+    # Persisted at the Step 1 -> Step 2 transition, not re-derived from the
+    # bare start_date/end_date session-state keys here — those can silently
+    # reset (e.g. an OAuth token-refresh redirect mid-flow), which would
+    # otherwise collapse runtime_days to 1 and inflate every "effect on
+    # revenue" projection by a factor equal to the true test runtime.
+    runtime_days = st.session_state.get("auto_runtime_days", 1)
     if control is not None and variation is not None:
         total_visitors = control.visitors + variation.visitors
     else:
         # Per-visitor rows (RPV query mode) — one row per exposed user.
         total_visitors = len(df_continuous)
     daily_visitors = total_visitors / runtime_days
+
+    # Continuous's own population can differ from Binomial's even for the
+    # same experiment/date range: its shared-scan query INNER JOINs against
+    # device_data (device_category IN desktop/mobile only), while Binomial's
+    # fetch here doesn't split by device at all (kpi_device_split=False) and
+    # so isn't restricted by device category. Reusing the Binomial-derived
+    # daily_visitors above to scale Continuous's own rate/mean (measured on
+    # its own, potentially smaller population) would systematically over- or
+    # under-state its monetary projection — so Continuous gets its own,
+    # computed from its own fetched rows regardless of whether Binomial was
+    # also fetched.
+    daily_visitors_continuous = (
+        len(df_continuous) / runtime_days if df_continuous is not None else daily_visitors
+    )
 
     st.divider()
     if use_frequentist or use_continuous or use_pretest:
@@ -566,7 +599,13 @@ def _render_stage_configure():
                 value=0.0, step=0.05, key="auto_aov_cv",
                 help="0 treats AOV as a known constant. Above 0 propagates AOV sampling uncertainty (Frequentist only).",
             )
-        st.caption(f"Test runtime: {runtime_days} day(s) · Daily visitors: {daily_visitors:,.0f}")
+        if use_continuous and daily_visitors_continuous != daily_visitors:
+            st.caption(
+                f"Test runtime: {runtime_days} day(s) · Daily visitors: {daily_visitors:,.0f} "
+                f"(Frequentist/Bayesian) · {daily_visitors_continuous:,.0f} (Continuous — own population)"
+            )
+        else:
+            st.caption(f"Test runtime: {runtime_days} day(s) · Daily visitors: {daily_visitors:,.0f}")
 
     active_methods = [
         m for m, using in (
@@ -629,7 +668,7 @@ def _render_stage_configure():
                     df_continuous,
                     control_label="A",
                     variation_label="B",
-                    daily_visitors=daily_visitors,
+                    daily_visitors=daily_visitors_continuous,
                     projection_days=int(projection_days),
                     confidence_level=confidence_level,
                     tail=tail,
@@ -803,41 +842,107 @@ def _render_stage_results():
 # Step 4 — AI conclusion (optional)
 # ---------------------------------------------------------------------------
 
+def _render_lookup_base_table_picker(api_key: str) -> tuple[Optional[str], Optional[dict]]:
+    """
+    Lets the user pick which Airtable base/table holds this experiment's
+    tracking record, via the same live discovery the Send step uses.
+
+    get_credentials()'s base_id/table_name are NOT usable here: they only
+    ever reflect Step 5's own selections (airtable_base_ids /
+    airtable_table_names_{base_id}, both plural/multi-base since the
+    multi-base send refactor) or a legacy AIRTABLE_BASE_ID/AIRTABLE_TABLE_NAME
+    secret pair the app no longer needs anywhere else -- and since this step
+    (4) runs before Send (5) in the wizard, neither is necessarily set yet on
+    a fresh run. Shares Step 5's bases/tables cache keys (same underlying
+    data) but keeps its own selection keys so the two steps' choices don't
+    collide.
+    Returns (base_id, table_dict) — table_dict is None until a base with at
+    least one table is actually resolved.
+    """
+    if st.session_state.get("airtable_bases_for_key") != api_key:
+        with st.spinner("Loading Airtable bases…"):
+            result = list_bases(api_key)
+        if not result["ok"]:
+            st.error(f"Couldn't list Airtable bases: {result['error']}")
+            return None, None
+        st.session_state["airtable_bases_cache"] = result["bases"]
+        st.session_state["airtable_bases_for_key"] = api_key
+
+    bases: dict = st.session_state.get("airtable_bases_cache", {})
+    if not bases:
+        st.warning("This token can't see any bases — check its access under Airtable's token settings.")
+        return None, None
+
+    base_ids = list(bases.keys())
+    prior_base = st.session_state.get("auto_lookup_base_id")
+    base_id = st.selectbox(
+        "Base to check for this experiment's record",
+        options=base_ids,
+        index=base_ids.index(prior_base) if prior_base in base_ids else 0,
+        format_func=lambda bid: bases.get(bid, bid),
+        key="auto_lookup_base_id",
+    )
+
+    tables_cache_key = f"airtable_tables_{base_id}"
+    if tables_cache_key not in st.session_state:
+        with st.spinner(f"Loading tables for {bases.get(base_id, base_id)}…"):
+            result = list_tables(api_key, base_id)
+        if not result["ok"]:
+            st.error(f"Couldn't list tables in {bases.get(base_id, base_id)}: {result['error']}")
+            return base_id, None
+        st.session_state[tables_cache_key] = result["tables"]
+
+    tables: list = st.session_state.get(tables_cache_key, [])
+    if not tables:
+        st.warning("This base has no tables.")
+        return base_id, None
+
+    table_names = [t["name"] for t in tables]
+    prior_table = st.session_state.get("auto_lookup_table_name")
+    table_choice = st.selectbox(
+        "Table",
+        options=table_names,
+        index=table_names.index(prior_table) if prior_table in table_names else 0,
+        key="auto_lookup_table_name",
+    )
+    return base_id, next(t for t in tables if t["name"] == table_choice)
+
+
 def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
     """
-    Searches the configured default Airtable base/table (AIRTABLE_BASE_ID/
-    AIRTABLE_TABLE_NAME) for the record matching this experiment (Step 1's
-    exp_prefix, via the same id-field guess the Send step uses). Shared by
-    the Hypothesis gate (required, blocks generation) and the Custom Code
-    lookup (optional context for Gemini) so both reuse one round-trip.
+    Searches the user-picked Airtable base/table (see
+    _render_lookup_base_table_picker) for the record matching this
+    experiment (Step 1's exp_prefix, via the same id-field guess the Send
+    step uses). Shared by the Hypothesis gate (required, blocks generation)
+    and the Custom Code lookup (optional context for Gemini) so both reuse
+    one round-trip.
     Returns (table_field_names, matched_record_fields_or_None, message).
     """
     exp_prefix = st.session_state.get("auto_exp_prefix")
     creds = get_credentials()
-    api_key, base_id, table_name = creds["api_key"], creds["base_id"], creds["table_name"]
+    api_key = creds["api_key"]
 
-    if not (api_key and base_id and table_name):
+    if not api_key:
         return [], None, (
-            "Airtable isn't fully configured (AIRTABLE_API_KEY/BASE_ID/TABLE_NAME) — "
-            "can't look up the experiment record."
+            "No Airtable token configured (AIRTABLE_API_KEY) — can't look up the experiment record."
         )
     if not exp_prefix:
         return [], None, "No experiment ID from Step 1 to look up."
 
-    tables_result = list_tables(api_key, base_id)
-    if not tables_result["ok"]:
-        return [], None, f"Couldn't load Airtable tables: {tables_result['error']}"
-
-    table = next(
-        (t for t in tables_result["tables"] if table_name in (t["id"], t["name"])),
-        None,
-    )
+    base_id, table = _render_lookup_base_table_picker(api_key)
     if table is None:
-        return [], None, f"Configured table '{table_name}' wasn't found in the base."
+        return [], None, "Pick a base and table above to look up the experiment record."
+
+    # Persisted so Step 5 can pre-select this same base/table (and, once a
+    # record is found below, that same record) instead of making the user
+    # pick and search for something already resolved here.
+    resolved = {"base_id": base_id, "table_id": table["id"], "table_name": table["name"]}
+    st.session_state["auto_lookup_resolved"] = resolved
 
     id_field = _guess_id_field(table["fields"])
     if not id_field:
-        return table["fields"], None, "Couldn't find an ID field on the configured table."
+        return table["fields"], None, "Couldn't find an ID field on the selected table."
+    resolved["id_field"] = id_field
 
     search_result = search_records(base_id, table["id"], api_key, id_field, exp_prefix)
     if not search_result["ok"]:
@@ -850,14 +955,17 @@ def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
     # Prefer a match that already has a Hypothesis filled in, if more than one
     # record matched the search term — otherwise just take the first.
     hypothesis_field = _guess_hypothesis_field(table["fields"])
+    matched = None
     if hypothesis_field:
-        with_hypothesis = next(
+        matched = next(
             (r for r in matches if str(r["fields"].get(hypothesis_field, "")).strip()), None,
         )
-        if with_hypothesis:
-            return table["fields"], with_hypothesis["fields"], f"Matched Airtable record for '{exp_prefix}'."
+    matched = matched or matches[0]
 
-    return table["fields"], matches[0]["fields"], f"Matched Airtable record for '{exp_prefix}'."
+    resolved["record_id"] = matched["id"]
+    resolved["record_fields"] = matched["fields"]
+    resolved["search_term"] = exp_prefix
+    return table["fields"], matched["fields"], f"Matched Airtable record for '{exp_prefix}'."
 
 
 def _render_stage_ai():
@@ -874,6 +982,12 @@ def _render_stage_ai():
         "Entirely optional — skip straight to sending if you don't want one."
     )
 
+    st.markdown("**Where's this experiment tracked in Airtable?**")
+    st.caption(
+        "Used to check the Hypothesis field before generating a conclusion, and to "
+        "pull in Custom Code as extra context — independent of where you actually "
+        "send results in Step 5."
+    )
     table_fields, record_fields, lookup_message = _lookup_experiment_record()
 
     hypothesis_field = _guess_hypothesis_field(table_fields) if table_fields else None
@@ -1043,8 +1157,13 @@ def _render_stage_send():
         return
 
     base_ids = list(bases.keys())
+    lookup_resolved = st.session_state.get("auto_lookup_resolved") or {}
     prior_bases = st.session_state.get("airtable_base_ids") or (
         [creds["base_id"]] if creds["base_id"] in base_ids else []
+    ) or (
+        # Nothing picked here yet — default to whatever base Step 4 already
+        # resolved this experiment's record to, so it doesn't need picking twice.
+        [lookup_resolved["base_id"]] if lookup_resolved.get("base_id") in base_ids else []
     )
     default_bases = [b for b in prior_bases if b in base_ids] or base_ids[:1]
     selected_base_ids = st.multiselect(
@@ -1103,8 +1222,17 @@ def _render_stage_send():
             experiment_tables = [n for n in table_names if n.lower() == "experiments"] or [
                 n for n in table_names if "experiments" in n.lower()
             ]
+            # If Step 4 already resolved this base to a specific table, prefer
+            # that over the generic "experiment(s)"-named-table guess.
+            lookup_table_name = (
+                [lookup_resolved["table_name"]]
+                if lookup_resolved.get("base_id") == base_id
+                and lookup_resolved.get("table_name") in table_names
+                else []
+            )
             default_selection = (
                 [n for n in stored_selection if n in table_names]
+                or lookup_table_name
                 or experiment_tables
                 or table_names[:1]
             )
@@ -1120,8 +1248,46 @@ def _render_stage_send():
                 with tab:
                     lookup_key = f"airtable_lookup_{base_id}_{table['id']}"
 
+                    # Pre-seed this exact (base, table)'s lookup widgets from
+                    # Step 4's already-resolved record — before they're
+                    # created below, so the user doesn't have to pick the ID
+                    # field or search again for something already found.
+                    # Only seeds keys that don't exist yet, so it never
+                    # clobbers a choice the user has since changed.
+                    is_lookup_resolved_table = (
+                        lookup_resolved.get("base_id") == base_id
+                        and lookup_resolved.get("table_id") == table["id"]
+                    )
+                    if is_lookup_resolved_table and lookup_resolved.get("id_field"):
+                        idfield_key = f"{lookup_key}_idfield"
+                        if idfield_key not in st.session_state:
+                            st.session_state[idfield_key] = lookup_resolved["id_field"]
+                        if lookup_resolved.get("record_id"):
+                            term_key = f"{lookup_key}_term"
+                            if term_key not in st.session_state and lookup_resolved.get("search_term"):
+                                st.session_state[term_key] = lookup_resolved["search_term"]
+                            results_key = f"{lookup_key}_results"
+                            if results_key not in st.session_state:
+                                st.session_state[results_key] = [{
+                                    "id": lookup_resolved["record_id"],
+                                    "fields": lookup_resolved.get("record_fields") or {},
+                                }]
+                            choice_key = f"{lookup_key}_choice"
+                            if choice_key not in st.session_state:
+                                record_fields = lookup_resolved.get("record_fields") or {}
+                                id_value = record_fields.get(lookup_resolved["id_field"], "(blank)")
+                                st.session_state[choice_key] = (
+                                    f"{id_value}  ·  …{lookup_resolved['record_id'][-6:]}"
+                                )
+
                     st.markdown("**Existing record**")
                     id_field_options = ["— Always create new —"] + table["fields"]
+                    idfield_key = f"{lookup_key}_idfield"
+                    # index= only applies the very first time this key is
+                    # rendered — passing it alongside a key that's already in
+                    # session_state (e.g. pre-seeded from Step 4 above) is
+                    # redundant and Streamlit warns about it, so omit it once
+                    # the key already has a value.
                     default_id_field = _guess_id_field(table["fields"])
                     default_idx = (
                         id_field_options.index(default_id_field)
@@ -1129,8 +1295,9 @@ def _render_stage_send():
                     )
                     id_field = st.selectbox(
                         "Field to search on (e.g. an experiment ID Airtable generated)",
-                        options=id_field_options, index=default_idx,
-                        key=f"{lookup_key}_idfield",
+                        options=id_field_options,
+                        **({} if idfield_key in st.session_state else {"index": default_idx}),
+                        key=idfield_key,
                     )
 
                     mode = "create"

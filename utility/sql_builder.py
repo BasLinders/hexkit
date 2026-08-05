@@ -686,6 +686,42 @@ def build_continuous(p: ContinuousParams, limit: int = 0) -> str:
 
     limit_clause = f"\nLIMIT {limit}" if limit else ""
 
+    # Mirrors build_binomial_from_shared_scan's post_exposure_filter handling
+    # (previously a no-op here: the field existed on ContinuousParams and was
+    # threaded through from the UI, but neither continuous builder ever
+    # filtered on it, so purchases from *before* a user's first recorded
+    # experiment exposure were always counted).
+    ts_col = "event_timestamp AS first_exposure_timestamp," if p.post_exposure_filter else ""
+
+    if p.post_exposure_filter:
+        ecommerce_cte = """ecommerce_data AS (
+  SELECT
+    e.user_pseudo_id,
+    e.ecommerce.transaction_id AS transaction_id,
+    SUM(e.ecommerce.purchase_revenue)    AS purchase_revenue,
+    SUM(e.ecommerce.total_item_quantity) AS total_item_quantity
+  FROM single_scan e
+  INNER JOIN variant_data vd ON e.user_pseudo_id = vd.user_pseudo_id
+  WHERE e.event_name = 'purchase'
+    AND e.ecommerce.purchase_revenue IS NOT NULL
+    AND e.ecommerce.purchase_revenue <> 0.0
+    AND e.event_timestamp >= vd.first_exposure_timestamp
+  GROUP BY e.user_pseudo_id, transaction_id
+)"""
+    else:
+        ecommerce_cte = """ecommerce_data AS (
+  SELECT
+    user_pseudo_id,
+    ecommerce.transaction_id AS transaction_id,
+    SUM(ecommerce.purchase_revenue)    AS purchase_revenue,
+    SUM(ecommerce.total_item_quantity) AS total_item_quantity
+  FROM single_scan
+  WHERE event_name = 'purchase'
+    AND ecommerce.purchase_revenue IS NOT NULL
+    AND ecommerce.purchase_revenue <> 0.0
+  GROUP BY user_pseudo_id, transaction_id
+)"""
+
     return f"""-- Continuous experiment export
 DECLARE start_date    STRING DEFAULT '{p.start_date}';
 DECLARE end_date      STRING DEFAULT '{p.end_date}';
@@ -715,6 +751,7 @@ user_initial_exposure AS (
   SELECT
     user_pseudo_id,
     exp_variant_string,
+    event_timestamp,
     ROW_NUMBER() OVER (PARTITION BY user_pseudo_id ORDER BY event_timestamp ASC) AS rn
   FROM single_scan
   WHERE exp_variant_string IS NOT NULL
@@ -724,6 +761,7 @@ user_initial_exposure AS (
 variant_data AS (
   SELECT
     user_pseudo_id,
+    {ts_col}
     CASE
 {case_block}
       ELSE 'Other'
@@ -750,18 +788,7 @@ device_data AS (
   GROUP BY user_pseudo_id
 ),
 
-ecommerce_data AS (
-  SELECT
-    user_pseudo_id,
-    ecommerce.transaction_id AS transaction_id,
-    SUM(ecommerce.purchase_revenue)    AS purchase_revenue,
-    SUM(ecommerce.total_item_quantity) AS total_item_quantity
-  FROM single_scan
-  WHERE event_name = 'purchase'
-    AND ecommerce.purchase_revenue IS NOT NULL
-    AND ecommerce.purchase_revenue <> 0.0
-  GROUP BY user_pseudo_id, transaction_id
-)
+{ecommerce_cte}
 
 SELECT
   vd.user_pseudo_id        AS variant_user_pseudo_id,
@@ -1201,11 +1228,48 @@ def build_continuous_from_shared_scan(p: ContinuousParams) -> str:
         if filter_cte else ""
     )
 
+    # Mirrors build_binomial_from_shared_scan's post_exposure_filter handling
+    # (previously a no-op here: the field existed on ContinuousParams and was
+    # threaded through from the UI, but neither continuous builder ever
+    # filtered on it, so purchases from *before* a user's first recorded
+    # experiment exposure were always counted).
+    ts_col = "event_timestamp AS first_exposure_timestamp," if p.post_exposure_filter else ""
+
+    if p.post_exposure_filter:
+        ecommerce_cte = """ecommerce_data AS (
+  SELECT
+    e.user_pseudo_id,
+    e.transaction_id,
+    SUM(e.purchase_revenue)    AS purchase_revenue,
+    SUM(e.total_item_quantity) AS total_item_quantity
+  FROM shared_scan e
+  INNER JOIN variant_data vd ON e.user_pseudo_id = vd.user_pseudo_id
+  WHERE e.event_name = 'purchase'
+    AND e.purchase_revenue IS NOT NULL
+    AND e.purchase_revenue <> 0.0
+    AND e.event_timestamp >= vd.first_exposure_timestamp
+  GROUP BY e.user_pseudo_id, e.transaction_id
+)"""
+    else:
+        ecommerce_cte = """ecommerce_data AS (
+  SELECT
+    user_pseudo_id,
+    transaction_id,
+    SUM(purchase_revenue)    AS purchase_revenue,
+    SUM(total_item_quantity) AS total_item_quantity
+  FROM shared_scan
+  WHERE event_name = 'purchase'
+    AND purchase_revenue IS NOT NULL
+    AND purchase_revenue <> 0.0
+  GROUP BY user_pseudo_id, transaction_id
+)"""
+
     return f"""
 user_initial_exposure AS (
   SELECT
     user_pseudo_id,
     exp_variant_string,
+    event_timestamp,
     ROW_NUMBER() OVER (PARTITION BY user_pseudo_id ORDER BY event_timestamp ASC) AS rn
   FROM shared_scan
   WHERE exp_variant_string IS NOT NULL
@@ -1215,6 +1279,7 @@ user_initial_exposure AS (
 variant_data AS (
   SELECT
     user_pseudo_id,
+    {ts_col}
     CASE
 {case_block}
       ELSE 'Other'
@@ -1239,18 +1304,7 @@ device_data AS (
   GROUP BY user_pseudo_id
 ),
 
-ecommerce_data AS (
-  SELECT
-    user_pseudo_id,
-    transaction_id,
-    SUM(purchase_revenue)    AS purchase_revenue,
-    SUM(total_item_quantity) AS total_item_quantity
-  FROM shared_scan
-  WHERE event_name = 'purchase'
-    AND purchase_revenue IS NOT NULL
-    AND purchase_revenue <> 0.0
-  GROUP BY user_pseudo_id, transaction_id
-){ecommerce_trailer}
+{ecommerce_cte}{ecommerce_trailer}
 SELECT
   vd.user_pseudo_id        AS variant_user_pseudo_id,
   vd.experience_variant_label,
