@@ -48,6 +48,7 @@ from utility.automation_engine import (
     run_bayesian_analysis,
     run_continuous_analysis,
     run_pretest_analysis,
+    run_pretest_analysis_seasonal,
     build_airtable_payload,
     apply_field_map,
     best_match_field,
@@ -188,6 +189,21 @@ def _render_stage_fetch():
                 options=list(PRETEST_KPI_OPTIONS.keys()),
                 key="autofetch_pretest_kpi",
             )
+        use_seasonal_pretest = st.checkbox(
+            "Use seasonal forecast (Prophet) instead of a flat weekly average",
+            value=False,
+            key="autofetch_pretest_seasonal",
+            help=(
+                "Fits a Prophet model to daily baseline traffic/conversions and "
+                "projects the next 6 weeks with weekly/yearly seasonality, instead "
+                "of assuming flat traffic — useful around holidays or promo periods "
+                "that would otherwise be averaged away. Needs at least 14 days of "
+                "daily baseline history (hard minimum), but yearly seasonality is "
+                "only meaningfully estimated with several months of history — with "
+                "just a few weeks, later forecast weeks can flatten out unreliably. "
+                "Prefer 8+ weeks above when this is on."
+            ),
+        )
 
         try:
             experiment_start = datetime.strptime(start_date, "%Y-%m-%d").date()
@@ -202,6 +218,19 @@ def _render_stage_fetch():
                 f"Baseline period: **{baseline_start}** to **{baseline_end}** "
                 f"({int(weeks_before)} full week(s), Monday-Sunday)."
             )
+            baseline_days = (baseline_end - baseline_start).days + 1
+            if use_seasonal_pretest and baseline_days < 14:
+                st.warning(
+                    "Seasonal forecasting needs at least 14 days of daily baseline "
+                    "history — pick 2 or more weeks above, or turn it off."
+                )
+            elif use_seasonal_pretest and baseline_days < 56:
+                st.caption(
+                    "ℹ️ With under ~8 weeks of history, Prophet's yearly-seasonality "
+                    "component is poorly estimated and later forecast weeks can "
+                    "flatten out unrealistically — treat this as directional, or "
+                    "pick more weeks above for a more reliable projection."
+                )
 
             filter_type, filter_value = render_user_filter(
                 project, dataset, str(baseline_start), str(baseline_end),
@@ -214,15 +243,16 @@ def _render_stage_fetch():
                 start_date=str(baseline_start),
                 end_date=str(baseline_end),
                 output_type="binomial",
-                output_shape="aggregate",
+                output_shape="daily" if use_seasonal_pretest else "aggregate",
                 kpi_add_to_cart=(PRETEST_KPI_OPTIONS[kpi_choice] == "add_to_cart"),
                 filter_type=filter_type,
                 filter_value=filter_value,
             )
             baseline_sql = build_baseline(baseline_params)
             render_sql_viewer(baseline_sql, key="auto_pretest_sql")
+            pretest_result_key = "auto_pretest_daily_result" if use_seasonal_pretest else "auto_pretest_result"
             render_execution_gate(
-                project, baseline_sql, result_key="auto_pretest_result", allow_preview=True,
+                project, baseline_sql, result_key=pretest_result_key, allow_preview=True,
                 dataset=dataset,
             )
 
@@ -383,10 +413,27 @@ def _render_stage_fetch():
             st.session_state["auto_runtime_days"] = 1
 
         df_pretest = st.session_state.get("auto_pretest_result")
+        df_pretest_daily = st.session_state.get("auto_pretest_daily_result")
         st.session_state["auto_df_pretest"] = df_pretest
-        if df_pretest is not None and not df_pretest.empty:
+        use_seasonal = bool(st.session_state.get("autofetch_pretest_seasonal", False))
+        kpi_choice = st.session_state.get("autofetch_pretest_kpi", "Transactions (purchases)")
+
+        if use_seasonal and df_pretest_daily is not None and not df_pretest_daily.empty:
             weeks = int(st.session_state.get("autofetch_pretest_weeks", 1))
-            kpi_choice = st.session_state.get("autofetch_pretest_kpi", "Transactions (purchases)")
+            value_col = (
+                "add_to_cart_conversions"
+                if PRETEST_KPI_OPTIONS[kpi_choice] == "add_to_cart"
+                else "conversions"
+            )
+            st.session_state["auto_pretest_meta"] = {
+                "seasonal": True,
+                "weeks": weeks,
+                "kpi_label": kpi_choice,
+                "daily_df": df_pretest_daily,
+                "value_col": value_col,
+            }
+        elif df_pretest is not None and not df_pretest.empty:
+            weeks = int(st.session_state.get("autofetch_pretest_weeks", 1))
             row = df_pretest.iloc[0]
             conversions_col = (
                 "total_add_to_cart_conversions"
@@ -394,6 +441,7 @@ def _render_stage_fetch():
                 else "total_conversions"
             )
             st.session_state["auto_pretest_meta"] = {
+                "seasonal": False,
                 "weeks": weeks,
                 "kpi_label": kpi_choice,
                 "total_visitors": float(row["total_visitors"]),
@@ -578,12 +626,18 @@ def _render_stage_configure():
                 "Power / trustworthiness target (%)", min_value=50, max_value=99,
                 value=80, step=1, key="auto_pretest_trust",
             )
-            weekly_visitors = pretest_meta["total_visitors"] / pretest_meta["weeks"]
-            weekly_conversions = pretest_meta["total_conversions"] / pretest_meta["weeks"]
-            st.caption(
-                f"Baseline: {pretest_meta['kpi_label']} over {pretest_meta['weeks']} week(s) → "
-                f"{weekly_visitors:,.0f} visitors/week, {weekly_conversions:,.1f} conversions/week."
-            )
+            if pretest_meta.get("seasonal"):
+                st.caption(
+                    f"Baseline: {pretest_meta['kpi_label']} · {pretest_meta['weeks']} week(s) of "
+                    "daily history · seasonal (Prophet) forecast, not a flat weekly average."
+                )
+            else:
+                weekly_visitors = pretest_meta["total_visitors"] / pretest_meta["weeks"]
+                weekly_conversions = pretest_meta["total_conversions"] / pretest_meta["weeks"]
+                st.caption(
+                    f"Baseline: {pretest_meta['kpi_label']} over {pretest_meta['weeks']} week(s) → "
+                    f"{weekly_visitors:,.0f} visitors/week, {weekly_conversions:,.1f} conversions/week."
+                )
     else:
         trust_pct = 80
 
@@ -597,7 +651,12 @@ def _render_stage_configure():
             aov_cv = st.slider(
                 "AOV variability (CV)", min_value=0.0, max_value=1.5,
                 value=0.0, step=0.05, key="auto_aov_cv",
-                help="0 treats AOV as a known constant. Above 0 propagates AOV sampling uncertainty (Frequentist only).",
+                help=(
+                    "0 treats AOV as a known constant for both methods. Above 0: Frequentist "
+                    "propagates it as estimation-uncertainty on the AOV mean (widens the CI); "
+                    "Bayesian samples AOV from a log-normal with this CV on every simulated draw "
+                    "(widens the posterior spread). Same input, different mechanics per method."
+                ),
             )
         if use_continuous and daily_visitors_continuous != daily_visitors:
             st.caption(
@@ -662,6 +721,7 @@ def _render_stage_configure():
                     runtime_days=runtime_days,
                     projection_days=int(projection_days),
                     n_samples=int(n_samples),
+                    aov_cv=aov_cv,
                 )
             if use_continuous:
                 results["continuous"] = run_continuous_analysis(
@@ -675,15 +735,26 @@ def _render_stage_configure():
                     mode=continuous_mode,
                 )
             if use_pretest:
-                results["pretest"] = run_pretest_analysis(
-                    weekly_visitors=pretest_meta["total_visitors"] / pretest_meta["weeks"],
-                    weekly_conversions=pretest_meta["total_conversions"] / pretest_meta["weeks"],
-                    weeks_used=pretest_meta["weeks"],
-                    kpi_label=pretest_meta["kpi_label"],
-                    confidence_level=confidence_level,
-                    tail=tail,
-                    trust_pct=trust_pct,
-                )
+                if pretest_meta.get("seasonal"):
+                    results["pretest"] = run_pretest_analysis_seasonal(
+                        daily_df=pretest_meta["daily_df"],
+                        value_col=pretest_meta["value_col"],
+                        kpi_label=pretest_meta["kpi_label"],
+                        weeks_used=pretest_meta["weeks"],
+                        confidence_level=confidence_level,
+                        tail=tail,
+                        trust_pct=trust_pct,
+                    )
+                else:
+                    results["pretest"] = run_pretest_analysis(
+                        weekly_visitors=pretest_meta["total_visitors"] / pretest_meta["weeks"],
+                        weekly_conversions=pretest_meta["total_conversions"] / pretest_meta["weeks"],
+                        weeks_used=pretest_meta["weeks"],
+                        kpi_label=pretest_meta["kpi_label"],
+                        confidence_level=confidence_level,
+                        tail=tail,
+                        trust_pct=trust_pct,
+                    )
             st.session_state["auto_control"] = control
             st.session_state["auto_variation"] = variation
             st.session_state["auto_results"] = results
@@ -799,13 +870,20 @@ def _render_stage_results():
 
     if pretest:
         st.markdown("### Pre-Test Analysis")
-        st.caption(
-            f"Baseline: {pretest['kpi']} · {pretest['weeks_used']} week(s) · "
-            f"{pretest['weekly_visitors']:,.0f} visitors/week, "
-            f"{pretest['weekly_conversions']:,.1f} conversions/week."
-        )
-        mde_df = pd.DataFrame(pretest["table"])
-        st.dataframe(mde_df, use_container_width=True)
+        if pretest.get("seasonal"):
+            st.caption(
+                f"Baseline: {pretest['kpi']} · {pretest['weeks_used']} week(s) of daily "
+                f"history · seasonal (Prophet) forecast. {pretest.get('forecast_summary', '')}"
+            )
+        else:
+            st.caption(
+                f"Baseline: {pretest['kpi']} · {pretest['weeks_used']} week(s) · "
+                f"{pretest['weekly_visitors']:,.0f} visitors/week, "
+                f"{pretest['weekly_conversions']:,.1f} conversions/week."
+            )
+        if pretest["table"]:
+            mde_df = pd.DataFrame(pretest["table"])
+            st.dataframe(mde_df, use_container_width=True)
         st.caption(pretest["conclusion"])
         st.divider()
 
@@ -952,20 +1030,47 @@ def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
     if not matches:
         return table["fields"], None, f"No Airtable record found yet for experiment '{exp_prefix}'."
 
-    # Prefer a match that already has a Hypothesis filled in, if more than one
-    # record matched the search term — otherwise just take the first.
     hypothesis_field = _guess_hypothesis_field(table["fields"])
-    matched = None
-    if hypothesis_field:
-        matched = next(
-            (r for r in matches if str(r["fields"].get(hypothesis_field, "")).strip()), None,
+
+    if len(matches) > 1:
+        # search_records matches by substring (see its own docstring), so more
+        # than one record legitimately containing exp_prefix is a real
+        # possibility (e.g. "104" also matching "1041..."), not just a rare
+        # edge case. Silently picking one on the user's behalf risked
+        # attaching this result — and the AI conclusion — to the wrong
+        # experiment's record with no indication anything was ambiguous.
+        # Surface every candidate and let the user confirm, defaulting to the
+        # same "prefer a match with a filled Hypothesis" pick as before.
+        def _match_label(r: dict) -> str:
+            id_value = r["fields"].get(id_field, "(blank)")
+            has_hyp = bool(hypothesis_field and str(r["fields"].get(hypothesis_field, "")).strip())
+            marker = "  ·  ✓ has hypothesis" if has_hyp else ""
+            return f"{id_value}  ·  …{r['id'][-6:]}{marker}"
+
+        default_match = next(
+            (r for r in matches if hypothesis_field and str(r["fields"].get(hypothesis_field, "")).strip()),
+            matches[0],
         )
-    matched = matched or matches[0]
+        options = [_match_label(r) for r in matches]
+        st.warning(
+            f"{len(matches)} Airtable records matched '{exp_prefix}' on **{id_field}** — "
+            "confirm which one this experiment's result actually belongs to."
+        )
+        choice = st.selectbox(
+            "Matched record", options=options,
+            index=matches.index(default_match),
+            key="auto_lookup_record_choice",
+        )
+        matched = matches[options.index(choice)]
+        message = f"Matched Airtable record for '{exp_prefix}' ({len(matches)} candidates — confirm above)."
+    else:
+        matched = matches[0]
+        message = f"Matched Airtable record for '{exp_prefix}'."
 
     resolved["record_id"] = matched["id"]
     resolved["record_fields"] = matched["fields"]
     resolved["search_term"] = exp_prefix
-    return table["fields"], matched["fields"], f"Matched Airtable record for '{exp_prefix}'."
+    return table["fields"], matched["fields"], message
 
 
 def _render_stage_ai():
@@ -1374,6 +1479,22 @@ def _render_stage_send():
                             field_map[key] = chosen
 
                     st.session_state[mapping_key] = field_map
+
+                    # apply_field_map has no way to detect this: two internal
+                    # keys mapped to the same Airtable field silently collapse
+                    # to whichever one dict iteration processes last, dropping
+                    # the other's value with no error. Only a UI-level warning
+                    # can catch it, since the collision only exists at the
+                    # point the user picks the mapping.
+                    chosen_fields = list(field_map.values())
+                    dupes = sorted({f for f in chosen_fields if chosen_fields.count(f) > 1})
+                    if dupes:
+                        dupe_list = ", ".join(dupes)
+                        st.warning(
+                            f"Multiple result fields are mapped to the same Airtable column "
+                            f"({dupe_list}) — only one value will actually be sent for each, "
+                            "silently dropping the rest. Fix the mapping above before sending."
+                        )
 
                     if mode == "update" or description.strip():
                         send_plan.append({
