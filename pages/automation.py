@@ -420,8 +420,16 @@ def _render_stage_fetch():
         except ValueError:
             st.session_state["auto_runtime_days"] = 1
 
-        df_pretest = st.session_state.get("auto_pretest_result")
-        df_pretest_daily = st.session_state.get("auto_pretest_daily_result")
+        # Gated on the current want_pretest checkbox state, same reason as the
+        # want_binomial/want_continuous gate above: without it, unchecking
+        # "Fetch pre-test baseline data" after a previous fetch (e.g. going
+        # back and deciding not to use it this run) wouldn't actually drop
+        # the stale result -- the elif below would still pick it up and build
+        # auto_pretest_meta from it, silently keeping Pre-Test Analysis
+        # available with baseline data from a possibly different
+        # weeks/KPI/experiment configuration.
+        df_pretest = st.session_state.get("auto_pretest_result") if want_pretest else None
+        df_pretest_daily = st.session_state.get("auto_pretest_daily_result") if want_pretest else None
         st.session_state["auto_df_pretest"] = df_pretest
         use_seasonal = want_pretest and bool(st.session_state.get("autofetch_pretest_seasonal", False))
         kpi_choice = st.session_state.get("autofetch_pretest_kpi", "Transactions (purchases)")
@@ -795,6 +803,19 @@ def _render_stage_configure():
             st.session_state["auto_variation"] = variation
             st.session_state["auto_results"] = results
             st.session_state["auto_revenue_source"] = revenue_source
+
+            # A previously-generated AI conclusion (Step 4) describes a
+            # specific set of results -- nothing else invalidates it, so
+            # without this it would silently survive a re-run with different
+            # settings (confidence level, active methods, revenue source,
+            # ...) and get re-attached to a new payload with different
+            # numbers, with no indication the text no longer describes them.
+            # Dropping it here forces Step 4 to start from "not generated
+            # yet" after any change, rather than an explicit regenerate being
+            # something the user has to remember to do on their own.
+            st.session_state.pop("auto_ai_conclusion", None)
+            st.session_state.pop("auto_ai_include", None)
+
             st.session_state["auto_stage"] = 3
             st.rerun()
 
