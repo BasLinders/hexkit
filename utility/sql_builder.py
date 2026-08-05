@@ -897,15 +897,25 @@ def _shared_scan_user_filter(filter_type: Optional[str], filter_value: str) -> s
     column (see experiment_shared_scan_flags). Returns "" when disabled, and
     the CTE body WITHOUT a trailing comma or trailing newline — callers splice
     it into their own CTE chain and add a comma only if something follows it.
+
+    "contains"/"regex" is restricted to event_name = 'page_view', matching
+    _baseline_user_filter and the "Page URL — contains/regex... matches
+    page_view's page_location" UI copy (see render_user_filter). Without this,
+    shared_scan's page_location column — populated for ANY event that happens
+    to carry that param, e.g. click/scroll/video/file_download under GA4's
+    enhanced measurement — would scope the main experiment population
+    differently than the pre-test baseline population built from the same
+    filter UI, silently undermining the baseline-vs-experiment comparison
+    Pre-Test Analysis exists for.
     """
     if not (filter_type and filter_value):
         return ""
     if filter_type == "event":
         condition = f"event_name = '{filter_value}'"
     elif filter_type == "regex":
-        condition = f"REGEXP_CONTAINS(page_location, r'{filter_value}')"
+        condition = f"event_name = 'page_view' AND REGEXP_CONTAINS(page_location, r'{filter_value}')"
     else:
-        condition = f"page_location LIKE '%{filter_value}%'"
+        condition = f"event_name = 'page_view' AND page_location LIKE '%{filter_value}%'"
     return f"""
 filtered_users AS (
   SELECT DISTINCT user_pseudo_id

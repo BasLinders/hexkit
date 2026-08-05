@@ -104,6 +104,7 @@ MONETARY_METHOD_NOTES: dict[str, dict[str, list[str]]] = {
             "Monte Carlo based -- more expensive to compute, and the exact figure carries sampling noise across runs (controlled by the sample-size setting, but never fully eliminated).",
             "Always produces an expected-value number, even for a genuinely inconclusive result -- read alongside prob_beat_control/prob_being_best, never the money figure alone.",
             "AOV is modelled as log-normal with an assumed variability (CV); if that's a poor match for the real order-value distribution, the estimate's spread (not its mean) is affected.",
+            "Projects future volume by scaling each variant's OWN observed visitors by runtime_days -- i.e. assumes the traffic split observed during the test continues. Frequentist/Continuous instead scale a single combined daily-visitor figure -- i.e. assume the winner is rolled out to 100% of future traffic. The two are not projecting the same future and their revenue figures are not directly comparable.",
         ],
     },
     "continuous": {
@@ -126,7 +127,14 @@ MONETARY_METHOD_GUIDANCE = (
     "KPI (pricing, upsell, merchandising) -- Continuous is the most direct measure. Small sample or a "
     "pre-significance ship/hold decision -- Bayesian's expected-value framing is more informative than "
     "a flat non-significant verdict. Need a simple, easily-defensible number for a non-technical or "
-    "finance audience -- Frequentist's closed-form CI is the most transparent."
+    "finance audience -- Frequentist's closed-form CI is the most transparent. IMPORTANT: the three "
+    "figures are not a like-for-like comparison even before uncertainty is considered -- Frequentist "
+    "and Continuous project revenue assuming the winning variant is rolled out to 100% of future "
+    "traffic (today's combined daily visitors), while Bayesian projects forward assuming the SAME "
+    "traffic split observed during the test continues (each arm scaled by its own historical daily "
+    "visitors). In an even split, Bayesian's figure will run roughly half of Frequentist/Continuous's "
+    "for a comparable effect size -- that gap reflects differing rollout assumptions, not disagreement "
+    "about the underlying effect."
 )
 
 
@@ -205,8 +213,18 @@ def run_bayesian_analysis(
     runtime_days: int,
     projection_days: int,
     n_samples: int = 100_000,
+    aov_cv: float = 0.5,
 ) -> dict:
-    """Runs the FOE BayesianEngine (Beta-Binomial Monte Carlo) on a control/variation pair."""
+    """
+    Runs the FOE BayesianEngine (Beta-Binomial Monte Carlo) on a control/variation pair.
+
+    aov_cv is the same "AOV variability (CV)" the UI collects for Frequentist's
+    se_aov propagation, passed through to BayesianEngine.run_monetary_projection's
+    log-normal AOV sampling instead of silently falling back to its 0.5 default
+    regardless of what the user set — the two methods use the CV differently
+    (Frequentist propagates it as an estimation-uncertainty SE; Bayesian samples
+    AOV directly from it each draw), but both should reflect the same input.
+    """
     data = ExperimentInput(
         visitors=[control.visitors, variation.visitors],
         conversions=[control.conversions, variation.conversions],
@@ -230,6 +248,7 @@ def run_bayesian_analysis(
         biz_case=biz_case,
         prob_best_overall=prob_best_overall,
         variant_labels=[control.label, variation.label],
+        aov_cv=aov_cv,
         n_simulations=n_samples,
     )[0]
 
@@ -272,32 +291,50 @@ def run_continuous_analysis(
     projection.
 
     automation.py's continuous fetch always uses the "all_users" (LEFT JOIN)
-    query mode, so every exposed visitor is a row, non-buyers as NULL revenue
-    (zero-filled below) rather than dropped — this is what makes both modes
-    below possible from the *same* fetched data:
+    query mode, so every exposed visitor gets at least one row, non-buyers as
+    NULL revenue (zero-filled below) rather than dropped. A visitor who placed
+    more than one separate order within the date range gets *multiple* rows,
+    though — one per transaction, from the underlying SQL's per-order grain —
+    so the raw fetch is really "one row per (visitor, order)", not "one row
+    per visitor". That distinction matters differently per mode:
 
-    mode="rpv" (revenue per visitor): every row counts as-is — measures
-    conversion-rate AND spend effects together (AnalysisUnit.PER_VISITOR).
-    mode="rpt" (revenue per transaction): only buyers should count, so zero-
-    revenue rows are stripped before analysis (AnalysisUnit.PER_TRANSACTION)
-    — isolates the order-value effect alone. Each variant's total exposed
-    visitor count is taken from the data *before* that stripping and passed
-    through to the monetary projection regardless of mode, since FOE's
-    PER_TRANSACTION business case needs it to derive an order rate (n
-    orders / total visitors) — without it, a per-order lift can't be scaled
-    to daily traffic.
+    mode="rpv" (revenue per visitor): needs exactly one row per visitor
+    (AnalysisUnit.PER_VISITOR — FOE's own hurdle model assumes the group mean
+    already averages over every visitor). Rows are first collapsed to one per
+    (variant, visitor) by summing revenue, so a repeat purchaser contributes
+    their total spend as a single observation instead of being counted (and
+    weighted in the significance test) once per order.
+    mode="rpt" (revenue per transaction): the raw per-order grain *is* what's
+    wanted — only buyers should count, so zero-revenue rows are stripped
+    before analysis (AnalysisUnit.PER_TRANSACTION) — isolates the order-value
+    effect alone, one observation per order.
+
+    Each variant's total exposed visitor count (visitor_counts) is always the
+    count of *distinct* visitors, regardless of mode — computed before any
+    mode-specific collapsing/stripping, since FOE's PER_TRANSACTION business
+    case needs a true visitor count (not an order count) to derive an order
+    rate (n orders / total visitors); a repeat purchaser's extra rows must not
+    inflate it.
     """
     alternative = _TAIL_MAP[tail]
     alpha = 1.0 - confidence_level
 
     work = df.copy()
     work[kpi] = pd.to_numeric(work[kpi], errors="coerce").fillna(0.0)
-    visitor_counts = work["experience_variant_label"].value_counts().to_dict()
+    visitor_counts = (
+        work.groupby("experience_variant_label")["variant_user_pseudo_id"]
+        .nunique()
+        .to_dict()
+    )
 
     if mode == "rpt":
         work = work[work[kpi] != 0.0]
         unit = AnalysisUnit.PER_TRANSACTION
     else:
+        work = (
+            work.groupby(["experience_variant_label", "variant_user_pseudo_id"], as_index=False)[kpi]
+            .sum()
+        )
         unit = AnalysisUnit.PER_VISITOR
 
     config = ContinuousMetricConfig(
@@ -393,6 +430,84 @@ def run_pretest_analysis(
     }
 
 
+def run_pretest_analysis_seasonal(
+    daily_df: "pd.DataFrame",
+    value_col: str,
+    kpi_label: str,
+    weeks_used: int,
+    confidence_level: float,
+    tail: Literal["Two-sided", "Greater", "Less"],
+    trust_pct: float = 80.0,
+) -> dict:
+    """
+    Seasonal counterpart to run_pretest_analysis: fits a Prophet model to daily
+    baseline visitors/conversions (via FOE's TrafficForecastingEngine) and
+    projects a 6-week MDE table from that forecast instead of a flat weekly
+    average, so weekday/holiday patterns in the baseline period inform the
+    projection rather than being averaged away.
+
+    Note: pages/pre_test_analysis.py has its own, independent Prophet-based
+    seasonal forecast (run_prophet_forecast + perform_mde_calculation_forecast)
+    for its dedicated planning tool. This uses FOE's TrafficForecastingEngine /
+    PretestEngine.calculate_mde_from_forecast instead, since that page's helpers
+    aren't safely importable here (it calls st.set_page_config at module level,
+    which collides with automation.py's own call) — the two seasonal paths are
+    functionally equivalent (same Prophet weekly/yearly-seasonality fit, same
+    cumulative-week MDE formula) but independently implemented.
+
+    daily_df needs a 'report_date' column (as produced by
+    BaselineParams(output_shape="daily")) plus 'visitors' and `value_col`
+    (either 'conversions' or 'add_to_cart_conversions', matching the chosen
+    pretest KPI). Falls back to an explanatory empty-table result if there
+    isn't enough daily history (Prophet needs >= 14 days) or the forecast
+    comes back empty.
+    """
+    from foe.core.models import AnalysisUnit
+    from foe.pretest.forecasting import TrafficForecastingEngine
+
+    alternative = _TAIL_MAP[tail]
+    risk_pct = confidence_level * 100
+
+    df = daily_df.rename(columns={"report_date": "ds"})
+    df["ds"] = pd.to_datetime(df["ds"])
+    forecast_result = TrafficForecastingEngine.run_seasonal_forecast(
+        df, periods=42, interval=confidence_level,
+        unit=AnalysisUnit.PER_VISITOR, count_col="visitors", value_col=value_col,
+    )
+    records = forecast_result.get("forecast") or []
+    if not records:
+        return {
+            "method": "pretest",
+            "seasonal": True,
+            "kpi": kpi_label,
+            "weeks_used": weeks_used,
+            "table": [],
+            "conclusion": forecast_result.get(
+                "conclusion",
+                "Not enough daily baseline history for a seasonal forecast (need at least 14 days).",
+            ),
+        }
+
+    result = PretestEngine.calculate_mde_from_forecast(
+        forecast_records=records,
+        num_variants=2,
+        risk_pct=risk_pct,
+        trust_pct=trust_pct,
+        alternative=alternative,
+        unit=AnalysisUnit.PER_VISITOR,
+    )
+
+    return {
+        "method": "pretest",
+        "seasonal": True,
+        "kpi": kpi_label,
+        "weeks_used": weeks_used,
+        "table": result["table"],
+        "conclusion": result["conclusion"],
+        "forecast_summary": forecast_result["conclusion"],
+    }
+
+
 def format_pretest_table(table: list[dict]) -> str:
     """
     Renders the pre-test MDE table as plain text, one line per week, instead
@@ -405,6 +520,11 @@ def format_pretest_table(table: list[dict]) -> str:
     would multiply it by 100 a second time (12.42 -> "1242.29%" instead of
     "12.42%"), inflating every MDE in the table by exactly 100x before it
     ever reaches Airtable.
+
+    MDE can be None on the seasonal path (PretestEngine.calculate_mde_from_forecast
+    leaves a week's MDE unset when that week's forecasted volume is zero or
+    negative) -- run_pretest_analysis's flat-average path never produces None,
+    but this function is shared by both, so it's guarded here either way.
     """
     lines = []
     for row in table:
@@ -412,7 +532,9 @@ def format_pretest_table(table: list[dict]) -> str:
         size_label = size_key.replace("_", " ").lower() if size_key else ""
         size_val = row.get(size_key) if size_key else None
         size_part = f"{size_val:,} {size_label}" if size_val is not None else ""
-        lines.append(f"Week {row['Week']}: {size_part} — MDE {row['MDE']:.2f}%")
+        mde_val = row.get("MDE")
+        mde_part = f"{mde_val:.2f}%" if mde_val is not None else "N/A"
+        lines.append(f"Week {row['Week']}: {size_part} — MDE {mde_part}")
     return "\n".join(lines)
 
 
