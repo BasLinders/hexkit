@@ -20,6 +20,7 @@ from utility.bq_ui_components import (
     render_connection_selectors,
     render_date_range,
     render_variant_inputs,
+    render_user_filter,
     render_execution_gate,
     render_combined_execution_gate,
     render_sql_viewer,
@@ -28,7 +29,7 @@ from utility.sql_builder import (
     BaselineParams,
     BinomialParams,
     ContinuousParams,
-    binomial_shared_scan_flags,
+    experiment_shared_scan_flags,
     build_baseline,
     build_shared_scan_select,
     build_binomial_from_shared_scan,
@@ -186,44 +187,6 @@ def _render_stage_fetch():
                 key="autofetch_pretest_kpi",
             )
 
-        use_page_filter = st.toggle(
-            "Enable page filter",
-            value=False,
-            key="autofetch_pretest_use_filter",
-            help=(
-                "When enabled, only baseline users who visited a matching page "
-                "are included. Useful for scoping the baseline to a specific "
-                "section of the site — e.g. a product category or checkout flow."
-            ),
-        )
-        page_filter_type = None
-        page_filter_value = ""
-        if use_page_filter:
-            fc1, fc2 = st.columns([1, 2])
-            with fc1:
-                page_filter_type = cast(
-                    Literal["regex", "contains"],
-                    st.radio(
-                        "Filter type",
-                        options=["contains", "regex"],
-                        format_func=lambda x: "URL contains" if x == "contains" else "Regex pattern",
-                        horizontal=True,
-                        key="autofetch_pretest_filter_type",
-                    ),
-                )
-            with fc2:
-                page_filter_value = st.text_input(
-                    "Filter value",
-                    placeholder=".html  |  /products/  |  \\.html$",
-                    key="autofetch_pretest_filter_value",
-                    help=(
-                        "The string or pattern to match against page_location. "
-                        "Regex uses BigQuery REGEXP_CONTAINS syntax. Matching is case-sensitive."
-                    ),
-                )
-            if not page_filter_value:
-                st.warning("Enter a filter value or disable the page filter.")
-
         try:
             experiment_start = datetime.strptime(start_date, "%Y-%m-%d").date()
         except ValueError:
@@ -238,6 +201,11 @@ def _render_stage_fetch():
                 f"({int(weeks_before)} full week(s), Monday-Sunday)."
             )
 
+            filter_type, filter_value = render_user_filter(
+                project, dataset, str(baseline_start), str(baseline_end),
+                key_prefix="autofetch_pretest",
+            )
+
             baseline_params = BaselineParams(
                 project=project,
                 dataset=dataset,
@@ -246,13 +214,14 @@ def _render_stage_fetch():
                 output_type="binomial",
                 output_shape="aggregate",
                 kpi_add_to_cart=(PRETEST_KPI_OPTIONS[kpi_choice] == "add_to_cart"),
-                page_filter_type=page_filter_type if page_filter_value else None,
-                page_filter_value=page_filter_value,
+                filter_type=filter_type,
+                filter_value=filter_value,
             )
             baseline_sql = build_baseline(baseline_params)
             render_sql_viewer(baseline_sql, key="auto_pretest_sql")
             render_execution_gate(
                 project, baseline_sql, result_key="auto_pretest_result", allow_preview=True,
+                dataset=dataset,
             )
 
     st.divider()
@@ -301,6 +270,11 @@ def _render_stage_fetch():
 
     match_strategy = cast(Literal["exact", "like"], match_strategy)
 
+    st.divider()
+    filter_type, filter_value = render_user_filter(
+        project, dataset, start_date, end_date, key_prefix="autofetch_exp",
+    )
+
     binomial_params: Optional[BinomialParams] = None
     if want_binomial:
         binomial_params = BinomialParams(
@@ -319,6 +293,8 @@ def _render_stage_fetch():
             kpi_device_split=False,
             kpi_login=False,
             kpi_create_account=False,
+            filter_type=filter_type,
+            filter_value=filter_value,
         )
 
     continuous_params: Optional[ContinuousParams] = None
@@ -334,9 +310,11 @@ def _render_stage_fetch():
             device_filter="all",
             query_mode="all_users",  # RPV — non-buyers included, matches run_continuous_analysis's per-visitor assumption
             post_exposure_filter=True,
+            filter_type=filter_type,
+            filter_value=filter_value,
         )
 
-    need_page_location, need_payment_type = binomial_shared_scan_flags(binomial_params)
+    need_page_location, need_payment_type = experiment_shared_scan_flags(binomial_params, continuous_params)
     shared_scan_select = build_shared_scan_select(
         project, dataset, start_date, end_date, param_key,
         need_page_location, need_payment_type,
@@ -364,7 +342,9 @@ def _render_stage_fetch():
         )
         sql = build_experiment_single_output_sql(shared_scan_select, chain)
         render_sql_viewer(sql, key="auto_sql")
-        render_execution_gate(project, sql, result_key=f"auto_{label}_result", allow_preview=True)
+        render_execution_gate(
+            project, sql, result_key=f"auto_{label}_result", allow_preview=True, dataset=dataset,
+        )
 
     df_binomial = st.session_state.get("auto_binomial_result")
     df_continuous = st.session_state.get("auto_continuous_result")

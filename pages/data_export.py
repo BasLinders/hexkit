@@ -23,6 +23,7 @@ from utility.bq_ui_components import (
     render_date_range,
     render_variant_inputs,
     render_kpi_checkboxes,
+    render_user_filter,
     render_sql_viewer,
     render_export_options,
     render_combined_execution_gate,
@@ -39,7 +40,7 @@ from utility.sql_builder import (
     build_sequential,
     build_interaction,
     build_autodetect_variants_query,
-    binomial_shared_scan_flags,
+    experiment_shared_scan_flags,
     build_shared_scan_select,
     build_binomial_from_shared_scan,
     build_continuous_from_shared_scan,
@@ -139,55 +140,9 @@ def _render_baseline_inputs(
         )
 
     st.divider()
-    st.subheader("Page filter")
-    st.caption(
-        "Optional. Filter to users who visited specific pages before inclusion. "
-        "Leave disabled to include all users in the date range."
+    filter_type, filter_value = render_user_filter(
+        project, dataset, start_date, end_date, key_prefix="bl",
     )
-
-    use_filter = st.toggle(
-        "Enable page filter",
-        value=False,
-        key="bl_use_filter",
-        help=(
-            "When enabled, only users who visited a matching page during the date range "
-            "are included. Useful for scoping analysis to a specific section of the site — "
-            "for example, a product category or checkout flow."
-        ),
-    )
-    page_filter_type = None
-    page_filter_value = ""
-
-    if use_filter:
-        page_filter_type = cast(
-            Literal["regex", "contains"],
-            st.radio(
-                "Filter type",
-                options=["contains", "regex"],
-                format_func=lambda x: "URL contains" if x == "contains" else "Regex pattern",
-                horizontal=True,
-                key="bl_filter_type",
-                help=(
-                    "URL contains: simple substring match against the full page URL. "
-                    "Regex: BigQuery REGEXP_CONTAINS syntax for more specific patterns, "
-                    "e.g. r'\\.html$' to match only HTML product pages."
-                ),
-            ),
-        )
-        page_filter_value = st.text_input(
-            "Filter value",
-            placeholder=".html  |  /products/  |  \\.html$",
-            key="bl_filter_value",
-            help=(
-                "The string or pattern to match against page_location. "
-                "Contains example: '/products/shoes/'. "
-                "Regex example: r'/(product|category)/'. "
-                "Matching is case-sensitive."
-            ),
-        )
-        if not page_filter_value:
-            st.warning("Enter a filter value or disable the page filter.")
-            return None
 
     return BaselineParams(
         project=project,
@@ -197,8 +152,8 @@ def _render_baseline_inputs(
         output_type=output_type,
         output_shape=output_shape,
         kpi_add_to_cart=kpi_add_to_cart,
-        page_filter_type=page_filter_type,
-        page_filter_value=page_filter_value,
+        filter_type=filter_type,
+        filter_value=filter_value,
     )
 
 
@@ -257,6 +212,11 @@ def _render_experiment_inputs(
         key="exp_post_exposure",
     )
 
+    st.divider()
+    filter_type, filter_value = render_user_filter(
+        project, dataset, start_date, end_date, key_prefix="exp",
+    )
+
     binomial_params: Optional[BinomialParams] = None
     continuous_params: Optional[ContinuousParams] = None
 
@@ -283,6 +243,8 @@ def _render_experiment_inputs(
             kpi_device_split=kpis.get("kpi_device_split", True),
             kpi_login=kpis.get("kpi_login", False),
             kpi_create_account=kpis.get("kpi_create_account", False),
+            filter_type=filter_type,
+            filter_value=filter_value,
         )
 
     if want_continuous:
@@ -331,6 +293,8 @@ def _render_experiment_inputs(
             device_filter=device_filter,
             query_mode=query_mode,
             post_exposure_filter=post_exposure,
+            filter_type=filter_type,
+            filter_value=filter_value,
         )
 
     if not _experiments_valid(experiments):
@@ -746,7 +710,7 @@ def _run_experiment_mode(project: str, dataset: str, selected: dict) -> None:
     if ref is None:
         return  # _render_experiment_inputs already guards against this
 
-    need_page_location, need_payment_type = binomial_shared_scan_flags(bp)
+    need_page_location, need_payment_type = experiment_shared_scan_flags(bp, cp)
     shared_scan_select = build_shared_scan_select(
         ref.project, ref.dataset, ref.start_date, ref.end_date, ref.param_key,
         need_page_location, need_payment_type,

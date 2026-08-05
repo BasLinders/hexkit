@@ -501,6 +501,26 @@ def run_preview(project: str, sql: str, limit: int = 25) -> "pd.DataFrame":
 # ---------------------------------------------------------------------------
 # Auto-detect helpers
 # ---------------------------------------------------------------------------
+# All three sample only a short recent window rather than the full (possibly
+# months-long) date range — what they're looking for (a variant string, a
+# known KPI event, a custom event name) is stable over the course of an
+# experiment, so scanning the whole range buys no extra accuracy, only extra
+# cost. Each shows the bytes it actually scanned via dry_run, since these are
+# real billable queries a user can click repeatedly without ever seeing a
+# "Run full query"-style cost prompt otherwise.
+
+def _sample_recent_window(start_date: str, end_date: str, days: int) -> tuple[str, str]:
+    """Clamps to the last `days` day(s) ending at end_date, staying within
+    [start_date, end_date]. The full range is left untouched for the actual
+    export query — only auto-detect probes use this narrower window."""
+    from datetime import datetime, timedelta
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    start_dt = max(
+        end_dt - timedelta(days=days),
+        datetime.strptime(start_date, "%Y-%m-%d"),
+    )
+    return start_dt.strftime("%Y-%m-%d"), end_date
+
 
 def autodetect_variants(
     project: str,
@@ -510,20 +530,10 @@ def autodetect_variants(
     param_key: str,
     prefix: str,
 ) -> list[str]:
+    from datetime import datetime
     from utility.sql_builder import build_autodetect_variants_query
-    from datetime import datetime, timedelta
 
-    # Use only the last day of the selected date range to minimise scan cost.
-    # Variant strings are stable — they don't change over the course of an experiment —
-    # so a 1-day window is sufficient to discover all variants.
-    # The full date range is preserved for the actual export query.
-    end_dt   = datetime.strptime(end_date, "%Y-%m-%d")
-    start_dt = max(
-        end_dt - timedelta(days=1),
-        datetime.strptime(start_date, "%Y-%m-%d"),
-    )
-    sample_start = start_dt.strftime("%Y-%m-%d")
-    sample_end   = end_date  # end stays the same
+    sample_start, sample_end = _sample_recent_window(start_date, end_date, days=1)
 
     sql = build_autodetect_variants_query(
         project, dataset, sample_start, sample_end, param_key, prefix
@@ -536,6 +546,7 @@ def autodetect_variants(
     )
     df = run_query(project, sql)
     if df.empty:
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
         if end_dt.date() >= datetime.now().date():
             st.warning(
                 f"No variant strings found on {sample_start} → {sample_end}. "
@@ -561,7 +572,47 @@ def autodetect_kpis(
     end_date: str,
 ) -> list[str]:
     from utility.sql_builder import build_autodetect_kpi_query
-    sql = build_autodetect_kpi_query(project, dataset, start_date, end_date)
+
+    sample_start, sample_end = _sample_recent_window(start_date, end_date, days=2)
+
+    sql = build_autodetect_kpi_query(project, dataset, sample_start, sample_end)
+    cost = dry_run(project, sql)
+    st.caption(
+        f"Auto-detect scanned the last 2 days of your date range "
+        f"({sample_start} → {sample_end}): "
+        f"**{cost['display']}** — separate from your export query cost."
+    )
+    df = run_query(project, sql)
+    return df["event_name"].tolist() if not df.empty else []
+
+
+def autodetect_event_names(
+    project: str,
+    dataset: str,
+    start_date: str,
+    end_date: str,
+    limit: int = 100,
+) -> list[str]:
+    """
+    Distinct event names, most frequent first — lets the event-filter UI
+    offer a real pick-list instead of a blind free-text guess. Sampled over
+    the last 2 days rather than the full date range: which event names exist
+    at all doesn't meaningfully change day to day, and event_name is scanned
+    across every row in range regardless of how narrow the actual condition
+    ends up being, so this is the one auto-detect query size scales with
+    range length the most.
+    """
+    from utility.sql_builder import build_autodetect_event_names_query
+
+    sample_start, sample_end = _sample_recent_window(start_date, end_date, days=2)
+
+    sql = build_autodetect_event_names_query(project, dataset, sample_start, sample_end, limit)
+    cost = dry_run(project, sql)
+    st.caption(
+        f"Auto-detect scanned the last 2 days of your date range "
+        f"({sample_start} → {sample_end}): "
+        f"**{cost['display']}** — separate from your export query cost."
+    )
     df = run_query(project, sql)
     return df["event_name"].tolist() if not df.empty else []
 

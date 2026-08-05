@@ -11,7 +11,8 @@ from utility.bq_client import (
     is_authenticated, get_auth_url, exchange_code_for_credentials,
     get_redirect_uri, sign_out, list_projects, list_datasets, dry_run,
     get_monthly_usage, run_preview, run_query, run_combined_export,
-    df_to_csv_bytes, export_to_sheets, autodetect_variants, autodetect_kpis
+    df_to_csv_bytes, export_to_sheets, autodetect_variants, autodetect_kpis,
+    autodetect_event_names,
 )
 from utility.sql_builder import VariantPair, ExperimentConfig
 
@@ -478,6 +479,109 @@ def render_kpi_checkboxes(
 
 
 # ---------------------------------------------------------------------------
+# User filter (page URL or event) — scopes the population
+# ---------------------------------------------------------------------------
+
+def render_user_filter(
+    project: Optional[str],
+    dataset: Optional[str],
+    start_date: str,
+    end_date: str,
+    key_prefix: str,
+) -> tuple[Optional[Literal["contains", "regex", "event"]], str]:
+    """
+    Renders the optional "scope to a subset of users" block, shared by every
+    fetch flow that wants to restrict its population to users who did
+    something specific during the date range — either visited a matching
+    page (URL contains/regex against page_view's page_location) or fired a
+    specific event at least once (exact event_name match). Event mode is
+    more robust than a URL match whenever the URL itself can't differentiate
+    page types (e.g. everything lives behind one route, or a page type is
+    only knowable from an event a click handler fires).
+
+    Returns (filter_type, filter_value) — filter_type is None when disabled
+    or when enabled but left without a value (a warning is shown either way).
+    """
+    st.subheader("User filter")
+    st.caption(
+        "Optional. Scope the population to users who visited a matching page, "
+        "or fired a specific event, at any point during the date range."
+    )
+
+    enabled = st.toggle("Enable user filter", value=False, key=f"{key_prefix}_filter_enabled")
+    if not enabled:
+        return None, ""
+
+    filter_type = cast(
+        Literal["contains", "regex", "event"],
+        st.radio(
+            "Filter by",
+            options=["contains", "regex", "event"],
+            format_func=lambda x: (
+                "Page URL — contains" if x == "contains"
+                else "Page URL — regex" if x == "regex"
+                else "Event"
+            ),
+            horizontal=True,
+            key=f"{key_prefix}_filter_type",
+            help=(
+                "Page URL: matches page_view's page_location — works well when the "
+                "site's URL structure differentiates page types. Event: matches users "
+                "who fired a specific event at least once — more robust when the URL "
+                "can't tell page types apart."
+            ),
+        ),
+    )
+
+    if filter_type == "event":
+        autodetect_key = f"{key_prefix}_filter_detected_events"
+        if st.button(
+            "🔍 Discover event names",
+            disabled=not project or not dataset,
+            key=f"{key_prefix}_filter_autodetect_btn",
+        ):
+            if project and dataset:  # narrows Optional[str] → str for type checker
+                with st.spinner("Scanning for distinct event names…"):
+                    st.session_state[autodetect_key] = autodetect_event_names(
+                        project, dataset, start_date, end_date,
+                    )
+
+        detected = st.session_state.get(autodetect_key, [])
+        if detected:
+            filter_value = cast(str, st.selectbox(
+                "Event name",
+                options=detected,
+                key=f"{key_prefix}_filter_event_select",
+                help="Users who fired this event at least once during the date range are included.",
+            ))
+        else:
+            st.caption("ℹ️ Click 'Discover event names' above, or type one in manually below.")
+            filter_value = st.text_input(
+                "Event name",
+                placeholder="e.g. view_item, sign_up, video_start",
+                key=f"{key_prefix}_filter_event_value",
+                help="Must exactly match a GA4 event_name value. Case-sensitive.",
+            )
+    else:
+        filter_value = st.text_input(
+            "Filter value",
+            placeholder=".html  |  /products/  |  \\.html$",
+            key=f"{key_prefix}_filter_page_value",
+            help=(
+                "The string or pattern to match against page_location. "
+                "Contains example: '/products/shoes/'. "
+                "Regex example: '/(product|category)/'. Matching is case-sensitive."
+            ),
+        )
+
+    if not filter_value.strip():
+        st.warning("Enter a filter value (or event name) above, or disable the filter.")
+        return None, ""
+
+    return filter_type, filter_value.strip()
+
+
+# ---------------------------------------------------------------------------
 # Pre-execution gate + query runner
 # ---------------------------------------------------------------------------
 
@@ -486,9 +590,14 @@ def render_execution_gate(
     sql: str,
     result_key: str = "query_result",
     allow_preview: bool = True,
+    dataset: Optional[str] = None,
 ):
     """
-    Always runs dry-run and shows bytes.
+    Always runs dry-run and shows bytes. When `dataset` is given, also shows
+    this project's monthly usage against the 1 TB/month free tier — a single
+    query's own scan can look negligible in isolation while still adding to a
+    budget that's already mostly spent from earlier runs this month, which a
+    per-query estimate alone won't surface.
     Offers optional preview (25 rows).
     Shows confirm button to run full query.
     """
@@ -502,11 +611,56 @@ def render_execution_gate(
         st.error(f"Dry-run failed: {cost['error']}")
         return
 
-    col1, col2 = st.columns(2)
+    usage: Optional[dict] = None
+    if dataset:
+        with st.spinner("Fetching monthly usage…"):
+            usage = get_monthly_usage(project, dataset)
+
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Estimated scan", cost["display"])
+        st.metric(
+            "This query", cost["display"],
+            help="Estimated bytes scanned by this query (BigQuery dry-run).",
+        )
     with col2:
-        st.metric("Free tier usage", f"{cost['free_tier_pct']}%", help="Based on 1 TB/month free tier")
+        if usage is not None:
+            st.metric(
+                "Used this month",
+                usage["used_display"] if not usage["error"] else "Unavailable",
+                help=(
+                    "Bytes processed by all queries in this project since the 1st of "
+                    "the month. Sourced from INFORMATION_SCHEMA.JOBS_BY_PROJECT. "
+                    "Cached for 5 minutes."
+                ),
+            )
+        else:
+            st.metric("Free tier usage", f"{cost['free_tier_pct']}%", help="Based on 1 TB/month free tier")
+    with col3:
+        if usage is not None:
+            st.metric(
+                "Remaining free tier",
+                usage["remaining_display"] if not usage["error"] else "Unavailable",
+            )
+
+    if usage is not None and not usage["error"]:
+        used_pct = usage["used_pct"] / 100  # st.progress expects 0.0-1.0
+        st.progress(
+            min(used_pct, 1.0),
+            text=f"{usage['used_display']} of 1 TB used this month ({usage['used_pct']}%)",
+        )
+        if usage["remaining_bytes"] > 0:
+            query_pct_of_remaining = round((cost["bytes"] / usage["remaining_bytes"]) * 100, 3)
+            st.caption(
+                f"This query consumes **{query_pct_of_remaining}%** "
+                f"of your remaining {usage['remaining_display']} budget."
+            )
+    elif usage is not None and usage.get("permission_denied"):
+        st.caption(
+            "ℹ️ Monthly usage unavailable — "
+            "the authenticated account needs `bigquery.jobs.list` at project level."
+        )
+    elif usage is not None:
+        st.caption(f"ℹ️ Monthly usage unavailable: {usage['error']}")
 
     if allow_preview:
         if st.button("👁️ Preview (25 rows)", key=f"{result_key}_preview_btn"):
