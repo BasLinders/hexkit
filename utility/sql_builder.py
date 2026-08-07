@@ -2,10 +2,81 @@
 sql_builder.py
 Generates BigQuery SQL for each export mode from structured user inputs.
 No hardcoded limits on variants or experiments.
+
+foe.data backend
+-----------------
+foe.data.sql.experiments is a ported, hardened copy of this module's own
+build_* logic (see foe/data/sql/experiments.py's docstring) -- same GA4
+schema assumptions, same CTE shapes, plus SQL-literal escaping this module
+never had. Every build_* function below tries that backend first and falls
+back to this module's own (unchanged) implementation -- renamed with a
+_native_ prefix -- if foe isn't installed or the translated call raises for
+any reason. USING_FOE_BACKEND reports which path is live; callers (pages/
+data_export.py) are unaffected either way -- same dataclasses in, same SQL
+strings out.
+
+experiment_shared_scan_flags and the build_experiment_*_sql wrappers stay
+native-only: they're pure boolean/string-wrapping logic with no GA4-schema
+content, so there's nothing for a second backend to get right or wrong.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+from datetime import date as _date
 from typing import Literal, Optional
+import warnings
+
+try:
+    from foe.data.sql import experiments as _foe_experiments
+    from foe.core.models import (
+        BQConnectionConfig as _FoeBQConnectionConfig,
+        DateRange as _FoeDateRange,
+        ExperimentDefinition as _FoeExperimentDefinition,
+        VariantPair as _FoeVariantPair,
+        BaselineExtractionParams as _FoeBaselineExtractionParams,
+        BinomialExtractionParams as _FoeBinomialExtractionParams,
+        ContinuousExtractionParams as _FoeContinuousExtractionParams,
+        SequentialExtractionParams as _FoeSequentialExtractionParams,
+        InteractionExtractionParams as _FoeInteractionExtractionParams,
+    )
+    # Plain Literal strings from this module's own dataclasses (e.g.
+    # p.output_type == "binomial") are passed straight through to foe's
+    # Pydantic str-Enum fields below without importing/referencing the enum
+    # classes themselves -- Pydantic coerces "binomial" -> BaselineOutputType
+    # .BINOMIAL automatically since the values match verbatim.
+    USING_FOE_BACKEND = True
+except ImportError:
+    USING_FOE_BACKEND = False
+
+
+def _warn_foe_fallback(op: str, exc: Exception) -> None:
+    warnings.warn(
+        f"sql_builder.{op}: foe.data backend raised {exc!r} -- falling back "
+        f"to the native implementation.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _foe_connection(project: str, dataset: str) -> "_FoeBQConnectionConfig":
+    return _FoeBQConnectionConfig(project=project, dataset=dataset)
+
+
+def _foe_date_range(start_date: str, end_date: str) -> "_FoeDateRange":
+    return _FoeDateRange(
+        start_date=_date.fromisoformat(start_date),
+        end_date=_date.fromisoformat(end_date),
+    )
+
+
+def _foe_experiment_list(experiments: "list[ExperimentConfig]") -> list:
+    return [
+        _FoeExperimentDefinition(
+            experiment_id=exp.experiment_id,
+            prefix=exp.prefix,
+            variants=[_FoeVariantPair(label=v.label, string=v.string) for v in exp.variants],
+        )
+        for exp in experiments
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +248,24 @@ filtered_users AS (
 
 
 def build_baseline(p: BaselineParams, limit: int = 0) -> str:
+    if USING_FOE_BACKEND:
+        try:
+            fp = _FoeBaselineExtractionParams(
+                connection=_foe_connection(p.project, p.dataset),
+                date_range=_foe_date_range(p.start_date, p.end_date),
+                output_type=p.output_type,
+                output_shape=p.output_shape,
+                kpi_add_to_cart=p.kpi_add_to_cart,
+                filter_type=p.filter_type,
+                filter_value=p.filter_value,
+            )
+            return _foe_experiments.build_baseline(fp, limit=limit)
+        except Exception as e:
+            _warn_foe_fallback("build_baseline", e)
+    return _native_build_baseline(p, limit)
+
+
+def _native_build_baseline(p: BaselineParams, limit: int = 0) -> str:
     if p.output_shape == "daily":
         return _build_baseline_daily(p, limit)
     if p.output_shape == "per_user":
@@ -324,7 +413,36 @@ def _variant_case_block(exp: ExperimentConfig, strategy: str, source_col: str = 
     return "\n".join(lines)
 
 
+def _foe_binomial_params(p: BinomialParams) -> "_FoeBinomialExtractionParams":
+    return _FoeBinomialExtractionParams(
+        connection=_foe_connection(p.project, p.dataset),
+        date_range=_foe_date_range(p.start_date, p.end_date),
+        param_key=p.param_key,
+        match_strategy=p.match_strategy,
+        experiments=_foe_experiment_list(p.experiments),
+        post_exposure_filter=p.post_exposure_filter,
+        kpi_transactions=p.kpi_transactions,
+        kpi_add_to_cart=p.kpi_add_to_cart,
+        kpi_aov=p.kpi_aov,
+        kpi_ideal=p.kpi_ideal,
+        kpi_device_split=p.kpi_device_split,
+        kpi_login=p.kpi_login,
+        kpi_create_account=p.kpi_create_account,
+        filter_type=p.filter_type,
+        filter_value=p.filter_value,
+    )
+
+
 def build_binomial(p: BinomialParams, limit: int = 0) -> str:
+    if USING_FOE_BACKEND:
+        try:
+            return _foe_experiments.build_binomial(_foe_binomial_params(p), limit=limit)
+        except Exception as e:
+            _warn_foe_fallback("build_binomial", e)
+    return _native_build_binomial(p, limit)
+
+
+def _native_build_binomial(p: BinomialParams, limit: int = 0) -> str:
     table  = _table_ref(p.project, p.dataset)
     suffix = _suffix_filter(p.start_date, p.end_date)
     suffix_e = _suffix_filter(p.start_date, p.end_date, alias="e")
@@ -661,7 +779,31 @@ ORDER BY experience_variant_label{limit_clause};
 # CONTINUOUS
 # ---------------------------------------------------------------------------
 
+def _foe_continuous_params(p: ContinuousParams) -> "_FoeContinuousExtractionParams":
+    return _FoeContinuousExtractionParams(
+        connection=_foe_connection(p.project, p.dataset),
+        date_range=_foe_date_range(p.start_date, p.end_date),
+        param_key=p.param_key,
+        match_strategy=p.match_strategy,
+        experiments=_foe_experiment_list(p.experiments),
+        device_filter=p.device_filter,
+        query_mode=p.query_mode,
+        post_exposure_filter=p.post_exposure_filter,
+        filter_type=p.filter_type,
+        filter_value=p.filter_value,
+    )
+
+
 def build_continuous(p: ContinuousParams, limit: int = 0) -> str:
+    if USING_FOE_BACKEND:
+        try:
+            return _foe_experiments.build_continuous(_foe_continuous_params(p), limit=limit)
+        except Exception as e:
+            _warn_foe_fallback("build_continuous", e)
+    return _native_build_continuous(p, limit)
+
+
+def _native_build_continuous(p: ContinuousParams, limit: int = 0) -> str:
     table = _table_ref(p.project, p.dataset)
     suffix = _suffix_filter(p.start_date, p.end_date)
     exp = p.experiments[0]
@@ -846,6 +988,30 @@ def build_shared_scan_select(
     need_page_location: bool = False,
     need_payment_type: bool = False,
 ) -> str:
+    if USING_FOE_BACKEND:
+        try:
+            return _foe_experiments.build_shared_scan_select(
+                project, dataset, start_date, end_date, param_key,
+                need_page_location=need_page_location,
+                need_payment_type=need_payment_type,
+            )
+        except Exception as e:
+            _warn_foe_fallback("build_shared_scan_select", e)
+    return _native_build_shared_scan_select(
+        project, dataset, start_date, end_date, param_key,
+        need_page_location=need_page_location, need_payment_type=need_payment_type,
+    )
+
+
+def _native_build_shared_scan_select(
+    project: str,
+    dataset: str,
+    start_date: str,
+    end_date: str,
+    param_key: str,
+    need_page_location: bool = False,
+    need_payment_type: bool = False,
+) -> str:
     """
     Bare SELECT — no CREATE TABLE / WITH wrapper — over events_* for the date
     range, no event_name filter (matches the union of what every downstream
@@ -931,7 +1097,23 @@ def build_binomial_from_shared_scan(p: BinomialParams) -> str:
     chain body WITHOUT a leading `WITH` keyword or trailing semicolon —
     the caller prepends `WITH shared_scan AS (...),` (single output) or
     `WITH ` (shared_scan already a temp table, two-output session case).
+
+    foe.data note: foe/data/sql/experiments.py was ported from an earlier
+    version of this module's _shared_scan_user_filter, before it gained its
+    own event_name = 'page_view' scoping for "contains"/"regex" filters (see
+    that function's docstring). Both backends now agree -- this module's
+    smoke test confirmed byte-for-byte parity across every mode once this
+    file caught up, with no remaining intentional difference.
     """
+    if USING_FOE_BACKEND:
+        try:
+            return _foe_experiments.build_binomial_from_shared_scan(_foe_binomial_params(p))
+        except Exception as e:
+            _warn_foe_fallback("build_binomial_from_shared_scan", e)
+    return _native_build_binomial_from_shared_scan(p)
+
+
+def _native_build_binomial_from_shared_scan(p: BinomialParams) -> str:
     exp = p.experiments[0]
 
     all_variant_strings = [v.string for v in exp.variants]
@@ -1211,8 +1393,18 @@ def build_continuous_from_shared_scan(p: ContinuousParams) -> str:
     Same output as build_continuous, but sourced from shared_scan instead of
     independently scanning the raw table twice (single_scan + device_data).
     Returns the CTE chain body WITHOUT a leading `WITH` keyword or trailing
-    semicolon — see build_binomial_from_shared_scan for the wrapping contract.
+    semicolon — see build_binomial_from_shared_scan for the wrapping contract
+    (including its foe.data note on the "contains"/"regex" filter fix).
     """
+    if USING_FOE_BACKEND:
+        try:
+            return _foe_experiments.build_continuous_from_shared_scan(_foe_continuous_params(p))
+        except Exception as e:
+            _warn_foe_fallback("build_continuous_from_shared_scan", e)
+    return _native_build_continuous_from_shared_scan(p)
+
+
+def _native_build_continuous_from_shared_scan(p: ContinuousParams) -> str:
     exp = p.experiments[0]
 
     all_variant_strings = [v.string for v in exp.variants]
@@ -1362,6 +1554,31 @@ def build_experiment_session_output_sql(cte_chain: str, limit: int = 0) -> str:
 # ---------------------------------------------------------------------------
 
 def build_sequential(p: SequentialParams, limit: int = 0) -> str:
+    if USING_FOE_BACKEND:
+        try:
+            fp = _FoeSequentialExtractionParams(
+                connection=_foe_connection(p.project, p.dataset),
+                date_range=_foe_date_range(p.start_date, p.end_date),
+                param_key=p.param_key,
+                experiments=_foe_experiment_list(p.experiments),
+                use_persistence=p.use_persistence,
+                reset_cumulative_data=p.reset_cumulative_data,
+                cumulative_table=p.cumulative_table,
+                kpi_transactions=p.kpi_transactions,
+                kpi_add_to_cart=p.kpi_add_to_cart,
+                kpi_aov=p.kpi_aov,
+                kpi_ideal=p.kpi_ideal,
+                kpi_device_split=p.kpi_device_split,
+                kpi_login=p.kpi_login,
+                kpi_create_account=p.kpi_create_account,
+            )
+            return _foe_experiments.build_sequential(fp, limit=limit)
+        except Exception as e:
+            _warn_foe_fallback("build_sequential", e)
+    return _native_build_sequential(p, limit)
+
+
+def _native_build_sequential(p: SequentialParams, limit: int = 0) -> str:
     table = _table_ref(p.project, p.dataset)
     suffix = _suffix_filter(p.start_date, p.end_date)
     exp = p.experiments[0]
@@ -1551,6 +1768,23 @@ ORDER BY 1{limit_clause};
 # ---------------------------------------------------------------------------
 
 def build_interaction(p: InteractionParams, limit: int = 0) -> str:
+    if USING_FOE_BACKEND:
+        try:
+            fp = _FoeInteractionExtractionParams(
+                connection=_foe_connection(p.project, p.dataset),
+                date_range=_foe_date_range(p.start_date, p.end_date),
+                param_key=p.param_key,
+                experiments=_foe_experiment_list(p.experiments),
+                kpi_transactions=p.kpi_transactions,
+                kpi_add_to_cart=p.kpi_add_to_cart,
+            )
+            return _foe_experiments.build_interaction(fp, limit=limit)
+        except Exception as e:
+            _warn_foe_fallback("build_interaction", e)
+    return _native_build_interaction(p, limit)
+
+
+def _native_build_interaction(p: InteractionParams, limit: int = 0) -> str:
     table = _table_ref(p.project, p.dataset)
     suffix = _suffix_filter(p.start_date, p.end_date)
     n = len(p.experiments)
@@ -1673,6 +1907,24 @@ def build_autodetect_variants_query(
     param_key: str,
     prefix: str,
 ) -> str:
+    if USING_FOE_BACKEND:
+        try:
+            return _foe_experiments.build_autodetect_variants_query(
+                project, dataset, start_date, end_date, param_key, prefix
+            )
+        except Exception as e:
+            _warn_foe_fallback("build_autodetect_variants_query", e)
+    return _native_build_autodetect_variants_query(project, dataset, start_date, end_date, param_key, prefix)
+
+
+def _native_build_autodetect_variants_query(
+    project: str,
+    dataset: str,
+    start_date: str,
+    end_date: str,
+    param_key: str,
+    prefix: str,
+) -> str:
     table = _table_ref(project, dataset)
     suffix = _suffix_filter(start_date, end_date)
     return f"""
@@ -1701,6 +1953,21 @@ def build_autodetect_event_names_query(
     event_params entry), so this is a cheap scan regardless of range length —
     unlike autodetect_variants, no need to sample just the last day.
     """
+    if USING_FOE_BACKEND:
+        try:
+            return _foe_experiments.build_autodetect_event_names_query(project, dataset, start_date, end_date, limit)
+        except Exception as e:
+            _warn_foe_fallback("build_autodetect_event_names_query", e)
+    return _native_build_autodetect_event_names_query(project, dataset, start_date, end_date, limit)
+
+
+def _native_build_autodetect_event_names_query(
+    project: str,
+    dataset: str,
+    start_date: str,
+    end_date: str,
+    limit: int = 100,
+) -> str:
     table = _table_ref(project, dataset)
     suffix = _suffix_filter(start_date, end_date)
     return f"""
@@ -1714,6 +1981,20 @@ LIMIT {limit};
 
 
 def build_autodetect_kpi_query(
+    project: str,
+    dataset: str,
+    start_date: str,
+    end_date: str,
+) -> str:
+    if USING_FOE_BACKEND:
+        try:
+            return _foe_experiments.build_autodetect_kpi_query(project, dataset, start_date, end_date)
+        except Exception as e:
+            _warn_foe_fallback("build_autodetect_kpi_query", e)
+    return _native_build_autodetect_kpi_query(project, dataset, start_date, end_date)
+
+
+def _native_build_autodetect_kpi_query(
     project: str,
     dataset: str,
     start_date: str,

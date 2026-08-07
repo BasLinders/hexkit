@@ -36,6 +36,63 @@ try:
 except ImportError:
     DEPS_AVAILABLE = False
 
+# ---------------------------------------------------------------------------
+# foe.data backend
+# ---------------------------------------------------------------------------
+# foe.data.DataEngine wraps the same BigQuery client calls this module makes
+# by hand (dry_run/run/preview/sessions/monthly_usage) -- see foe/data/
+# engine.py's docstring. Discovery/execution functions below try a
+# per-call DataEngine (built from the current session's credentials) first
+# and fall back to this module's own native implementation -- renamed with a
+# _native_ prefix -- if foe isn't installed, the user isn't authenticated
+# yet, or the call raises for any reason. USING_FOE_BACKEND reports which
+# path is available; callers (pages/data_export.py) are unaffected either
+# way -- same function names, same signatures, same return dict shapes.
+#
+# Deliberately NOT routed through DataEngine in this pass: the OAuth flow
+# (get_auth_url/exchange_code_for_credentials) and the export helpers
+# (df_to_csv_bytes/export_to_sheets, which foe.data has no equivalent for).
+# DataEngine.build_auth_url/exchange_code encode OAuth state differently
+# (notably: never embedding client_secret in the browser-round-tripped
+# `state` param, unlike this module's current get_auth_url) and drop this
+# module's per-page redirect-URI multiplexing -- swapping the login flow
+# itself needs its own dedicated review, not a silent side effect of
+# migrating the data-export query path.
+try:
+    from foe.data import DataEngine as _FoeDataEngine
+    USING_FOE_BACKEND = True
+except ImportError:
+    USING_FOE_BACKEND = False
+
+
+def _warn_foe_fallback(op: str, exc: Exception) -> None:
+    import warnings
+    warnings.warn(
+        f"bq_client.{op}: foe.data backend raised {exc!r} -- falling back "
+        f"to the native implementation.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _get_data_engine(project: Optional[str] = None) -> Optional["_FoeDataEngine"]:
+    """
+    Returns a DataEngine built from the current session's credentials, or
+    None if the foe[bigquery] backend isn't installed or no one is signed
+    in yet. Callers must fall back to their own native bigquery.Client path
+    on None -- and on any exception the returned engine later raises, per
+    this module's engine-first/native-fallback pattern.
+    """
+    if not USING_FOE_BACKEND:
+        return None
+    creds = get_credentials()
+    if not creds:
+        return None
+    try:
+        return _FoeDataEngine.from_credentials(creds, project=project)
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # OAuth config
@@ -246,6 +303,16 @@ def list_projects() -> dict[str, str]:
     Returns {project_id: display_name}. display_name may be empty string
     if the project has no friendly name set.
     """
+    engine = _get_data_engine()
+    if engine is not None:
+        try:
+            return engine.list_projects()
+        except Exception as e:
+            _warn_foe_fallback("list_projects", e)
+    return _native_list_projects()
+
+
+def _native_list_projects() -> dict[str, str]:
     creds = get_credentials()
     if not creds:
         return {}
@@ -267,6 +334,16 @@ def list_datasets(project: str) -> dict[str, str]:
     Returns {dataset_id: friendly_name}. friendly_name may be empty string
     if the dataset has no friendly name set — this is common for GA4 exports.
     """
+    engine = _get_data_engine(project)
+    if engine is not None:
+        try:
+            return engine.list_datasets(project)
+        except Exception as e:
+            _warn_foe_fallback("list_datasets", e)
+    return _native_list_datasets(project)
+
+
+def _native_list_datasets(project: str) -> dict[str, str]:
     try:
         client = get_bq_client(project)
         result = {
@@ -290,6 +367,24 @@ def dry_run(project: str, sql: str) -> dict:
     (CREATE TABLE, INSERT, IF blocks). The sequential export page handles
     this by skipping the dry-run step and showing a warning instead.
     """
+    engine = _get_data_engine(project)
+    if engine is not None:
+        try:
+            est = engine.dry_run(sql)
+            return {
+                "bytes": est.bytes_processed,
+                "gb": est.gb_processed,
+                "display": est.display,
+                "free_tier_pct": est.free_tier_pct,
+                "error": est.error,
+                "is_dml": est.is_dml,
+            }
+        except Exception as e:
+            _warn_foe_fallback("dry_run", e)
+    return _native_dry_run(project, sql)
+
+
+def _native_dry_run(project: str, sql: str) -> dict:
     try:
         client = get_bq_client(project)
         job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
@@ -379,6 +474,36 @@ def get_monthly_usage(project: str, dataset_id: str) -> dict:
     if cached and (time.time() - cached.get("_ts", 0)) < _USAGE_CACHE_TTL:
         return cached
 
+    result = _fetch_monthly_usage(project, dataset_id)
+    result["_ts"] = time.time()
+    st.session_state[cache_key] = result
+    return result
+
+
+def _fetch_monthly_usage(project: str, dataset_id: str) -> dict:
+    engine = _get_data_engine(project)
+    if engine is not None:
+        try:
+            report = engine.monthly_usage(dataset_id, project=project)
+            return {
+                "used_bytes": report.used_bytes,
+                "used_gb": report.used_gb,
+                "used_display": report.used_display,
+                "remaining_bytes": report.remaining_bytes,
+                "remaining_gb": report.remaining_gb,
+                "remaining_display": report.remaining_display,
+                "used_pct": report.used_pct,
+                "query_pct_of_remaining": None,
+                "free_tier_bytes": report.free_tier_bytes,
+                "error": report.error,
+                "permission_denied": report.permission_denied,
+            }
+        except Exception as e:
+            _warn_foe_fallback("monthly_usage", e)
+    return _native_fetch_monthly_usage(project, dataset_id)
+
+
+def _native_fetch_monthly_usage(project: str, dataset_id: str) -> dict:
     result: dict = {
         "used_bytes": 0,
         "used_gb": 0.0,
@@ -391,7 +516,6 @@ def get_monthly_usage(project: str, dataset_id: str) -> dict:
         "free_tier_bytes": _FREE_TIER_BYTES,
         "error": None,
         "permission_denied": False,
-        "_ts": time.time(),
     }
 
     try:
@@ -418,7 +542,6 @@ WHERE DATE(creation_time) >= DATE_TRUNC(CURRENT_DATE(), MONTH)
             "remaining_gb": round(remaining / 1e9, 2),
             "remaining_display": _format_bytes(remaining),
             "used_pct": used_pct,
-            "_ts": time.time(),
         })
 
     except Exception as e:
@@ -430,7 +553,6 @@ WHERE DATE(creation_time) >= DATE_TRUNC(CURRENT_DATE(), MONTH)
             or "does not have bigquery.jobs.list" in err
         )
 
-    st.session_state[cache_key] = result
     return result
 
 
@@ -440,6 +562,16 @@ WHERE DATE(creation_time) >= DATE_TRUNC(CURRENT_DATE(), MONTH)
 
 def run_query(project: str, sql: str) -> "pd.DataFrame":
     """Execute SQL and return a DataFrame."""
+    engine = _get_data_engine(project)
+    if engine is not None:
+        try:
+            return engine.run(sql)
+        except Exception as e:
+            _warn_foe_fallback("run_query", e)
+    return _native_run_query(project, sql)
+
+
+def _native_run_query(project: str, sql: str) -> "pd.DataFrame":
     client = get_bq_client(project)
     job = client.query(sql)
     return job.result().to_dataframe()
@@ -451,6 +583,16 @@ def create_scan_session(project: str, create_temp_table_sql: str) -> str:
     session enabled, waits for it to finish, and returns the session_id so
     later queries can read that temp table via run_query_in_session.
     """
+    engine = _get_data_engine(project)
+    if engine is not None:
+        try:
+            return engine.create_scan_session(create_temp_table_sql)
+        except Exception as e:
+            _warn_foe_fallback("create_scan_session", e)
+    return _native_create_scan_session(project, create_temp_table_sql)
+
+
+def _native_create_scan_session(project: str, create_temp_table_sql: str) -> str:
     client = get_bq_client(project)
     job_config = bigquery.QueryJobConfig(create_session=True)
     job = client.query(create_temp_table_sql, job_config=job_config)
@@ -461,6 +603,16 @@ def create_scan_session(project: str, create_temp_table_sql: str) -> str:
 def run_query_in_session(project: str, sql: str, session_id: str) -> "pd.DataFrame":
     """Runs a query against an existing BigQuery session (e.g. to read a
     TEMP TABLE created by create_scan_session) and returns a DataFrame."""
+    engine = _get_data_engine(project)
+    if engine is not None:
+        try:
+            return engine.run_in_session(sql, session_id)
+        except Exception as e:
+            _warn_foe_fallback("run_query_in_session", e)
+    return _native_run_query_in_session(project, sql, session_id)
+
+
+def _native_run_query_in_session(project: str, sql: str, session_id: str) -> "pd.DataFrame":
     client = get_bq_client(project)
     job_config = bigquery.QueryJobConfig(
         connection_properties=[bigquery.ConnectionProperty(key="session_id", value=session_id)]
