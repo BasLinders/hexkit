@@ -1367,10 +1367,16 @@ def _render_stage_ai():
         )
         if generate_clicked:
             language = language_keys[language_labels.index(language_choice)]
-            with st.spinner("Asking Gemini…"):
+            with st.spinner("Asking Gemini… (retries automatically on high-demand errors)"):
                 result = gemini_client.generate_conclusion(ai_input, language=language)
             if result["ok"]:
                 st.session_state["auto_ai_conclusion"] = result["text"]
+                if result.get("model_used"):
+                    st.info(
+                        f"{result['model_requested']} was unavailable (high demand) — "
+                        f"generated with {result['model_used']} instead.",
+                        icon="ℹ️",
+                    )
             else:
                 st.error(f"Gemini request failed: {result['error']}")
 

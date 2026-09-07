@@ -9,11 +9,28 @@ are Streamlit pages that just want to show st.error().
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Optional
 
 import streamlit as st
 
 DEFAULT_MODEL = "gemini-3.6-flash"
+
+# Tried, in order, after DEFAULT_MODEL/the caller's chosen model — only on a
+# transient server-side failure (ServerError, e.g. 503 UNAVAILABLE / "high
+# demand"), never on a client-side one (bad API key, invalid request, etc.),
+# where every model would fail identically and retrying would just delay the
+# real error. Deduplicated against whatever model was actually requested at
+# call time, so the primary model never gets tried twice.
+FALLBACK_MODELS = ["gemini-3.0-pro", "gemini-2.5-flash"]
+
+# Attempts on a single model before moving to the next one, and the backoff
+# (seconds) between them — e.g. 2 retries = 3 total attempts per model, with
+# a 2s/4s pause in between. High-demand 503s are usually seconds-scale
+# blips, not sustained outages, so a short backoff clears most of them
+# without the wizard sitting through a whole extra model's response.
+MAX_RETRIES_PER_MODEL = 2
+RETRY_BACKOFF_SECONDS = (2, 4)
 
 # generate_conclusion's `language` param is one of these keys; the value is
 # what actually gets woven into the prompt below.
@@ -102,16 +119,35 @@ def generate_conclusion(
     Sends `data` (typically the Airtable payload plus each method's
     conclusion string) to Gemini and asks for a written interpretation, in
     `language` (a key of LANGUAGES; unrecognized values fall back to Dutch).
-    Returns {"ok": bool, "text": Optional[str], "error": Optional[str]}.
+
+    Retries `model` a few times on a transient ServerError (e.g. 503
+    UNAVAILABLE / "high demand" — see FALLBACK_MODELS/MAX_RETRIES_PER_MODEL),
+    then falls through FALLBACK_MODELS in order under the same policy. Any
+    other error (bad API key, invalid request, empty response, …) returns
+    immediately without retrying or falling back, since every model would
+    fail identically and retrying would just delay the real error.
+
+    Returns {"ok": bool, "text": Optional[str], "error": Optional[str],
+    "model_used": Optional[str], "model_requested": str}. model_requested
+    echoes back `model` (or its default); model_used is the model that
+    actually produced `text`, only non-None when it differs from `model`,
+    i.e. a fallback kicked in.
     """
     key = api_key or get_api_key()
     if not key:
-        return {"ok": False, "text": None, "error": "No Gemini API key configured."}
+        return {
+            "ok": False, "text": None, "error": "No Gemini API key configured.",
+            "model_used": None, "model_requested": model,
+        }
 
     try:
         from google import genai
+        from google.genai import errors as genai_errors
     except ImportError as e:
-        return {"ok": False, "text": None, "error": f"google-genai isn't installed: {e}"}
+        return {
+            "ok": False, "text": None, "error": f"google-genai isn't installed: {e}",
+            "model_used": None, "model_requested": model,
+        }
 
     language_name = LANGUAGES.get(language, LANGUAGES[DEFAULT_LANGUAGE])
     prompt_instructions = _PROMPT_TEMPLATE.format(
@@ -140,12 +176,48 @@ def generate_conclusion(
             "-----END CUSTOM_CODE-----"
         )
 
-    try:
-        client = genai.Client(api_key=key)
-        response = client.models.generate_content(model=model, contents=prompt)
-        text = (response.text or "").strip()
-        if not text:
-            return {"ok": False, "text": None, "error": "Gemini returned an empty response."}
-        return {"ok": True, "text": text, "error": None}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "text": None, "error": str(e)}
+    client = genai.Client(api_key=key)
+    # model first, then FALLBACK_MODELS in order, minus whichever of them
+    # happens to equal model itself (e.g. the caller already passed a
+    # fallback name directly) so nothing is ever attempted twice.
+    models_to_try = [model] + [m for m in FALLBACK_MODELS if m != model]
+
+    last_error = "Gemini request failed."
+    for candidate_model in models_to_try:
+        for attempt in range(MAX_RETRIES_PER_MODEL + 1):
+            try:
+                response = client.models.generate_content(model=candidate_model, contents=prompt)
+                text = (response.text or "").strip()
+                if not text:
+                    # Not a transient server error -- retrying/falling back
+                    # wouldn't help an empty-but-200 response -- but still
+                    # worth trying the next model in case it's a
+                    # candidate_model-specific quirk rather than the prompt.
+                    last_error = "Gemini returned an empty response."
+                    break
+                return {
+                    "ok": True, "text": text, "error": None,
+                    "model_used": candidate_model if candidate_model != model else None,
+                    "model_requested": model,
+                }
+            except genai_errors.ServerError as e:
+                # Transient (5xx, e.g. 503 "high demand") -- worth a retry on
+                # this same model before giving up on it.
+                last_error = str(e)
+                if attempt < MAX_RETRIES_PER_MODEL:
+                    time.sleep(RETRY_BACKOFF_SECONDS[attempt])
+                    continue
+                break  # retries exhausted on this model -- try the next one
+            except Exception as e:  # noqa: BLE001
+                # Not transient (bad request, auth, network, …) -- every
+                # model would fail identically, so fail now rather than
+                # burning through retries/fallbacks that can't help.
+                return {
+                    "ok": False, "text": None, "error": str(e),
+                    "model_used": None, "model_requested": model,
+                }
+
+    return {
+        "ok": False, "text": None, "error": last_error,
+        "model_used": None, "model_requested": model,
+    }
