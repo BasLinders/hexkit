@@ -74,6 +74,13 @@ PRETEST_KPI_OPTIONS = {
     "Add to cart": "add_to_cart",
 }
 
+# Which df_binomial column each PRETEST_KPI_OPTIONS value's conversions live
+# in — used by Step 2's own conversion-KPI picker (see _variant_from_row).
+CONVERSION_KPI_COLUMNS = {
+    "purchase": "users_with_transaction",
+    "add_to_cart": "add_to_cart",
+}
+
 
 def _monday_on_or_before(d: date) -> date:
     return d - timedelta(days=d.weekday())
@@ -326,7 +333,11 @@ def _render_stage_fetch():
             post_exposure_filter=True,
             kpi_transactions=True,
             kpi_aov=True,
-            kpi_add_to_cart=False,
+            # Fetched unconditionally (not gated on a Step 1 choice) so
+            # Step 2's conversion-KPI picker can offer it without a second
+            # round-trip to BigQuery — it's the same underlying events scan,
+            # just one more CASE-WHEN column on it.
+            kpi_add_to_cart=True,
             kpi_ideal=False,
             kpi_device_split=False,
             kpi_login=False,
@@ -493,12 +504,12 @@ def _render_stage_fetch():
 # Step 2 — Choose analysis method(s) and settings
 # ---------------------------------------------------------------------------
 
-def _variant_from_row(row, label: str) -> VariantData:
+def _variant_from_row(row, label: str, conversion_column: str) -> VariantData:
     aov = row["average_order_value"]
     return VariantData(
         label=label,
         visitors=int(row["visitors"]),
-        conversions=int(row["users_with_transaction"]),
+        conversions=int(row[conversion_column]),
         aov=float(aov) if pd.notna(aov) else 0.0,
     )
 
@@ -526,8 +537,33 @@ def _render_stage_configure():
 
     control = variation = None
     if df_binomial is not None:
-        control = _variant_from_row(df_binomial[df_binomial["experience_variant_label"] == "A"].iloc[0], "Control")
-        variation = _variant_from_row(df_binomial[df_binomial["experience_variant_label"] == "B"].iloc[0], "Variation")
+        # Only offer KPIs this df_binomial actually has a column for — an
+        # older cached fetch from before a given KPI was added here won't
+        # have it, and reading a missing column would crash rather than
+        # just narrowing the choice.
+        kpi_labels = [
+            label for label in PRETEST_KPI_OPTIONS
+            if CONVERSION_KPI_COLUMNS[PRETEST_KPI_OPTIONS[label]] in df_binomial.columns
+        ]
+        if not kpi_labels:
+            kpi_labels = ["Transactions (purchases)"]
+        conversion_kpi_choice = st.selectbox(
+            "Conversion KPI",
+            options=kpi_labels,
+            key="auto_conversion_kpi",
+            help="Which event this experiment's Binomial/Frequentist/Bayesian "
+                 "analysis below should treat as a conversion.",
+        )
+        if len(kpi_labels) < len(PRETEST_KPI_OPTIONS):
+            st.caption("Only KPIs fetched in Step 1 are selectable here — re-fetch to add more.")
+        conversion_column = CONVERSION_KPI_COLUMNS[PRETEST_KPI_OPTIONS[conversion_kpi_choice]]
+
+        control = _variant_from_row(
+            df_binomial[df_binomial["experience_variant_label"] == "A"].iloc[0], "Control", conversion_column,
+        )
+        variation = _variant_from_row(
+            df_binomial[df_binomial["experience_variant_label"] == "B"].iloc[0], "Variation", conversion_column,
+        )
 
         col1, col2 = st.columns(2)
         with col1:
@@ -1118,9 +1154,6 @@ def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
             st.error(f"Airtable lookup failed: {search_result['error']}")
 
     matches = st.session_state.get(f"{lookup_key}_results", [])
-    if not matches:
-        return table["fields"], None, "Search above to find this experiment's Airtable record."
-
     hypothesis_field = _guess_hypothesis_field(table["fields"])
 
     def _match_label(r: dict) -> str:
@@ -1135,11 +1168,17 @@ def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
     # term the user typed on purpose rather than an automatic guess.
     default_match = next(
         (r for r in matches if hypothesis_field and str(r["fields"].get(hypothesis_field, "")).strip()),
-        matches[0],
+        matches[0] if matches else None,
     )
-    options = [_match_label(r) for r in matches]
     if len(matches) > 1:
         st.info(f"{len(matches)} records matched — confirm which one this experiment's result belongs to.")
+
+    # "+ Create new record" is always on offer alongside whatever matched —
+    # covers the experiment not being in Airtable at all yet, not just this
+    # particular search term failing to find it. Mirrors Step 5's own
+    # "Record to update" picker.
+    create_option = "+ Create new record"
+    options = [create_option] + [_match_label(r) for r in matches]
     # Scoped per base/table/search-term, not a bare key — an unscoped key
     # would keep the previous pick's value in session_state when the matched
     # candidates change (a different base/table, or a new search term here).
@@ -1150,12 +1189,39 @@ def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
     # Step 5's "existing record to update", risking a result landing on the
     # wrong experiment's record.
     choice_key = f"{lookup_key}_choice_{search_term.strip()}"
+    default_index = 1 + matches.index(default_match) if matches else 0
     choice = st.selectbox(
-        "Matched record", options=options,
-        **({} if choice_key in st.session_state else {"index": matches.index(default_match)}),
+        "Record", options=options,
+        **({} if choice_key in st.session_state else {"index": default_index}),
         key=choice_key,
     )
-    matched = matches[options.index(choice)]
+
+    if choice == create_option:
+        st.caption(
+            "No record picked — create a blank one now (add its Hypothesis in "
+            "Airtable afterward), or search above for an existing match."
+        )
+        if st.button("➕ Create record in Airtable", key=f"{lookup_key}_create_btn"):
+            with st.spinner("Creating record…"):
+                create_result = push_record(base_id, table["id"], api_key, {})
+            if create_result["ok"]:
+                # Seed the results cache with the freshly created record,
+                # same shape search_records returns, so it shows up
+                # pre-selected on rerun instead of making the user search for
+                # what was just made.
+                st.session_state[f"{lookup_key}_results"] = [
+                    {"id": create_result["record_id"], "fields": {}}
+                ]
+                st.session_state.pop(choice_key, None)
+                st.rerun()
+            else:
+                st.error(f"Couldn't create record: {create_result['error']}")
+        return table["fields"], None, (
+            "No Airtable record picked yet — search above for an existing "
+            "match, or create a new record."
+        )
+
+    matched = matches[options.index(choice) - 1]
     message = f"Matched Airtable record: {choice}."
 
     resolved["record_id"] = matched["id"]
@@ -1253,13 +1319,21 @@ def _render_stage_ai():
                 "can't be generated without it." if record_fields is not None else ""
             )
             st.warning(f"{lookup_message}{note}")
+        language_labels = list(gemini_client.LANGUAGES.values())
+        language_keys = list(gemini_client.LANGUAGES.keys())
+        default_language_idx = language_keys.index(gemini_client.DEFAULT_LANGUAGE)
+        language_choice = st.radio(
+            "Conclusion language", options=language_labels,
+            index=default_language_idx, horizontal=True, key="auto_ai_language",
+        )
         generate_clicked = st.button(
             "🤖 Generate AI conclusion", type="primary",
             disabled=not hypothesis_ok, key="auto_generate_ai_btn",
         )
         if generate_clicked:
+            language = language_keys[language_labels.index(language_choice)]
             with st.spinner("Asking Gemini…"):
-                result = gemini_client.generate_conclusion(ai_input)
+                result = gemini_client.generate_conclusion(ai_input, language=language)
             if result["ok"]:
                 st.session_state["auto_ai_conclusion"] = result["text"]
             else:
@@ -1448,96 +1522,130 @@ def _render_stage_send():
             for tab, table in zip(st.tabs(selected_names), selected_tables):
                 with tab:
                     lookup_key = f"airtable_lookup_{base_id}_{table['id']}"
-
-                    # Pre-seed this exact (base, table)'s lookup widgets from
-                    # Step 4's already-resolved record — before they're
-                    # created below, so the user doesn't have to pick the ID
-                    # field or search again for something already found.
-                    # Only seeds keys that don't exist yet, so it never
-                    # clobbers a choice the user has since changed.
                     is_lookup_resolved_table = (
                         lookup_resolved.get("base_id") == base_id
                         and lookup_resolved.get("table_id") == table["id"]
                     )
-                    if is_lookup_resolved_table and lookup_resolved.get("id_field"):
-                        idfield_key = f"{lookup_key}_idfield"
-                        if idfield_key not in st.session_state:
-                            st.session_state[idfield_key] = lookup_resolved["id_field"]
-                        if lookup_resolved.get("record_id"):
-                            term_key = f"{lookup_key}_term"
-                            if term_key not in st.session_state and lookup_resolved.get("search_term"):
-                                st.session_state[term_key] = lookup_resolved["search_term"]
-                            results_key = f"{lookup_key}_results"
-                            if results_key not in st.session_state:
-                                st.session_state[results_key] = [{
-                                    "id": lookup_resolved["record_id"],
-                                    "fields": lookup_resolved.get("record_fields") or {},
-                                }]
-                            choice_key = f"{lookup_key}_choice"
-                            if choice_key not in st.session_state:
-                                record_fields = lookup_resolved.get("record_fields") or {}
-                                id_value = record_fields.get(lookup_resolved["id_field"], "(blank)")
-                                st.session_state[choice_key] = (
-                                    f"{id_value}  ·  …{lookup_resolved['record_id'][-6:]}"
-                                )
+                    resolved_has_record = is_lookup_resolved_table and bool(lookup_resolved.get("record_id"))
 
                     st.markdown("**Existing record**")
-                    id_field_options = ["— Always create new —"] + table["fields"]
-                    idfield_key = f"{lookup_key}_idfield"
-                    # index= only applies the very first time this key is
-                    # rendered — passing it alongside a key that's already in
-                    # session_state (e.g. pre-seeded from Step 4 above) is
-                    # redundant and Streamlit warns about it, so omit it once
-                    # the key already has a value.
-                    default_id_field = _guess_id_field(table["fields"])
-                    default_idx = (
-                        id_field_options.index(default_id_field)
-                        if default_id_field in id_field_options else 0
-                    )
-                    id_field = st.selectbox(
-                        "Field to search on (e.g. an experiment ID Airtable generated)",
-                        options=id_field_options,
-                        **({} if idfield_key in st.session_state else {"index": default_idx}),
-                        key=idfield_key,
-                    )
 
                     mode = "create"
                     record_id: Optional[str] = None
-                    if id_field != "— Always create new —":
-                        search_col, btn_col = st.columns([3, 1])
-                        with search_col:
-                            search_term = st.text_input(
-                                "Search for existing record (matches part of the ID)",
-                                key=f"{lookup_key}_term",
-                            )
-                        with btn_col:
-                            st.write("")
-                            search_clicked = st.button("🔍 Search", key=f"{lookup_key}_btn")
+                    id_field: Optional[str] = None
+                    # Whether the full search-and-pick UI below still needs
+                    # rendering. Skipped when Step 4 already resolved a
+                    # record for this exact (base, table) — re-asking the
+                    # same search here would just repeat a question the user
+                    # already answered — unless they explicitly want to
+                    # target a different record than the one used for the
+                    # Hypothesis check.
+                    show_manual_ui = True
 
-                        if search_clicked and search_term.strip():
-                            with st.spinner("Searching…"):
-                                result = search_records(
-                                    base_id, table["id"], api_key, id_field, search_term.strip(),
-                                )
-                            if result["ok"]:
-                                st.session_state[f"{lookup_key}_results"] = result["records"]
-                            else:
-                                st.error(f"Search failed: {result['error']}")
-
-                        matches = st.session_state.get(f"{lookup_key}_results", [])
-                        match_options = ["+ Create new record"] + [
-                            f"{r['fields'].get(id_field, '(blank)')}  ·  …{r['id'][-6:]}"
-                            for r in matches
-                        ]
-                        choice = st.selectbox(
-                            "Record to update", options=match_options,
-                            key=f"{lookup_key}_choice",
-                            help="Pick a match to append this result to it, or keep "
-                                 "'Create new record' to add a new row instead.",
+                    if resolved_has_record:
+                        id_field = lookup_resolved["id_field"]
+                        record_id = lookup_resolved["record_id"]
+                        record_fields = lookup_resolved.get("record_fields") or {}
+                        id_value = record_fields.get(id_field, "(blank)")
+                        st.success(
+                            f"Using the record found in Step 4 — **{id_value}** "
+                            f"(…{record_id[-6:]})."
                         )
-                        if choice != "+ Create new record":
-                            record_id = matches[match_options.index(choice) - 1]["id"]
-                            mode = "update"
+                        mode = "update"
+                        show_manual_ui = st.checkbox(
+                            "Search for a different record instead",
+                            key=f"{lookup_key}_override_step4",
+                        )
+                        if show_manual_ui:
+                            mode = "create"
+                            record_id = None
+
+                    if show_manual_ui:
+                        # Pre-seed this exact (base, table)'s lookup widgets
+                        # from Step 4's already-resolved record — before
+                        # they're created below, so the user doesn't have to
+                        # pick the ID field or search again for something
+                        # already found. Only seeds keys that don't exist
+                        # yet, so it never clobbers a choice the user has
+                        # since changed. A no-op unless resolved_has_record
+                        # (and the box above got checked), since
+                        # is_lookup_resolved_table is otherwise False.
+                        if is_lookup_resolved_table and lookup_resolved.get("id_field"):
+                            idfield_key = f"{lookup_key}_idfield"
+                            if idfield_key not in st.session_state:
+                                st.session_state[idfield_key] = lookup_resolved["id_field"]
+                            if lookup_resolved.get("record_id"):
+                                term_key = f"{lookup_key}_term"
+                                if term_key not in st.session_state and lookup_resolved.get("search_term"):
+                                    st.session_state[term_key] = lookup_resolved["search_term"]
+                                results_key = f"{lookup_key}_results"
+                                if results_key not in st.session_state:
+                                    st.session_state[results_key] = [{
+                                        "id": lookup_resolved["record_id"],
+                                        "fields": lookup_resolved.get("record_fields") or {},
+                                    }]
+                                choice_key = f"{lookup_key}_choice"
+                                if choice_key not in st.session_state:
+                                    record_fields = lookup_resolved.get("record_fields") or {}
+                                    id_value = record_fields.get(lookup_resolved["id_field"], "(blank)")
+                                    st.session_state[choice_key] = (
+                                        f"{id_value}  ·  …{lookup_resolved['record_id'][-6:]}"
+                                    )
+
+                        id_field_options = ["— Always create new —"] + table["fields"]
+                        idfield_key = f"{lookup_key}_idfield"
+                        # index= only applies the very first time this key is
+                        # rendered — passing it alongside a key that's already
+                        # in session_state (e.g. pre-seeded from Step 4 above)
+                        # is redundant and Streamlit warns about it, so omit
+                        # it once the key already has a value.
+                        default_id_field = _guess_id_field(table["fields"])
+                        default_idx = (
+                            id_field_options.index(default_id_field)
+                            if default_id_field in id_field_options else 0
+                        )
+                        id_field = st.selectbox(
+                            "Field to search on (e.g. an experiment ID Airtable generated)",
+                            options=id_field_options,
+                            **({} if idfield_key in st.session_state else {"index": default_idx}),
+                            key=idfield_key,
+                        )
+
+                        if id_field != "— Always create new —":
+                            search_col, btn_col = st.columns([3, 1])
+                            with search_col:
+                                search_term = st.text_input(
+                                    "Search for existing record (matches part of the ID)",
+                                    key=f"{lookup_key}_term",
+                                )
+                            with btn_col:
+                                st.write("")
+                                search_clicked = st.button("🔍 Search", key=f"{lookup_key}_btn")
+
+                            if search_clicked and search_term.strip():
+                                with st.spinner("Searching…"):
+                                    result = search_records(
+                                        base_id, table["id"], api_key, id_field, search_term.strip(),
+                                    )
+                                if result["ok"]:
+                                    st.session_state[f"{lookup_key}_results"] = result["records"]
+                                else:
+                                    st.error(f"Search failed: {result['error']}")
+
+                            matches = st.session_state.get(f"{lookup_key}_results", [])
+                            match_options = ["+ Create new record"] + [
+                                f"{r['fields'].get(id_field, '(blank)')}  ·  …{r['id'][-6:]}"
+                                for r in matches
+                            ]
+                            choice = st.selectbox(
+                                "Record to update", options=match_options,
+                                key=f"{lookup_key}_choice",
+                                help="Pick a match to append this result to it, or keep "
+                                     "'Create new record' to add a new row instead.",
+                            )
+                            if choice != "+ Create new record":
+                                record_id = matches[match_options.index(choice) - 1]["id"]
+                                mode = "update"
 
                     description = ""
                     if mode == "create":
