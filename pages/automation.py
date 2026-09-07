@@ -1050,15 +1050,17 @@ def _render_lookup_base_table_picker(api_key: str) -> tuple[Optional[str], Optio
 
 def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
     """
-    Searches the user-picked Airtable base/table (see
-    _render_lookup_base_table_picker) for the record matching this
-    experiment (Step 1's exp_prefix, via the same id-field guess the Send
-    step uses). Shared by the Hypothesis gate (required, blocks generation)
-    and the Custom Code lookup (optional context for Gemini) so both reuse
-    one round-trip.
+    Same manual search-and-pick flow Step 5 uses for its "Existing record"
+    lookup, just one step earlier: pick which field identifies records, type
+    a search term, and confirm a match. Manual rather than automatic off
+    Step 1's numeric platform ID, because the field that actually identifies
+    a record here (e.g. an autonumber 'Experiment ID') doesn't reliably hold
+    that same value — there's no reliable term to search on without the user
+    supplying one. Shared by the Hypothesis gate (required, blocks
+    generation) and the Custom Code lookup (optional context for Gemini) so
+    both reuse one search.
     Returns (table_field_names, matched_record_fields_or_None, message).
     """
-    exp_prefix = st.session_state.get("auto_exp_prefix")
     creds = get_credentials()
     api_key = creds["api_key"]
 
@@ -1066,12 +1068,15 @@ def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
         return [], None, (
             "No Airtable token configured (AIRTABLE_API_KEY) — can't look up the experiment record."
         )
-    if not exp_prefix:
-        return [], None, "No experiment ID from Step 1 to look up."
 
     base_id, table = _render_lookup_base_table_picker(api_key)
     if table is None:
         return [], None, "Pick a base and table above to look up the experiment record."
+
+    if not table["fields"]:
+        return table["fields"], None, "Selected table has no fields."
+
+    lookup_key = f"auto_ai_lookup_{base_id}_{table['id']}"
 
     # Persisted so Step 5 can pre-select this same base/table (and, once a
     # record is found below, that same record) instead of making the user
@@ -1079,74 +1084,83 @@ def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
     resolved = {"base_id": base_id, "table_id": table["id"], "table_name": table["name"]}
     st.session_state["auto_lookup_resolved"] = resolved
 
-    id_field = _guess_id_field(table["fields"])
-    if not id_field:
-        return table["fields"], None, (
-            "Couldn't find an 'Experiment ID' field on the selected table — "
-            "add one (a numeric field matching Step 1's experiment ID) so this "
-            "experiment's record can be looked up."
-        )
+    idfield_key = f"{lookup_key}_idfield"
+    default_id_field = _guess_id_field(table["fields"])
+    default_idx = (
+        table["fields"].index(default_id_field)
+        if default_id_field in table["fields"] else 0
+    )
+    id_field = st.selectbox(
+        "Field to search on (e.g. Airtable's own 'Experiment ID')",
+        options=table["fields"],
+        **({} if idfield_key in st.session_state else {"index": default_idx}),
+        key=idfield_key,
+    )
     resolved["id_field"] = id_field
 
-    search_result = search_records(base_id, table["id"], api_key, id_field, exp_prefix)
-    if not search_result["ok"]:
-        return table["fields"], None, f"Airtable lookup failed: {search_result['error']}"
+    search_col, btn_col = st.columns([3, 1])
+    with search_col:
+        search_term = st.text_input(
+            "Search for this experiment's record (matches part of the value)",
+            key=f"{lookup_key}_term",
+        )
+    with btn_col:
+        st.write("")
+        search_clicked = st.button("🔍 Search", key=f"{lookup_key}_btn")
 
-    matches = search_result["records"]
+    if search_clicked and search_term.strip():
+        with st.spinner("Searching…"):
+            search_result = search_records(base_id, table["id"], api_key, id_field, search_term.strip())
+        if search_result["ok"]:
+            st.session_state[f"{lookup_key}_results"] = search_result["records"]
+        else:
+            st.session_state[f"{lookup_key}_results"] = []
+            st.error(f"Airtable lookup failed: {search_result['error']}")
+
+    matches = st.session_state.get(f"{lookup_key}_results", [])
     if not matches:
-        return table["fields"], None, f"No Airtable record found yet for experiment '{exp_prefix}'."
+        return table["fields"], None, "Search above to find this experiment's Airtable record."
 
     hypothesis_field = _guess_hypothesis_field(table["fields"])
 
-    if len(matches) > 1:
-        # search_records matches by substring (see its own docstring), so more
-        # than one record legitimately containing exp_prefix is a real
-        # possibility (e.g. "104" also matching "1041..."), not just a rare
-        # edge case. Silently picking one on the user's behalf risked
-        # attaching this result — and the AI conclusion — to the wrong
-        # experiment's record with no indication anything was ambiguous.
-        # Surface every candidate and let the user confirm, defaulting to the
-        # same "prefer a match with a filled Hypothesis" pick as before.
-        def _match_label(r: dict) -> str:
-            id_value = r["fields"].get(id_field, "(blank)")
-            has_hyp = bool(hypothesis_field and str(r["fields"].get(hypothesis_field, "")).strip())
-            marker = "  ·  ✓ has hypothesis" if has_hyp else ""
-            return f"{id_value}  ·  …{r['id'][-6:]}{marker}"
+    def _match_label(r: dict) -> str:
+        id_value = r["fields"].get(id_field, "(blank)")
+        has_hyp = bool(hypothesis_field and str(r["fields"].get(hypothesis_field, "")).strip())
+        marker = "  ·  ✓ has hypothesis" if has_hyp else ""
+        return f"{id_value}  ·  …{r['id'][-6:]}{marker}"
 
-        default_match = next(
-            (r for r in matches if hypothesis_field and str(r["fields"].get(hypothesis_field, "")).strip()),
-            matches[0],
-        )
-        options = [_match_label(r) for r in matches]
-        st.warning(
-            f"{len(matches)} Airtable records matched '{exp_prefix}' on **{id_field}** — "
-            "confirm which one this experiment's result actually belongs to."
-        )
-        # Scoped per base/table/search-term, not a bare key — an unscoped key
-        # would keep the previous pick's value in session_state when the
-        # matched candidates change (a different base/table, or a second
-        # experiment's exp_prefix in the same session). Streamlit doesn't
-        # error when that stored value no longer matches the new options; it
-        # silently resets to the new list's first entry with no indication
-        # anything changed, discarding the "prefer a filled Hypothesis"
-        # default -- and that silently-reset pick is what pre-seeds Step 5's
-        # "existing record to update", risking a result landing on the wrong
-        # experiment's record.
-        choice_key = f"auto_lookup_record_choice_{base_id}_{table['id']}_{exp_prefix}"
-        choice = st.selectbox(
-            "Matched record", options=options,
-            index=matches.index(default_match),
-            key=choice_key,
-        )
-        matched = matches[options.index(choice)]
-        message = f"Matched Airtable record for '{exp_prefix}' ({len(matches)} candidates — confirm above)."
-    else:
-        matched = matches[0]
-        message = f"Matched Airtable record for '{exp_prefix}'."
+    # Defaults to a match with a filled Hypothesis when more than one comes
+    # back — same tie-break as before, just no longer gated behind a
+    # multiple-matches warning, since every result here now comes from a
+    # term the user typed on purpose rather than an automatic guess.
+    default_match = next(
+        (r for r in matches if hypothesis_field and str(r["fields"].get(hypothesis_field, "")).strip()),
+        matches[0],
+    )
+    options = [_match_label(r) for r in matches]
+    if len(matches) > 1:
+        st.info(f"{len(matches)} records matched — confirm which one this experiment's result belongs to.")
+    # Scoped per base/table/search-term, not a bare key — an unscoped key
+    # would keep the previous pick's value in session_state when the matched
+    # candidates change (a different base/table, or a new search term here).
+    # Streamlit doesn't error when that stored value no longer matches the
+    # new options; it silently resets to the new list's first entry with no
+    # indication anything changed, discarding the "prefer a filled
+    # Hypothesis" default -- and that silently-reset pick is what pre-seeds
+    # Step 5's "existing record to update", risking a result landing on the
+    # wrong experiment's record.
+    choice_key = f"{lookup_key}_choice_{search_term.strip()}"
+    choice = st.selectbox(
+        "Matched record", options=options,
+        **({} if choice_key in st.session_state else {"index": matches.index(default_match)}),
+        key=choice_key,
+    )
+    matched = matches[options.index(choice)]
+    message = f"Matched Airtable record: {choice}."
 
     resolved["record_id"] = matched["id"]
     resolved["record_fields"] = matched["fields"]
-    resolved["search_term"] = exp_prefix
+    resolved["search_term"] = search_term.strip()
     return table["fields"], matched["fields"], message
 
 
@@ -1230,10 +1244,15 @@ def _render_stage_ai():
         )
     else:
         if not hypothesis_ok:
-            st.warning(
-                f"{lookup_message} Document the Hypothesis in Airtable first — "
-                "an AI conclusion can't be generated without it."
+            # Only append the "document it first" nudge once a record is
+            # actually in hand — before that, lookup_message is itself the
+            # instruction (pick a match, or search above), and pairing it
+            # with "document the Hypothesis first" reads as contradictory.
+            note = (
+                " Document the Hypothesis in Airtable first — an AI conclusion "
+                "can't be generated without it." if record_fields is not None else ""
             )
+            st.warning(f"{lookup_message}{note}")
         generate_clicked = st.button(
             "🤖 Generate AI conclusion", type="primary",
             disabled=not hypothesis_ok, key="auto_generate_ai_btn",
