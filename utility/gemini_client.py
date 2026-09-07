@@ -22,7 +22,7 @@ DEFAULT_MODEL = "gemini-flash-latest"
 # where every model would fail identically and retrying would just delay the
 # real error. Deduplicated against whatever model was actually requested at
 # call time, so the primary model never gets tried twice.
-FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-3.1-pro-preview"]
+FALLBACK_MODELS = ["gemini-pro-latest", "gemini-3.7-flash", "gemini-3.8-flash"]
 
 # Attempts on a single model before moving to the next one, and the backoff
 # (seconds) between them — e.g. 2 retries = 3 total attempts per model, with
