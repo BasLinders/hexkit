@@ -94,7 +94,12 @@ def _pretest_baseline_range(experiment_start: date, weeks_before: int) -> tuple[
 # normalized (spaces/punctuation stripped) exact match, then a normalized
 # substring match — so naming variants (incl. Dutch, since these bases
 # aren't necessarily English) still resolve without an exact hint hit.
-_ID_FIELD_HINTS = ("experiment id", "experiment_id", "test id", "test_id", "id")
+# Deliberately excludes a bare "id" hint: guess_field_by_hints' last-resort
+# substring pass would then match *any* field whose name merely contains
+# "id" — e.g. a platform-specific "Convert-ID" field that stores a
+# differently-formatted value — and silently search on that instead of the
+# actual numeric "Experiment ID" field this lookup needs.
+_ID_FIELD_HINTS = ("experiment id", "experiment_id", "test id", "test_id")
 
 
 def _guess_id_field(fields: list[str]) -> Optional[str]:
@@ -1076,7 +1081,11 @@ def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
 
     id_field = _guess_id_field(table["fields"])
     if not id_field:
-        return table["fields"], None, "Couldn't find an ID field on the selected table."
+        return table["fields"], None, (
+            "Couldn't find an 'Experiment ID' field on the selected table — "
+            "add one (a numeric field matching Step 1's experiment ID) so this "
+            "experiment's record can be looked up."
+        )
     resolved["id_field"] = id_field
 
     search_result = search_records(base_id, table["id"], api_key, id_field, exp_prefix)
