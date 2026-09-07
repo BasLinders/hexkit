@@ -74,11 +74,20 @@ PRETEST_KPI_OPTIONS = {
     "Add to cart": "add_to_cart",
 }
 
-# Which df_binomial column each PRETEST_KPI_OPTIONS value's conversions live
-# in — used by Step 2's own conversion-KPI picker (see _variant_from_row).
+# Step 2's own conversion-KPI picker (see _variant_from_row) — same first two
+# options as the pre-test baseline's, plus a third for programs with no
+# ecommerce KPIs at all (e.g. lead-gen), which count a user-typed custom GA4
+# event instead (see Step 1's "Custom KPI event" input and
+# BinomialParams.custom_kpi_event). "Other" only ever appears as selectable
+# once that event was actually set and fetched — see CONVERSION_KPI_COLUMNS.
+CONVERSION_KPI_OPTIONS = {**PRETEST_KPI_OPTIONS, "Other": "custom"}
+
+# Which df_binomial column each CONVERSION_KPI_OPTIONS value's conversions
+# live in.
 CONVERSION_KPI_COLUMNS = {
     "purchase": "users_with_transaction",
     "add_to_cart": "add_to_cart",
+    "custom": "custom_kpi_conversions",
 }
 
 
@@ -296,6 +305,18 @@ def _render_stage_fetch():
             icon="💡",
         )
 
+    custom_kpi_event = ""
+    if want_binomial:
+        custom_kpi_event = st.text_input(
+            "Custom KPI event (optional)",
+            key="autofetch_custom_kpi_event",
+            placeholder="e.g. generate_lead, form_submit",
+            help="For programs with no ecommerce KPIs at all (e.g. lead-gen) — "
+                 "counts users who fired this exact GA4 event name as conversions. "
+                 "Fetched alongside Transactions/Add to cart at no extra scan cost, "
+                 "and selectable as 'Other' in Step 2.",
+        ).strip()
+
     st.divider()
     param_key, match_strategy, exp_prefix, experiments = render_variant_inputs(
         project, dataset, start_date, end_date,
@@ -342,6 +363,7 @@ def _render_stage_fetch():
             kpi_device_split=False,
             kpi_login=False,
             kpi_create_account=False,
+            custom_kpi_event=custom_kpi_event or None,
             filter_type=filter_type,
             filter_value=filter_value,
         )
@@ -419,6 +441,10 @@ def _render_stage_fetch():
         st.session_state["auto_df_binomial"] = df_binomial
         st.session_state["auto_df_continuous"] = df_continuous
         st.session_state["auto_exp_prefix"] = exp_prefix
+        # Only meaningful alongside df_binomial (custom_kpi_event is
+        # Binomial-only) — labels Step 2's "Other" KPI option with the actual
+        # event name instead of just "Other".
+        st.session_state["auto_custom_kpi_event"] = custom_kpi_event if want_binomial else ""
 
         # Computed from the local start_date/end_date (reliable right here,
         # right after render_date_range) and stashed under an auto_-prefixed
@@ -537,13 +563,20 @@ def _render_stage_configure():
 
     control = variation = None
     if df_binomial is not None:
+        # "Other" labeled with the actual event name once one was set in
+        # Step 1, rather than a bare, unhelpful "Other".
+        kpi_options = dict(CONVERSION_KPI_OPTIONS)
+        custom_kpi_event_name = st.session_state.get("auto_custom_kpi_event", "")
+        if custom_kpi_event_name:
+            kpi_options[f"Other ({custom_kpi_event_name})"] = kpi_options.pop("Other")
+
         # Only offer KPIs this df_binomial actually has a column for — an
-        # older cached fetch from before a given KPI was added here won't
-        # have it, and reading a missing column would crash rather than
-        # just narrowing the choice.
+        # older cached fetch from before a given KPI was added here (or one
+        # fetched without a custom KPI event set) won't have it, and reading
+        # a missing column would crash rather than just narrowing the choice.
         kpi_labels = [
-            label for label in PRETEST_KPI_OPTIONS
-            if CONVERSION_KPI_COLUMNS[PRETEST_KPI_OPTIONS[label]] in df_binomial.columns
+            label for label in kpi_options
+            if CONVERSION_KPI_COLUMNS[kpi_options[label]] in df_binomial.columns
         ]
         if not kpi_labels:
             kpi_labels = ["Transactions (purchases)"]
@@ -552,11 +585,13 @@ def _render_stage_configure():
             options=kpi_labels,
             key="auto_conversion_kpi",
             help="Which event this experiment's Binomial/Frequentist/Bayesian "
-                 "analysis below should treat as a conversion.",
+                 "analysis below should treat as a conversion. 'Other' only "
+                 "appears once a custom KPI event was set and fetched in Step 1 "
+                 "— for programs with no ecommerce KPIs at all, e.g. lead-gen.",
         )
-        if len(kpi_labels) < len(PRETEST_KPI_OPTIONS):
+        if len(kpi_labels) < len(kpi_options):
             st.caption("Only KPIs fetched in Step 1 are selectable here — re-fetch to add more.")
-        conversion_column = CONVERSION_KPI_COLUMNS[PRETEST_KPI_OPTIONS[conversion_kpi_choice]]
+        conversion_column = CONVERSION_KPI_COLUMNS[kpi_options[conversion_kpi_choice]]
 
         control = _variant_from_row(
             df_binomial[df_binomial["experience_variant_label"] == "A"].iloc[0], "Control", conversion_column,

@@ -81,6 +81,12 @@ class BinomialParams:
     # KPI toggles — cost-warning group (adds page_view scan)
     kpi_login: bool = False
     kpi_create_account: bool = False
+    # Free-form conversion event for programs with no ecommerce KPIs at all
+    # (e.g. lead-gen) — any user firing this exact GA4 event name counts as a
+    # conversion, alongside whichever of the above are also enabled. None/""
+    # disables it. Zero-cost, same as add_to_cart: event_name is already
+    # selected in shared_scan, so this needs no extra column.
+    custom_kpi_event: Optional[str] = None
     # Same semantics as BaselineParams.filter_type/filter_value — scopes the
     # experiment population to users who visited a matching page or fired a
     # specific event, at any point in the date range.
@@ -1048,6 +1054,30 @@ add_to_cart_data AS (
 """
         optional_joins += "  LEFT JOIN add_to_cart_data atc ON vd.variant_user_pseudo_id = atc.atc_user_pseudo_id\n"
 
+    if p.custom_kpi_event:
+        custom_event_escaped = p.custom_kpi_event.replace("\\", "\\\\").replace("'", "\\'")
+        if p.post_exposure_filter:
+            optional_ctes += f"""
+custom_kpi_data AS (
+  SELECT e.user_pseudo_id AS custom_kpi_user_pseudo_id
+  FROM shared_scan e
+  INNER JOIN variant_data vd ON e.user_pseudo_id = vd.variant_user_pseudo_id
+  WHERE e.event_name = '{custom_event_escaped}'
+    AND e.event_timestamp >= vd.first_exposure_timestamp
+  GROUP BY e.user_pseudo_id
+),
+"""
+        else:
+            optional_ctes += f"""
+custom_kpi_data AS (
+  SELECT user_pseudo_id AS custom_kpi_user_pseudo_id
+  FROM shared_scan
+  WHERE event_name = '{custom_event_escaped}'
+  GROUP BY user_pseudo_id
+),
+"""
+        optional_joins += "  LEFT JOIN custom_kpi_data ck ON vd.variant_user_pseudo_id = ck.custom_kpi_user_pseudo_id\n"
+
     if p.kpi_login:
         if p.post_exposure_filter:
             optional_ctes += f"""
@@ -1147,6 +1177,10 @@ ideal_users AS (
         final_cols.append("    COALESCE(ld.has_logged_in, 0) AS has_logged_in")
     if p.kpi_create_account:
         final_cols.append("    COALESCE(cd.has_created_account, 0) AS has_created_account")
+    if p.custom_kpi_event:
+        final_cols.append(
+            "    CASE WHEN ck.custom_kpi_user_pseudo_id IS NOT NULL THEN 1 ELSE 0 END AS has_custom_conversion"
+        )
 
     final_select = ",\n".join(final_cols)
 
@@ -1181,6 +1215,8 @@ ideal_users AS (
         select_cols.append("  SUM(has_logged_in) AS login_page_visits")
     if p.kpi_create_account:
         select_cols.append("  SUM(has_created_account) AS account_creation_page_visits")
+    if p.custom_kpi_event:
+        select_cols.append("  SUM(has_custom_conversion) AS custom_kpi_conversions")
 
     select_block = ",\n".join(select_cols)
 
