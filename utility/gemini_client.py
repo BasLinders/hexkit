@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 import streamlit as st
 
-DEFAULT_MODEL = "gemini-3.6-flash"
+DEFAULT_MODEL = "gemini-flash-latest"
 
 # Tried, in order, after DEFAULT_MODEL/the caller's chosen model — only on a
 # transient server-side failure (ServerError, e.g. 503 UNAVAILABLE / "high
@@ -22,7 +22,7 @@ DEFAULT_MODEL = "gemini-3.6-flash"
 # where every model would fail identically and retrying would just delay the
 # real error. Deduplicated against whatever model was actually requested at
 # call time, so the primary model never gets tried twice.
-FALLBACK_MODELS = ["gemini-3.0-pro", "gemini-2.5-flash"]
+FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-3.8-flash", "gemini-3.1-pro-preview"]
 
 # Attempts on a single model before moving to the next one, and the backoff
 # (seconds) between them — e.g. 2 retries = 3 total attempts per model, with
