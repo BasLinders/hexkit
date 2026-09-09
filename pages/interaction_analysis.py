@@ -69,10 +69,19 @@ class InteractionEngine:
 
         def _combo_label(row: pd.Series) -> str:
             return " / ".join(f"{col}={row[col]}" for col in test_cols)
-
-        zero_rate_rows = df[df["conversions"] == 0]
-        full_rate_rows = df[df["conversions"] == df["visitors"]]
-
+    
+        no_traffic_rows = df[df["visitors"] == 0]
+        traffic_df = df[df["visitors"] > 0]
+    
+        zero_rate_rows = traffic_df[traffic_df["conversions"] == 0]
+        full_rate_rows = traffic_df[traffic_df["conversions"] == traffic_df["visitors"]]
+    
+        if not no_traffic_rows.empty:
+            combos = no_traffic_rows.apply(_combo_label, axis=1).tolist()
+            messages.append(
+                f"The following segment(s) have **no visitors** and will be excluded "
+                f"from separation checks: {', '.join(combos)}."
+            )
         if not zero_rate_rows.empty:
             combos = zero_rate_rows.apply(_combo_label, axis=1).tolist()
             messages.append(
