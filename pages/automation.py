@@ -1265,6 +1265,33 @@ def _lookup_experiment_record() -> tuple[list[str], Optional[dict], str]:
     return table["fields"], matched["fields"], message
 
 
+# Friendly, non-raw headlines for gemini_client.generate_conclusion's
+# "error_kind" — the raw exception text (often a large JSON blob, e.g. a 429
+# quota error) goes in the "Technical details" expander instead, never
+# directly into st.error(). None is the catch-all for an unrecognized/missing
+# error_kind.
+_GEMINI_ERROR_MESSAGES = {
+    "not_configured": "No Gemini API key is configured.",
+    "sdk_missing": "The Gemini SDK isn't installed in this environment.",
+    "quota_exhausted": (
+        "Gemini is out of quota on every model this tool tries — usually a "
+        "free-tier limit on the API key's Google Cloud project. Try again "
+        "later, or enable billing on that project."
+    ),
+    "server_busy": (
+        "Gemini is experiencing high demand right now and didn't respond in "
+        "time. Please try again in a few minutes."
+    ),
+    "empty_response": "Gemini returned an empty response. Please try again.",
+    "client_error": (
+        "Gemini rejected the request — check the Gemini API key in "
+        "Streamlit secrets."
+    ),
+    "other": "Something went wrong while contacting Gemini. Please try again.",
+    None: "Something went wrong while contacting Gemini. Please try again.",
+}
+
+
 def _render_stage_ai():
     payload = st.session_state.get("auto_payload")
     results = st.session_state.get("auto_results") or {}
@@ -1367,8 +1394,19 @@ def _render_stage_ai():
         )
         if generate_clicked:
             language = language_keys[language_labels.index(language_choice)]
-            with st.spinner("Asking Gemini… (retries automatically on high-demand errors)"):
-                result = gemini_client.generate_conclusion(ai_input, language=language)
+            with st.status("Asking Gemini…", expanded=True) as status_box:
+                def _on_gemini_progress(message: str, _box=status_box) -> None:
+                    _box.update(label=message)
+                    st.write(message)
+
+                result = gemini_client.generate_conclusion(
+                    ai_input, language=language, on_progress=_on_gemini_progress,
+                )
+                if result["ok"]:
+                    status_box.update(label="Gemini conclusion ready", state="complete", expanded=False)
+                else:
+                    status_box.update(label="Gemini request failed", state="error", expanded=False)
+
             if result["ok"]:
                 st.session_state["auto_ai_conclusion"] = result["text"]
                 if result.get("model_used"):
@@ -1378,7 +1416,15 @@ def _render_stage_ai():
                         icon="ℹ️",
                     )
             else:
-                st.error(f"Gemini request failed: {result['error']}")
+                friendly_error = _GEMINI_ERROR_MESSAGES.get(
+                    result.get("error_kind"), _GEMINI_ERROR_MESSAGES[None],
+                )
+                models_tried = result.get("models_tried") or []
+                if models_tried:
+                    friendly_error += f" (tried: {', '.join(models_tried)})"
+                st.error(friendly_error, icon="🚨")
+                with st.expander("Technical details"):
+                    st.code(result["error"] or "No further details.")
 
     ai_conclusion = st.session_state.get("auto_ai_conclusion")
     if ai_conclusion:
