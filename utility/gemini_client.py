@@ -10,18 +10,20 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import streamlit as st
 
 DEFAULT_MODEL = "gemini-3.6-flash"
 
-# Tried, in order, after DEFAULT_MODEL/the caller's chosen model — only on a
+# Tried, in order, after DEFAULT_MODEL/the caller's chosen model — on a
 # transient server-side failure (ServerError, e.g. 503 UNAVAILABLE / "high
-# demand"), never on a client-side one (bad API key, invalid request, etc.),
-# where every model would fail identically and retrying would just delay the
-# real error. Deduplicated against whatever model was actually requested at
-# call time, so the primary model never gets tried twice.
+# demand") or a 429 RESOURCE_EXHAUSTED (the project's quota for that specific
+# model is used up or, for a free-tier key, simply zero), never on any other
+# client-side error (bad API key, invalid request, etc.), where every model
+# would fail identically and retrying would just delay the real error.
+# Deduplicated against whatever model was actually requested at call time, so
+# the primary model never gets tried twice.
 FALLBACK_MODELS = ["gemini-3.0-pro", "gemini-2.5-flash"]
 
 # Attempts on a single model before moving to the next one, and the backoff
@@ -114,6 +116,7 @@ def generate_conclusion(
     model: str = DEFAULT_MODEL,
     api_key: Optional[str] = None,
     language: str = DEFAULT_LANGUAGE,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """
     Sends `data` (typically the Airtable payload plus each method's
@@ -122,22 +125,38 @@ def generate_conclusion(
 
     Retries `model` a few times on a transient ServerError (e.g. 503
     UNAVAILABLE / "high demand" — see FALLBACK_MODELS/MAX_RETRIES_PER_MODEL),
-    then falls through FALLBACK_MODELS in order under the same policy. Any
-    other error (bad API key, invalid request, empty response, …) returns
+    then falls through FALLBACK_MODELS in order under the same policy. A 429
+    RESOURCE_EXHAUSTED (quota used up, or zero on a free-tier key) skips
+    straight to the next model instead — a retry backoff on the same model
+    can't fix a quota problem the way it can a transient 503. Any other
+    error (bad API key, invalid request, empty response, …) returns
     immediately without retrying or falling back, since every model would
     fail identically and retrying would just delay the real error.
 
+    If given, `on_progress` is called with a short human-readable status
+    string (e.g. "Trying gemini-3.6-flash…") at each model switch/retry, so a
+    caller (e.g. a Streamlit page) can surface live progress instead of a
+    single static spinner. It is never given raw exception text — that
+    stays out of the UI-facing string, see `error`/`error_kind` below.
+
     Returns {"ok": bool, "text": Optional[str], "error": Optional[str],
-    "model_used": Optional[str], "model_requested": str}. model_requested
+    "error_kind": Optional[str], "model_used": Optional[str],
+    "model_requested": str, "models_tried": list[str]}. model_requested
     echoes back `model` (or its default); model_used is the model that
     actually produced `text`, only non-None when it differs from `model`,
-    i.e. a fallback kicked in.
+    i.e. a fallback kicked in. On failure, `error` is the raw/technical
+    message (fine for a collapsed "details" expander, not a headline) and
+    `error_kind` is one of "not_configured", "sdk_missing",
+    "quota_exhausted", "server_busy", "empty_response", "client_error", or
+    "other" — meant for building a friendly, non-raw st.error() headline.
+    `models_tried` lists every model actually attempted, in order.
     """
     key = api_key or get_api_key()
     if not key:
         return {
             "ok": False, "text": None, "error": "No Gemini API key configured.",
-            "model_used": None, "model_requested": model,
+            "error_kind": "not_configured",
+            "model_used": None, "model_requested": model, "models_tried": [],
         }
 
     try:
@@ -146,7 +165,8 @@ def generate_conclusion(
     except ImportError as e:
         return {
             "ok": False, "text": None, "error": f"google-genai isn't installed: {e}",
-            "model_used": None, "model_requested": model,
+            "error_kind": "sdk_missing",
+            "model_used": None, "model_requested": model, "models_tried": [],
         }
 
     language_name = LANGUAGES.get(language, LANGUAGES[DEFAULT_LANGUAGE])
@@ -176,6 +196,16 @@ def generate_conclusion(
             "-----END CUSTOM_CODE-----"
         )
 
+    def _progress(message: str) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(message)
+        except Exception:  # noqa: BLE001
+            # A caller's status-rendering callback misbehaving shouldn't be
+            # able to take down the actual Gemini request.
+            pass
+
     client = genai.Client(api_key=key)
     # model first, then FALLBACK_MODELS in order, minus whichever of them
     # happens to equal model itself (e.g. the caller already passed a
@@ -183,7 +213,9 @@ def generate_conclusion(
     models_to_try = [model] + [m for m in FALLBACK_MODELS if m != model]
 
     last_error = "Gemini request failed."
+    last_error_kind = "other"
     for candidate_model in models_to_try:
+        _progress(f"Trying {candidate_model}…")
         for attempt in range(MAX_RETRIES_PER_MODEL + 1):
             try:
                 response = client.models.generate_content(model=candidate_model, contents=prompt)
@@ -194,30 +226,55 @@ def generate_conclusion(
                     # worth trying the next model in case it's a
                     # candidate_model-specific quirk rather than the prompt.
                     last_error = "Gemini returned an empty response."
+                    last_error_kind = "empty_response"
                     break
                 return {
-                    "ok": True, "text": text, "error": None,
+                    "ok": True, "text": text, "error": None, "error_kind": None,
                     "model_used": candidate_model if candidate_model != model else None,
-                    "model_requested": model,
+                    "model_requested": model, "models_tried": models_to_try[:models_to_try.index(candidate_model) + 1],
                 }
             except genai_errors.ServerError as e:
                 # Transient (5xx, e.g. 503 "high demand") -- worth a retry on
                 # this same model before giving up on it.
                 last_error = str(e)
+                last_error_kind = "server_busy"
                 if attempt < MAX_RETRIES_PER_MODEL:
-                    time.sleep(RETRY_BACKOFF_SECONDS[attempt])
+                    delay = RETRY_BACKOFF_SECONDS[attempt]
+                    _progress(f"{candidate_model} is busy (high demand) — retrying in {delay}s…")
+                    time.sleep(delay)
                     continue
                 break  # retries exhausted on this model -- try the next one
+            except genai_errors.ClientError as e:
+                if e.code == 429:
+                    # RESOURCE_EXHAUSTED -- this project's quota for
+                    # candidate_model is used up (often 0 outright for a
+                    # free-tier key on a model that free tier doesn't cover).
+                    # Waiting out a retry backoff on the same model can't fix
+                    # that, but FALLBACK_MODELS may have real quota, so skip
+                    # straight to the next model rather than burning retries.
+                    last_error = str(e)
+                    last_error_kind = "quota_exhausted"
+                    _progress(f"{candidate_model}'s quota is exhausted…")
+                    break
+                # Any other 4xx (bad API key, invalid request, ...) would
+                # fail identically on every model, so fail now rather than
+                # burning through retries/fallbacks that can't help.
+                return {
+                    "ok": False, "text": None, "error": str(e), "error_kind": "client_error",
+                    "model_used": None, "model_requested": model,
+                    "models_tried": models_to_try[:models_to_try.index(candidate_model) + 1],
+                }
             except Exception as e:  # noqa: BLE001
                 # Not transient (bad request, auth, network, …) -- every
                 # model would fail identically, so fail now rather than
                 # burning through retries/fallbacks that can't help.
                 return {
-                    "ok": False, "text": None, "error": str(e),
+                    "ok": False, "text": None, "error": str(e), "error_kind": "other",
                     "model_used": None, "model_requested": model,
+                    "models_tried": models_to_try[:models_to_try.index(candidate_model) + 1],
                 }
 
     return {
-        "ok": False, "text": None, "error": last_error,
-        "model_used": None, "model_requested": model,
+        "ok": False, "text": None, "error": last_error, "error_kind": last_error_kind,
+        "model_used": None, "model_requested": model, "models_tried": models_to_try,
     }
