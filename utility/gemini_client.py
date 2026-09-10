@@ -14,7 +14,7 @@ from typing import Any, Callable, Optional
 
 import streamlit as st
 
-DEFAULT_MODEL = "gemini-3.6-flash"
+DEFAULT_MODEL = "gemini-flash-latest"
 
 # Tried, in order, after DEFAULT_MODEL/the caller's chosen model — on a
 # transient server-side failure (ServerError, e.g. 503 UNAVAILABLE / "high
