@@ -24,7 +24,7 @@ DEFAULT_MODEL = "gemini-flash-latest"
 # would fail identically and retrying would just delay the real error.
 # Deduplicated against whatever model was actually requested at call time, so
 # the primary model never gets tried twice.
-FALLBACK_MODELS = ["gemini-3.0-pro", "gemini-2.5-flash"]
+FALLBACK_MODELS = ["gemini-3.5-flash-lite"]
 
 # Attempts on a single model before moving to the next one, and the backoff
 # (seconds) between them — e.g. 2 retries = 3 total attempts per model, with
@@ -162,6 +162,7 @@ def generate_conclusion(
     try:
         from google import genai
         from google.genai import errors as genai_errors
+        from google.genai import types
     except ImportError as e:
         return {
             "ok": False, "text": None, "error": f"google-genai isn't installed: {e}",
@@ -206,7 +207,12 @@ def generate_conclusion(
             # able to take down the actual Gemini request.
             pass
 
-    client = genai.Client(api_key=key)
+    client = genai.Client(
+        api_key=key,
+        http_options=types.HttpOptions(
+            retry_options=types.HttpRetryOptions(http_status_codes=[]),
+        ),
+    )
     # model first, then FALLBACK_MODELS in order, minus whichever of them
     # happens to equal model itself (e.g. the caller already passed a
     # fallback name directly) so nothing is ever attempted twice.
@@ -218,7 +224,13 @@ def generate_conclusion(
         _progress(f"Trying {candidate_model}…")
         for attempt in range(MAX_RETRIES_PER_MODEL + 1):
             try:
-                response = client.models.generate_content(model=candidate_model, contents=prompt)
+                response = client.models.generate_content(
+                    model=candidate_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        thinking_config=types.ThinkingConfig(thinking_level="high"),
+                    ),
+                )
                 text = (response.text or "").strip()
                 if not text:
                     # Not a transient server error -- retrying/falling back
