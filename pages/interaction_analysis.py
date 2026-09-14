@@ -1,250 +1,28 @@
-import patsy
 import itertools
-import re
 import textwrap
-import warnings as _warnings
 from typing import Any, Dict, List, Tuple
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-import statsmodels.api as sm
 import streamlit as st
+from scipy.stats import norm
+from foe.interaction.operations import InteractionEngine
 
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Interaction Analysis", page_icon="🔢", layout="wide")
 
-
-# ---------------------------------------------------------------------------
-# InteractionEngine (inlined — no external import required)
-# ---------------------------------------------------------------------------
-
-# Pre-compiled regex for parsing statsmodels coefficient names like:
-# "C(test1)[T.VariantB]"  →  group(1)="test1", group(2)="VariantB"
-_COEF_TERM_RE = re.compile(r"C\((\w+)\)\[T\.([^\]]+)\]")
-
-
-class InteractionEngine:
-    """
-    Analyzes synergies and clashes between concurrent A/B tests.
-
-    Uses a Generalized Linear Model (GLM) with a Binomial family.
-    The model is fit on pre-aggregated (conversions, visitors) count data
-    using a two-column binomial response, which produces correct standard
-    errors and p-values without inflating the effective sample size.
-    """
-
-    # Maximum number of concurrent tests allowed in a single model.
-    # A full factorial model produces 2^N terms; beyond 4 tests the model
-    # becomes numerically unstable and very hard to interpret.
-    MAX_TESTS = 4
-
-    @staticmethod
-    def prepare_aggregated_format(
-        input_df: pd.DataFrame, test_cols: List[str]
-    ) -> pd.DataFrame:
-        """
-        Prepares a cleaned, aggregated dataframe for model fitting.
-
-        Each row represents one unique combination of test variants.
-        The response is kept as (conversions, non_conversions) - a two-column
-        binomial response - which is the statistically correct approach for
-        pre-aggregated count data.
-        """
-        df = input_df.copy()
-        for col in test_cols:
-            df[col] = df[col].astype(str)
-        df["non_conversions"] = df["visitors"] - df["conversions"]
-        return df
-
-    @staticmethod
-    def check_data_quality(df: pd.DataFrame, test_cols: List[str]) -> List[str]:
-        """
-        Returns soft warnings (not errors) about data conditions likely to
-        cause perfect separation in the GLM.  Called before fitting so the
-        user understands the root cause if statsmodels warnings appear.
-        """
-        messages: List[str] = []
-
-        def _combo_label(row: pd.Series) -> str:
-            return " / ".join(f"{col}={row[col]}" for col in test_cols)
-    
-        no_traffic_rows = df[df["visitors"] == 0]
-        traffic_df = df[df["visitors"] > 0]
-    
-        zero_rate_rows = traffic_df[traffic_df["conversions"] == 0]
-        full_rate_rows = traffic_df[traffic_df["conversions"] == traffic_df["visitors"]]
-    
-        if not no_traffic_rows.empty:
-            combos = no_traffic_rows.apply(_combo_label, axis=1).tolist()
-            messages.append(
-                f"The following segment(s) have **no visitors** and will be excluded "
-                f"from separation checks: {', '.join(combos)}."
-            )
-        if not zero_rate_rows.empty:
-            combos = zero_rate_rows.apply(_combo_label, axis=1).tolist()
-            messages.append(
-                f"The following segment(s) have a **0% conversion rate**, which can "
-                f"cause perfect separation - coefficient estimates may be unreliable: "
-                f"{', '.join(combos)}."
-            )
-        if not full_rate_rows.empty:
-            combos = full_rate_rows.apply(_combo_label, axis=1).tolist()
-            messages.append(
-                f"The following segment(s) have a **100% conversion rate**, which can "
-                f"cause perfect separation - coefficient estimates may be unreliable: "
-                f"{', '.join(combos)}."
-            )
-
-        return messages
-
-    def fit_interaction_model(
-        self, df: pd.DataFrame, test_cols: List[str]
-    ) -> Tuple[Any, List[str]]:
-        """
-        Fits a full-factorial GLM-Binomial model using explicit matrices.
-
-        Uses a two-column binomial response (conversions, non_conversions),
-        which is correct for pre-aggregated count data and does NOT inflate
-        the effective sample size the way freq_weights would.
-
-        Returns
-        -------
-        model : fitted GLMResults
-        fit_warnings : list[str]
-            Human-readable messages for any PerfectSeparationWarning or
-            numerical RuntimeWarning raised during fitting.  The caller is
-            responsible for surfacing these to the user.
-        """
-        from statsmodels.genmod.generalized_linear_model import PerfectSeparationWarning
-
-        self._validate_inputs(df, test_cols)
-
-        # 1. Prepare 2D Endogenous Variable (Response) explicitly
-        endog = df[["conversions", "non_conversions"]].to_numpy()
-
-        # 2. Build Exogenous Design Matrix via patsy
-        formula_rhs = " * ".join([f"C({col})" for col in test_cols])
-        exog = patsy.dmatrix(f"~ {formula_rhs}", data=df, return_type='dataframe') # type: ignore
-
-        try:
-            with _warnings.catch_warnings(record=True) as caught:
-                _warnings.simplefilter("always")
-                model = sm.GLM(
-                    endog=endog,
-                    exog=exog,
-                    family=sm.families.Binomial(),
-                ).fit()
-        except Exception as e:
-            raise ValueError(f"Interaction model fitting failed: {e}") from e
-
-        # Translate captured warnings into readable strings and deduplicate.
-        # statsmodels tends to emit each warning twice (once per IRLS pass).
-        seen: set = set()
-        fit_warnings: List[str] = []
-        for w in caught:
-            if issubclass(w.category, PerfectSeparationWarning):
-                msg = (
-                    "**Perfect separation detected** — one or more variant combinations "
-                    "may have a 0% or 100% conversion rate. Affected coefficient "
-                    "estimates and p-values should be treated with caution."
-                )
-            elif issubclass(w.category, RuntimeWarning) and "divide by zero" in str(w.message):
-                msg = (
-                    "**Numerical instability during fitting** (divide by zero in scale "
-                    "calculation). This is typically a secondary symptom of perfect "
-                    "separation - see the data quality warning above."
-                )
-            else:
-                continue
-            if msg not in seen:
-                seen.add(msg)
-                fit_warnings.append(msg)
-
-        return model, fit_warnings
-
-    @staticmethod
-    def format_summary_table(model) -> Tuple[pd.DataFrame, Dict[str, str]]:
-        """
-        Returns the coefficient summary table with human-readable index labels,
-        alongside the raw→readable name mapping so callers don't need to
-        re-parse the model object.
-        """
-        raw_summary = model.summary2().tables[1].copy()
-        name_map = {raw: InteractionEngine._rename_coefficient(raw) for raw in raw_summary.index}
-        raw_summary.index = raw_summary.index.map(name_map)
-        return raw_summary, name_map
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    def _validate_inputs(self, df: pd.DataFrame, test_cols: List[str]) -> None:
-        """Raises ValueError for any input that would cause a bad model fit."""
-        if not test_cols:
-            raise ValueError("test_cols must contain at least one column name.")
-
-        if len(test_cols) > self.MAX_TESTS:
-            raise ValueError(
-                f"Cannot fit a factorial model with {len(test_cols)} tests "
-                f"(maximum is {self.MAX_TESTS}). The model would produce "
-                f"{2 ** len(test_cols)} terms and become numerically unstable."
-            )
-
-        missing_cols = [
-            c for c in [*test_cols, "visitors", "conversions"] if c not in df.columns
-        ]
-        if missing_cols:
-            raise ValueError(f"Required columns missing from dataframe: {missing_cols}")
-
-        if df["conversions"].lt(0).any():
-            raise ValueError("'conversions' column contains negative values.")
-
-        if df["visitors"].le(0).any():
-            raise ValueError("'visitors' column contains zero or negative values.")
-
-        if (df["conversions"] > df["visitors"]).any():
-            raise ValueError(
-                "Some rows have more conversions than visitors. "
-                "Check your input data."
-            )
-
-        if df[test_cols].isnull().any().any():
-            raise ValueError("Test variant columns contain null values.")
-
-    @staticmethod
-    def _rename_coefficient(name: str) -> str:
-        """
-        Converts a single statsmodels coefficient name to a readable label.
-
-        Uses a pre-compiled regex rather than chained string replacements so
-        that changes to statsmodels' formatting surface as unmatched patterns
-        (returned verbatim) rather than silently garbled names.
-        """
-        if name == "Intercept":
-            return "Baseline (Control Group)"
-
-        if ":" in name:
-            parts = name.split(":")
-            clean_parts = []
-            for part in parts:
-                m = _COEF_TERM_RE.fullmatch(part.strip())
-                clean_parts.append(
-                    f"{m.group(1)} ({m.group(2)})" if m else part.strip()
-                )
-            return " & ".join(clean_parts) + " — Clash/Synergy"
-
-        m = _COEF_TERM_RE.fullmatch(name.strip())
-        if m:
-            return f"{m.group(1)} ({m.group(2)})"
-
-        # Fallback: return verbatim so nothing silently disappears
-        return name
-
-
-# Singleton engine, constructed once per session
+# Model fitting, data-quality checks, and coefficient naming/conclusions are
+# delegated entirely to the shared FOE InteractionEngine
+# (foe.interaction.operations) rather than duplicated here.
 _engine = InteractionEngine()
+
+# Confidence intervals below are derived from FOE's (coefficient, std_err)
+# output as coef ± Z * std_err, which is numerically identical to
+# statsmodels' own GLM conf_int() at the matching alpha (both are Wald/z
+# based since the Binomial family fixes the dispersion at 1).
+ALPHA = 0.05
+_Z_CRIT = float(norm.ppf(1 - ALPHA / 2))
 
 
 # ---------------------------------------------------------------------------
@@ -399,46 +177,56 @@ def validate_input_df(df: pd.DataFrame, test_cols: List[str]) -> List[str]:
 # Rendering helpers
 # ---------------------------------------------------------------------------
 
-def render_model_summary(model) -> Dict[str, str]:
+def render_model_summary(results: List[Dict[str, Any]]) -> None:
     """
     Renders the coefficient summary table and interaction analysis section.
-    Returns the readable name mapping so downstream plots can reuse it.
+
+    `results` is the list of per-term dicts returned by
+    InteractionEngine.run_interaction_analysis (term, raw_term, coefficient,
+    std_err, z_score, p_value, is_significant, conclusion).
     """
-    summary_df, name_map = InteractionEngine.format_summary_table(model)
+    summary_df = pd.DataFrame(
+        [
+            {
+                "Coef.": r["coefficient"],
+                "Std.Err.": r["std_err"],
+                "z": r["z_score"],
+                "P>|z|": r["p_value"],
+            }
+            for r in results
+        ],
+        index=[r["term"] for r in results],
+    )
 
     st.write("### Model Summary")
     st.dataframe(summary_df.astype(float).round(4), width="stretch")
 
     # --- Interaction analysis -----------------------------------------------
-    p_values = model.pvalues
-    interaction_mask = p_values.index.str.contains(":")
-    significant_interactions = p_values[(p_values < 0.05) & interaction_mask]
+    significant_interactions = [
+        r for r in results if ":" in r["raw_term"] and r["p_value"] < ALPHA
+    ]
 
     st.write("### Interaction Analysis")
-    if not significant_interactions.empty:
+    if significant_interactions:
         st.warning(
             f"Detected **{len(significant_interactions)}** significant interaction(s):"
         )
-        for raw_name, pval in significant_interactions.items():
-            coef = model.params[raw_name]
-            display_name = name_map.get(raw_name, raw_name)
-            direction = "Positive (Synergy) 📈" if coef > 0 else "Negative (Clash) 📉"
+        for r in significant_interactions:
+            direction = "Positive (Synergy) 📈" if r["coefficient"] > 0 else "Negative (Clash) 📉"
             st.write(
-                f"- **{display_name}** — p={pval:.2e}, "
-                f"Coef: {coef:.4f} ({direction})"
+                f"- **{r['term']}** — p={r['p_value']:.2e}, "
+                f"Coef: {r['coefficient']:.4f} ({direction})"
             )
     else:
         st.success("No significant test interactions detected.")
 
-    return name_map
 
-
-def render_forest_plot(model, name_map: Dict[str, str]) -> None:
+def render_forest_plot(results: List[Dict[str, Any]]) -> None:
     """
-    Forest plot of all coefficients (excluding intercept).
+    Forest plot of all coefficients (excluding the intercept/baseline term).
 
-    Y-axis uses the human-readable labels from name_map.
-    Long labels are wrapped automatically.
+    Confidence intervals are derived from (coefficient, std_err) at ALPHA —
+    see the module-level note on _Z_CRIT. Long labels are wrapped automatically.
     """
     st.write("### Coefficient Forest Plot (Effect vs. Control Baseline)")
     st.info(
@@ -446,24 +234,23 @@ def render_forest_plot(model, name_map: Dict[str, str]) -> None:
         "A line crossing 0 means the effect is not statistically significant."
     )
 
-    params = model.params[1:]   # drop intercept
-    conf   = model.conf_int()[1:]
+    terms = [r for r in results if r["term"] != "Baseline (Control Group)"]
 
-    results = pd.DataFrame(
+    plot_df = pd.DataFrame(
         {
-            "Feature": [name_map.get(n, n) for n in params.index],
-            "Coefficient": params.values,
-            "Lower": conf[0].values,
-            "Upper": conf[1].values,
+            "Feature": [r["term"] for r in terms],
+            "Coefficient": [r["coefficient"] for r in terms],
+            "Lower": [r["coefficient"] - _Z_CRIT * r["std_err"] for r in terms],
+            "Upper": [r["coefficient"] + _Z_CRIT * r["std_err"] for r in terms],
         }
     ).sort_values("Coefficient")
 
     # Wrap long labels so they don't overflow the axis
-    wrapped_labels = [textwrap.fill(str(lbl), width=45) for lbl in results["Feature"]]
+    wrapped_labels = [textwrap.fill(str(lbl), width=45) for lbl in plot_df["Feature"]]
 
-    fig, ax = plt.subplots(figsize=(10, max(len(results) * 0.6 + 2, 4)))
+    fig, ax = plt.subplots(figsize=(10, max(len(plot_df) * 0.6 + 2, 4)))
 
-    for i, (_, row) in enumerate(results.iterrows()):
+    for i, (_, row) in enumerate(plot_df.iterrows()):
         is_significant = not (row["Lower"] <= 0 <= row["Upper"])
         color = "#ff4b4b" if is_significant else "#7d7d7d"
         ax.errorbar(
@@ -477,7 +264,7 @@ def render_forest_plot(model, name_map: Dict[str, str]) -> None:
         )
 
     ax.axvline(0, color="black", linestyle="--", alpha=0.5)
-    ax.set_yticks(range(len(results)))
+    ax.set_yticks(range(len(plot_df)))
     ax.set_yticklabels(wrapped_labels, fontsize=9)
     ax.set_xlabel("Log-Odds Effect Size")
     ax.grid(axis="x", linestyle=":", alpha=0.6)
@@ -487,33 +274,30 @@ def render_forest_plot(model, name_map: Dict[str, str]) -> None:
     plt.close(fig)
 
 
-def render_interaction_table(model, name_map: Dict[str, str]) -> None:
+def render_interaction_table(results: List[Dict[str, Any]]) -> None:
     """
     Displays a table of all interaction-term coefficients and their p-values.
-    Replaces the placeholder heatmap with something actually useful.
     """
     st.write("### Interaction Term Details")
 
-    params = model.params
-    pvals  = model.pvalues
-    conf   = model.conf_int()
-
-    interaction_idx = [n for n in params.index if ":" in n]
-    if not interaction_idx:
+    interaction_terms = [r for r in results if ":" in r["raw_term"]]
+    if not interaction_terms:
         st.info("No interaction terms found in the model.")
         return
 
     rows = []
-    for raw in interaction_idx:
+    for r in interaction_terms:
+        lower = r["coefficient"] - _Z_CRIT * r["std_err"]
+        upper = r["coefficient"] + _Z_CRIT * r["std_err"]
         rows.append(
             {
-                "Interaction": name_map.get(raw, raw),
-                "Coefficient": round(params[raw], 4),
-                "p-value": round(pvals[raw], 4),
-                "CI Lower": round(conf.loc[raw, 0], 4),
-                "CI Upper": round(conf.loc[raw, 1], 4),
-                "Significant": "✅" if pvals[raw] < 0.05 else "—",
-                "Direction": "Synergy 📈" if params[raw] > 0 else "Clash 📉",
+                "Interaction": r["term"],
+                "Coefficient": round(r["coefficient"], 4),
+                "p-value": round(r["p_value"], 4),
+                "CI Lower": round(lower, 4),
+                "CI Upper": round(upper, 4),
+                "Significant": "✅" if r["p_value"] < ALPHA else "—",
+                "Direction": "Synergy 📈" if r["coefficient"] > 0 else "Clash 📉",
             }
         )
 
@@ -613,16 +397,16 @@ def run() -> None:
                 st.error(err)
             st.stop()
 
-        # --- Prepare data & fit model via engine ---
+        # --- Fit model & analyze via the shared FOE InteractionEngine ---
         try:
-            df_prepared = InteractionEngine.prepare_aggregated_format(edited_df, test_cols)
-
             # Soft data-quality warnings shown before fitting so the user
             # understands the root cause of any perfect-separation messages.
-            for msg in InteractionEngine.check_data_quality(df_prepared, test_cols):
+            for msg in InteractionEngine.check_data_quality(edited_df, test_cols):
                 st.warning(msg)
 
-            model, fit_warnings = _engine.fit_interaction_model(df_prepared, test_cols)
+            results, fit_warnings = _engine.run_interaction_analysis(
+                edited_df, test_cols, alpha=ALPHA
+            )
 
             for msg in fit_warnings:
                 st.warning(msg)
@@ -631,9 +415,9 @@ def run() -> None:
             st.stop()
 
         # --- Render results ---
-        name_map = render_model_summary(model)
-        render_forest_plot(model, name_map)
-        render_interaction_table(model, name_map)
+        render_model_summary(results)
+        render_forest_plot(results)
+        render_interaction_table(results)
 
 
 if __name__ == "__main__":
