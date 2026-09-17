@@ -233,12 +233,29 @@ def render_variant_inputs(
     """
     st.subheader("Experiment configuration")
 
-    param_key = st.text_input(
-        "Variant parameter key",
-        value="exp_variant_string",
+    PARAM_KEY_OPTIONS = {
+        "exp_variant_string": "Standard GA4 experiment integration (Optimizely, Convert.com, VWO, Wingify, AB Tasty)",
+        "vwo_exp_variant_string": "VWO — GTM data-layer push variant",
+        "varify_abTestShort": "Varify.io",
+        "Other custom)": None,
+    }
+    
+    param_key_choice = st.selectbox(
+        "Choose the test parameter key",
+        list(PARAM_KEY_OPTIONS.keys()),
         help="The event_params key used to identify experiment variants.",
-        key=f"{key_prefix}_param_key",
+        key=f"{key_prefix}_param_key_choice",
     )
+    
+    if param_key_choice == "Other (custom)":
+        param_key = st.text_input(
+            "Custom variant parameter key",
+            value="exp_variant_string",
+            help="Enter the event_params key manually if it isn't in the list above.",
+            key=f"{key_prefix}_param_key_custom",
+        )
+    else:
+        param_key = param_key_choice
 
     match_strategy = cast(
         Literal["exact", "like"],
