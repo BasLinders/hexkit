@@ -237,7 +237,7 @@ def render_variant_inputs(
         "exp_variant_string": "Standard GA4 experiment integration (Optimizely, Convert.com, VWO, Wingify, AB Tasty)",
         "vwo_exp_variant_string": "VWO — GTM data-layer push variant",
         "varify_abTestShort": "Varify.io",
-        "Other custom)": None,
+        "Other (custom)": None,
     }
     
     param_key_choice = st.selectbox(
