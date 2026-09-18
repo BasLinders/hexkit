@@ -25,4 +25,9 @@ db-dtypes
 requests>=2.31.0
 pydantic>=2.0.0
 google-genai>=0.3.0
-foe @ git+https://github.com/BasLinders/first-order-engine.git@main
+# Pinned to the commit that added foe/data (DataEngine + SQL builders) rather
+# than @main -- first-order-engine has no versioned releases yet, and
+# utility/sql_builder.py + utility/bq_client.py now prefer this backend when
+# available (see USING_FOE_BACKEND in each), falling back to their own native
+# implementation otherwise. Bump this SHA deliberately, not accidentally.
+foe[bigquery] @ git+https://github.com/BasLinders/first-order-engine.git@ffae1661f7fb3102edd399a5a4b1faeb506a521c
