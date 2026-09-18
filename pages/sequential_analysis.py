@@ -5,10 +5,10 @@ import pandas as pd
 import numpy as np
 import uuid
 from pydantic import ValidationError
-from scipy.stats import norm as scipy_norm
 from st_supabase_connection import SupabaseConnection
 from foe.bayesian.operations import BayesianEngine, get_lift_prior
 from foe.core.models import BusinessCaseInput, ExperimentInput
+from foe.sequential.operations import SequentialEngine, TestType as FoeSequentialTestType
 
 # --- CONSTANTS & CONFIGURATION ---
 st.set_page_config(page_title="Sequential Analysis", layout="wide")
@@ -50,87 +50,12 @@ def get_deduped_variant_df(df, variant_name):
 
 
 # --- STATISTICAL FUNCTIONS ---
-
-def calculate_msprt_boundaries(alpha, beta, num_variants=1):
-    """
-    Calculates boundaries for mSPRT.
-    Upper bound applies a Bonferroni correction when testing multiple variants,
-    raising the bar to control the family-wise error rate.
-    """
-    upper = np.log(num_variants / alpha)
-    lower = np.log(beta)
-    return upper, lower
-
-
-def calculate_msprt_llr(visitors_base, conversions_base, visitors_var, conversions_var,
-                         tau=0.0004, fixed_baseline_cr=None):
-    """
-    Calculates the Log-Likelihood Ratio.
-    Handles both two-sample pooled variance and one-sample fixed variance.
-    """
-    if visitors_var == 0:
-        return 0.0
-
-    p_var = conversions_var / visitors_var
-
-    if fixed_baseline_cr is not None:
-        # ONE-SAMPLE: Variance of a single proportion
-        p_base = fixed_baseline_cr
-        var = p_var * (1 - p_var) / visitors_var
-        if var == 0:
-            return 0.0
-        diff = p_var - p_base
-    else:
-        # TWO-SAMPLE: Pooled variance of the difference
-        if visitors_base == 0:
-            return 0.0
-        p_base = conversions_base / visitors_base
-        p_pool = (conversions_base + conversions_var) / (visitors_base + visitors_var)
-        if p_pool <= 0 or p_pool >= 1:
-            return 0.0
-        var = p_pool * (1 - p_pool) * (1 / visitors_base + 1 / visitors_var)
-        if var == 0:
-            return 0.0
-        diff = p_var - p_base
-
-    # mSPRT LLR Formula
-    llr = 0.5 * (np.log(var / (var + tau)) + (diff ** 2 / var) * (tau / (var + tau)))
-    return llr
-
-
-def calculate_instantaneous_power(n_var, p0, mde, alpha, n_ctrl=None):
-    """
-    Estimates statistical power at the current sample sizes using a normal approximation.
-
-    For one-sample: n_ctrl is None; variance is computed from the fixed baseline p0.
-    For two-sample: both n_ctrl and n_var are used; variance accounts for both group sizes.
-
-    Returns (power, beta_est) as floats.
-
-    Important: this is a fixed-horizon approximation. mSPRT power is structurally lower
-    due to the always-valid guarantee — treat the result as an optimistic upper bound.
-    """
-    if n_var <= 0 or mde <= 0 or p0 <= 0:
-        return 0.0, 1.0
-
-    p0 = float(np.clip(p0, 0.001, 0.999))
-    p1 = float(np.clip(p0 + mde, 0.001, 0.999))
-    z_alpha = scipy_norm.ppf(1 - alpha)
-
-    if n_ctrl is None:
-        # One-sample: variance under H1 using the alternative proportion
-        se = np.sqrt(p1 * (1 - p1) / n_var)
-    else:
-        # Two-sample: variance of the difference under H1
-        n_ctrl = max(int(n_ctrl), 1)
-        se = np.sqrt(p0 * (1 - p0) / n_ctrl + p1 * (1 - p1) / n_var)
-
-    if se == 0:
-        return 0.0, 1.0
-
-    z_power = mde / se - z_alpha
-    power = float(scipy_norm.cdf(z_power))
-    return power, 1.0 - power
+#
+# The mSPRT boundary/LLR/power math previously lived here as bespoke code.
+# It now delegates entirely to the shared FOE SequentialEngine
+# (foe.sequential.operations) — see analysis_section below — so this page
+# has exactly one implementation of the mSPRT math instead of a page-local
+# copy of what FOE already provides.
 
 
 # --- BUSINESS IMPACT (BAYESIAN REVENUE OVERLAY) ---
@@ -416,12 +341,36 @@ def analysis_section(df, params):
     max_visitors = params.get("max_visitors", 10000)
     num_variants = params.get("num_variants", 1)
 
-    upper_bound, lower_bound = calculate_msprt_boundaries(alpha, beta, num_variants=num_variants)
+    sequential_engine = SequentialEngine()
+    foe_test_type = (
+        FoeSequentialTestType.MULTI_SAMPLE
+        if test_type == TEST_TYPE_MULTI_SAMPLE
+        else FoeSequentialTestType.ONE_SAMPLE
+    )
+    upper_bound, lower_bound = SequentialEngine.calculate_boundaries(
+        alpha, beta, num_variants=num_variants
+    )
 
     variants_to_test = [v for v in df["variant_name"].unique() if v != "Control"]
     chart_data = []
     power_data = []
-    mde = np.sqrt(tau_param)
+
+    p0_param = params.get("p0", 0.10)
+
+    # Runs the LLR/power trajectory for every variant in one pass via the
+    # shared FOE SequentialEngine (foe.sequential.operations), instead of a
+    # page-local mSPRT implementation.
+    trajectory_df = sequential_engine.process_test_trajectory(
+        df=df,
+        test_type=foe_test_type,
+        tau=tau_param,
+        alpha=alpha,
+        beta=beta,
+        num_variants=num_variants,
+        baseline_cr=p0_param if test_type == TEST_TYPE_ONE_SAMPLE else None,
+        max_visitors=max_visitors,
+        control_group_name="Control",
+    )
 
     # --- BUSINESS IMPACT SETTINGS (ad-hoc, does not affect the locked test) ---
     with st.expander("💰 Revenue Impact Settings (optional)", expanded=False):
@@ -546,92 +495,33 @@ def analysis_section(df, params):
                 revenue_unavailable_reason = "error"
 
     for variant in variants_to_test:
-        var_df = get_deduped_variant_df(df, variant)
+        merged = (
+            trajectory_df[trajectory_df["variant_name"] == variant]
+            .sort_values("measurement_date")
+            .reset_index(drop=True)
+        )
 
-        if test_type == TEST_TYPE_MULTI_SAMPLE:
-            ctrl_df = get_deduped_variant_df(df, "Control")
-
-            merged = pd.merge(
-                var_df, ctrl_df, on="measurement_date", suffixes=("_var", "_ctrl")
-            )
-
-            if merged.empty:
+        if merged.empty:
+            if test_type == TEST_TYPE_MULTI_SAMPLE:
                 st.warning(
                     f"Waiting for aligned Control & Variant dates for {variant}."
                 )
-                continue
+            else:
+                st.warning(f"Waiting for data for {variant}.")
+            continue
 
-            merged["llr"] = merged.apply(
-                lambda row: calculate_msprt_llr(
-                    visitors_base=row["visitors_ctrl"],
-                    conversions_base=row["conversions_ctrl"],
-                    visitors_var=row["visitors_var"],
-                    conversions_var=row["conversions_var"],
-                    tau=tau_param,
-                ),
-                axis=1,
-            )
-
-            # Per-row power: use observed control CR at each date as the baseline
-            def _power_two_sample(row):
-                p_base = (
-                    row["conversions_ctrl"] / row["visitors_ctrl"]
-                    if row["visitors_ctrl"] > 0
-                    else 0.1
-                )
-                power, _ = calculate_instantaneous_power(
-                    n_var=row["visitors_var"],
-                    p0=p_base,
-                    mde=mde,
-                    alpha=alpha,
-                    n_ctrl=row["visitors_ctrl"],
-                )
-                return power
-
-            merged["power"] = merged.apply(_power_two_sample, axis=1)
-
+        if test_type == TEST_TYPE_MULTI_SAMPLE:
             latest_vis = merged.iloc[-1]["visitors_var"]
             latest_conv = merged.iloc[-1]["conversions_var"]
             base_vis = merged.iloc[-1]["visitors_ctrl"]
             base_cr = (
                 merged.iloc[-1]["conversions_ctrl"] / base_vis if base_vis > 0 else 0
             )
-
         else:
-            # One-sample logic
-            merged = var_df.copy()
-            if merged.empty:
-                continue
-
-            p0_param = params.get("p0", 0.10)
-            merged["llr"] = merged.apply(
-                lambda row: calculate_msprt_llr(
-                    visitors_base=0,
-                    conversions_base=0,
-                    visitors_var=row["visitors"],
-                    conversions_var=row["conversions"],
-                    tau=tau_param,
-                    fixed_baseline_cr=p0_param,
-                ),
-                axis=1,
-            )
-
-            merged["power"] = merged.apply(
-                lambda row: calculate_instantaneous_power(
-                    n_var=row["visitors"],
-                    p0=p0_param,
-                    mde=mde,
-                    alpha=alpha,
-                    n_ctrl=None,
-                )[0],
-                axis=1,
-            )
-
             latest_vis = merged.iloc[-1]["visitors"]
             latest_conv = merged.iloc[-1]["conversions"]
             base_cr = p0_param
 
-        merged["variant_name"] = variant
         vis_col = "visitors_var" if "visitors_var" in merged.columns else "visitors"
         chart_data.append(
             merged[["measurement_date", "variant_name", "llr", vis_col]]
