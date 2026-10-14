@@ -319,6 +319,47 @@ def collapse_to_per_visitor(df: "pd.DataFrame", kpi: str = "purchase_revenue") -
     )
 
 
+def winsorize_continuous_data(
+    df: "pd.DataFrame",
+    kpi: str,
+    method: Literal["Standard Deviation", "Percentile"],
+    stdev: Optional[int] = None,
+    percentile: Optional[int] = None,
+) -> tuple["pd.DataFrame", Optional[float], Optional[float], str]:
+    """
+    Caps `kpi` via FOE's ContinuousMetricEngine.winsorize_series, restricted to
+    non-zero rows -- zero-revenue visitors are left at exactly 0 rather than
+    pulled up to a positive lower bound (mirrors pages/user_level_analysis.py's
+    own winsorize_data, which applies the same non-zero restriction on top of
+    the same bound logic FOE now exposes).
+    """
+    df_copy = df.copy()
+    nonzero_mask = df_copy[kpi] != 0
+    nonzero_values = df_copy.loc[nonzero_mask, kpi]
+
+    if nonzero_values.empty:
+        return df_copy, None, None, "No non-zero values to compute bounds from — no capping applied"
+
+    if method == "Standard Deviation":
+        stdev = stdev or 3
+        if nonzero_values.std() == 0:
+            return df_copy, None, None, "Standard deviation of non-zero values is zero — no capping applied"
+        clipped, lower_cap, upper_cap = ContinuousMetricEngine.winsorize_series(
+            nonzero_values, method="Standard Deviation", param=float(stdev),
+        )
+        description = f"{stdev} standard deviations from the mean (non-zero rows)"
+    else:
+        percentile = percentile or 95
+        lower_p = (100.0 - percentile) / 2.0
+        clipped, lower_cap, upper_cap = ContinuousMetricEngine.winsorize_series(
+            nonzero_values, method="Percentile", param=lower_p,
+        )
+        description = f"the {lower_p:.1f}th and {100.0 - lower_p:.1f}th percentiles (non-zero rows)"
+
+    df_copy.loc[nonzero_mask, kpi] = clipped
+    return df_copy, lower_cap, upper_cap, description
+
+
 def run_continuous_analysis(
     df: "pd.DataFrame",
     control_label: str,
@@ -329,6 +370,9 @@ def run_continuous_analysis(
     tail: Literal["Two-sided", "Greater", "Less"] = "Two-sided",
     kpi: str = "purchase_revenue",
     mode: Literal["rpv", "rpt"] = "rpv",
+    winsorize_method: Optional[Literal["Standard Deviation", "Percentile"]] = None,
+    winsorize_stdev: Optional[int] = None,
+    winsorize_percentile: Optional[int] = None,
 ) -> dict:
     """
     Runs the FOE ContinuousMetricEngine on row-level revenue data via the
@@ -384,6 +428,18 @@ def run_continuous_analysis(
         work = per_visitor
         unit = AnalysisUnit.PER_VISITOR
 
+    winsorize_info = None
+    if winsorize_method:
+        work, lower_cap, upper_cap, cap_description = winsorize_continuous_data(
+            work, kpi, winsorize_method, winsorize_stdev, winsorize_percentile,
+        )
+        winsorize_info = {
+            "method": winsorize_method,
+            "lower_cap": lower_cap,
+            "upper_cap": upper_cap,
+            "description": cap_description,
+        }
+
     config = ContinuousMetricConfig(
         kpi=kpi,
         group_col="experience_variant_label",
@@ -434,6 +490,7 @@ def run_continuous_analysis(
         "effect_on_revenue": monetary["point_estimate"] if monetary else 0.0,
         "effect_on_revenue_ci": (monetary["ci_low"], monetary["ci_high"]) if monetary else (0.0, 0.0),
         "projection_days": projection_days,
+        "winsorize_info": winsorize_info,
     }
 
 

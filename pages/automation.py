@@ -737,8 +737,47 @@ def _render_stage_configure():
                     "effect alone. Both use the same fetched data; only the calculation differs."
                 ),
             )
+            winsorize_continuous = st.checkbox(
+                "Winsorize outliers",
+                value=False,
+                key="auto_continuous_winsorize",
+                help=(
+                    "Caps extreme revenue values (e.g. a handful of unusually large orders) "
+                    "at a bound derived from the non-zero values, instead of leaving the raw "
+                    "data unbounded. Non-buyers (€0) are never affected."
+                ),
+            )
+            if winsorize_continuous:
+                wc1, wc2 = st.columns(2)
+                with wc1:
+                    winsorize_method = st.selectbox(
+                        "Outlier detection method",
+                        ["Standard Deviation", "Percentile"],
+                        key="auto_continuous_winsorize_method",
+                    )
+                with wc2:
+                    if winsorize_method == "Standard Deviation":
+                        winsorize_stdev = st.selectbox(
+                            "Standard deviations from the mean",
+                            [2, 3, 4, 5], index=1,
+                            key="auto_continuous_winsorize_stdev",
+                        )
+                        winsorize_percentile = None
+                    else:
+                        winsorize_percentile = st.selectbox(
+                            "Percentile", [90, 95, 99], index=1,
+                            key="auto_continuous_winsorize_percentile",
+                        )
+                        winsorize_stdev = None
+            else:
+                winsorize_method = None
+                winsorize_stdev = None
+                winsorize_percentile = None
     else:
         continuous_mode = "rpv"
+        winsorize_method = None
+        winsorize_stdev = None
+        winsorize_percentile = None
 
     if use_pretest:
         with st.expander("Pre-test settings", expanded=True):
@@ -853,6 +892,9 @@ def _render_stage_configure():
                     confidence_level=confidence_level,
                     tail=tail,
                     mode=continuous_mode,
+                    winsorize_method=winsorize_method,
+                    winsorize_stdev=winsorize_stdev,
+                    winsorize_percentile=winsorize_percentile,
                 )
             if use_pretest:
                 if pretest_meta.get("seasonal"):
@@ -998,6 +1040,15 @@ def _render_stage_results():
         st.caption(cont["conclusion"])
         if cont.get("monetary_conclusion"):
             st.caption(cont["monetary_conclusion"])
+        if cont.get("winsorize_info"):
+            wi = cont["winsorize_info"]
+            if wi["lower_cap"] is not None:
+                st.caption(
+                    f"Winsorized ({wi['method']}): capped at {wi['description']} "
+                    f"— bounds {wi['lower_cap']:.2f} to {wi['upper_cap']:.2f}."
+                )
+            else:
+                st.caption(f"Winsorizing requested but not applied: {wi['description']}.")
         _render_monetary_notes("continuous")
         st.divider()
 
