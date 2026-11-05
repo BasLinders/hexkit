@@ -453,17 +453,25 @@ def display_projection(results: List[ComparisonResult], remaining: int, num_noun
 # --------------------------------------------------------------------------- #
 
 def display_documentation():
-    with st.expander("When to use this page", expanded=False):
+    with st.expander("What is this page for?", expanded=False):
         st.markdown(f"""
-The z-test in **Experiment Analysis** relies on a normal approximation. That
-approximation breaks down when samples are small: few conversions, a variant
-at 0% or 100%, or a very uneven split (for example a 90/10 holdout). It can
-then report significance that isn't there, or miss a real effect.
+Use this page to check whether a change made a real difference when you only
+have a **small number of people** in your test. For example: an email sent to a
+few hundred recipients, a page with little traffic, or a conversion that rarely
+happens.
 
-This page uses **Boschloo's exact test**, which computes the p-value from
-every possible outcome instead of an approximation. It keeps the
-false-positive rate at your chosen level at any sample size, and it is more
-powerful than Fisher's exact test.
+With small numbers, a difference can easily be luck. Say 3 of 120 people
+clicked in version A and 11 of 118 in version B. That looks like a big win,
+but is it? This page tells you whether the difference is large enough to trust.
+
+**Why not use Experiment Analysis?**
+Experiment Analysis uses a z-test, which relies on an approximation that only
+holds with enough data. With small samples, zero conversions, or a very uneven
+split (such as a 90/10 holdout), it can report a winner that isn't there or
+miss a real one. This page uses **Boschloo's exact test**, which computes the
+result from every possible outcome instead of an approximation. It stays
+reliable at any sample size and finds real effects more often than Fisher's
+exact test.
 
 **How the test is chosen**
 - Every variant has at most {BOSCHLOO_MAX_PER_ARM:,} units: Boschloo's exact test.
@@ -471,9 +479,24 @@ powerful than Fisher's exact test.
   take much longer.
 
 **Typical uses**
-- Email A/B tests on small lists or segments (turn on *Email campaign mode*).
+- Email A/B tests on small lists or segments.
 - Low-traffic pages, B2B funnels, or rare micro-conversions.
 - Pilots and holdout groups with an uneven split.
+
+**Email campaign mode**
+Turn this on to enter campaign numbers directly: delivered emails and unique
+opens, clicks or conversions. You choose which rate to test (open rate, click
+rate, click-to-open rate or conversion rate). If you tested on part of your
+list, enter the remaining list size to see what sending the winner to everyone
+else would add.
+
+**Reading the results**
+- **p-value**: how likely a difference this large is by luck alone. Below the
+  threshold shown (for example 0.05 at 95% confidence) the result is significant.
+- **Interval**: the range the true difference most likely falls in, in
+  percentage points. If it includes 0, the data can't rule out "no difference".
+- **Not significant** doesn't mean the variants perform the same. It means
+  there isn't enough evidence yet to tell them apart.
 
 **Limits**
 - One outcome per independent unit. Counts must be unique users or recipients,
