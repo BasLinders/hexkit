@@ -23,6 +23,8 @@ from foe.frequentist.operations import FrequentistEngine
 from foe.frequentist.confidence import compute_interval_difference
 from foe.core.models import AlternativeHypothesis
 
+from utility.small_sample import BOSCHLOO_MAX_PER_ARM
+
 _TAIL_TO_ALTERNATIVE = {
     "Greater": AlternativeHypothesis.GREATER,
     "Less": AlternativeHypothesis.LESS,
@@ -1907,6 +1909,34 @@ def display_frequentist_summary(
 
 # Main logic
 
+def suggest_small_sample_analysis(visitor_counts, conversion_counts, confidence_level):
+    """
+    Points users to Small Sample Analysis when every arm is small enough for
+    Boschloo's exact test, where the z-test's normal approximation is weakest.
+    The button hands the inputs over through session state.
+    """
+    if not visitor_counts or any(v <= 0 for v in visitor_counts):
+        return
+    if max(visitor_counts) > BOSCHLOO_MAX_PER_ARM:
+        return
+    col_msg, col_btn = st.columns([4, 1], vertical_alignment="center")
+    with col_msg:
+        st.info(
+            f"Every variant has at most {BOSCHLOO_MAX_PER_ARM:,} visitors. The "
+            "z-test can be unreliable at this size, especially with few conversions. "
+            "**Small Sample Analysis** runs an exact test instead."
+        )
+    with col_btn:
+        if st.button("Use exact test", width="stretch"):
+            st.session_state.ssa_prefill = {
+                "visitors": list(visitor_counts),
+                "conversions": list(conversion_counts),
+                "confidence_level": confidence_level,
+                "tail": st.session_state.tail,
+            }
+            st.switch_page("pages/small_sample_analysis.py")
+
+
 def run():
     st.title("Experiment Analysis")
     st.markdown("""
@@ -1999,6 +2029,7 @@ def run():
             horizontal=True,
             help="'Two-sided' (A != B), 'Greater' (B > A), 'Less' (B < A)."
         )
+        suggest_small_sample_analysis(visitor_counts, conversion_counts, confidence_level)
         non_inferiority_margin = st.number_input(
             "Non-inferiority margin (absolute %)",
             min_value=0.0, max_value=10.0, value=1.0, step=0.1,
