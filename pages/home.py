@@ -25,6 +25,7 @@ This toolkit has been created for the purposes of analyzing data from online con
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Pre-test analysis**: Calculate the runtime to reach an effect<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**SRM calculator**: Identify if your visitors were distributed as expected in your experiment<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Experiment analysis**: Use Frequentist and Bayesian methods to analyze aggregated test data<br>
+<span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Small sample analysis**: For small sample experiments and e-mail A/B tests<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**User level analysis**: Analyze metrics such as revenue / items per transaction<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Behavioral metric analysis**: Analyze higher-level metrics in your experiments<br>
 <span style='color:#009900; font-weight: 600; margin-right: 6px;'>&#10003;</span>**Interaction analysis**: Verify if your experiments negatively impacted each other or not<br>
