@@ -13,7 +13,7 @@ st.sidebar.image(logo_url, width="stretch")
 
 # st.title("HEXKIT")
 # st.image(logo_url)
-st.write("### <span style='color: orange;'>v1.5.2</span>", unsafe_allow_html=True)
+st.write("### <span style='color: orange;'>v1.6.0</span>", unsafe_allow_html=True)
 st.write("""
 This is the main page for the **H**appy Horizon **Ex**perimentation Tool**kit**. You can navigate to individual apps using the sidebar.
 
