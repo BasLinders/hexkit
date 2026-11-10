@@ -1,7 +1,0 @@
-# Install Hexkit's own requirements so FOE and its scipy/statsmodels run at the
-# same versions as the app, plus the notebook tooling and the R bridge.
--r ../requirements.txt
-jupyter
-nbconvert
-ipykernel
-rpy2>=3.5
