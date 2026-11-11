@@ -811,10 +811,10 @@ def _render_stage_configure():
                 "AOV variability (CV)", min_value=0.0, max_value=1.5,
                 value=0.0, step=0.05, key="auto_aov_cv",
                 help=(
-                    "0 treats AOV as a known constant for both methods. Above 0: Frequentist "
-                    "propagates it as estimation-uncertainty on the AOV mean (widens the CI); "
-                    "Bayesian samples AOV from a log-normal with this CV on every simulated draw "
-                    "(widens the posterior spread). Same input, different mechanics per method."
+                    "How much individual order values vary (std / mean). 0 treats AOV as a known "
+                    "constant. Above 0, both methods treat each arm's average AOV as uncertain, "
+                    "with SD = AOV x CV / sqrt(conversions): Frequentist widens its CI, Bayesian "
+                    "widens the spread of uplift and risk. Neither changes the net estimate."
                 ),
             )
         if use_continuous and daily_visitors_continuous != daily_visitors:

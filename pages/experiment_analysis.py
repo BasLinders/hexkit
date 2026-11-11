@@ -17,7 +17,7 @@ import plotly.graph_objects as go
 from scipy.stats import beta, norm, chisquare
 import math
 from dataclasses import dataclass
-from typing import Literal, List, Tuple, Dict, Any, Optional, cast
+from typing import List, Tuple, Dict, Any, Optional
 
 from foe.frequentist.operations import FrequentistEngine
 from foe.frequentist.confidence import compute_interval_difference
@@ -26,8 +26,11 @@ from foe.bayesian.operations import (
     BayesianEngine,
     LiftPrior,
     get_lift_prior,
+    mc_margin,
     prior_prob_positive_lift,
 )
+
+from utility.lift_prior_ui import PRIOR_WIDTHS, prior_range_pct, width_label
 
 from utility.small_sample import BOSCHLOO_MAX_PER_ARM
 
@@ -101,26 +104,28 @@ def display_dynamic_documentation(analysis_method):
             This engine provides a **probabilistic** view of the experiment, moving away from "significant/not significant" to "how much better is it?"
 
             * **Risk-Aware Decisioning:** Quantifies the **Expected Monetary Risk**: the literal monetary amount you stand to lose if the variant is actually worse.
-            * **Business Impact:** Translates statistical lift into a **6-month revenue projection** based on your AOV as a constant.
-            * **Direct Probabilities:** Gives you a clear "Chance to Beat Control" percentage.
+            * **Business Impact:** Translates the result into a **6-month revenue projection**, valuing each variant at its own AOV and treating that AOV as an uncertain average.
+            * **Direct Probabilities:** Gives you a clear "Chance to Beat Control" percentage, plus a "Chance of Higher Revenue" once AOVs are entered.
             """)
 
         with st.expander("Bayesian: How it works"):
             st.markdown(r"""
             1.  **Prior & Posterior:** Each variant's conversion rate starts from a flat **Beta-Binomial conjugate prior** ($\alpha=1, \beta=1$) and is updated with the observed visitors and conversions.
-            2.  **Optional lift prior:** If enabled, a normal prior on the log relative lift of every challenger vs control reweights the simulations. It is centred on your expected lift; its width comes from the skepticism setting (95% of prior mass within roughly −18% to +22% for *skeptical*, −39% to +63% for *moderate*, −86% to +610% for *uninformative*, at an expected lift of 0%). If disabled, no lift prior is applied at all.
+            2.  **Optional lift prior:** If enabled, a normal prior on the log relative lift of every challenger vs control reweights the simulations. It is centred on your expected lift; its width comes from the prior width setting (95% of prior mass within roughly −18% to +22% for *narrow*, −39% to +63% for *medium*, −86% to +610% for *wide*, at an expected lift of 0%). Only a prior centred on 0% is skeptical: a narrow prior around a non-zero expected lift is a confident belief in that direction. If disabled, no lift prior is applied at all.
             3.  **Monte Carlo Simulation:** 100,000 simulations for the winning probabilities, 20,000 for the uplift distribution and 50,000 for the business case. A warning appears when the lift prior leaves too few effective simulations.
             4.  **Uplift Distribution:** The relative difference in conversion rate between each challenger and the control, across all simulations.
-            5.  **Revenue Modeling:** The conversion-rate difference times the average daily visitors per variant, multiplied by the Average Order Value (AOV) over a **183-day horizon**. Using the same traffic for every variant means an uneven traffic split cannot decide the result.
+            5.  **Revenue Modeling:** In each simulation, the revenue difference between challenger and control (each variant's conversion rate times its own AOV) at the average daily visitors per variant, over a **183-day horizon**. Each variant's AOV is treated as an uncertain average that becomes more precise the more conversions it has. Using the same traffic for every variant means an uneven traffic split cannot decide the result.
 
             All calculations run in the First Order Engine (FOE) Bayesian engine.
             """)
 
         with st.expander("Bayesian: Interpretation"):
             st.markdown(r"""
-            * **Chance to Beat Control:** The probability that the Variant is superior to the Control. A value $>95\%$ is a strong winner.
+            * **Chance to win:** The probability that a variant has the highest conversion rate of all variants (bar chart and Results Summary). The verdict compares it with your minimum probability for a winner: at or above it, the challenger is a winner; if the control reaches it, a loss is averted; otherwise the test is inconclusive.
+            * **Chance to Beat Control:** The probability that a challenger's conversion rate is higher than the control's. With two variants, this equals the chance to win.
+            * **Chance of Higher Revenue:** The probability that a challenger earns more than the control once each variant's AOV is included. It differs from the Chance to Beat Control whenever the AOVs differ.
             * **Expected Total Contribution:** The net expected monetary gain over 6 months. This accounts for both the upside and the downside risk.
-            * **Probability Density Graph:** Visualizes the uncertainty. Thinner, taller peaks indicate higher certainty in the conversion rate.
+            * **Uplift distribution:** One histogram per challenger, showing the relative conversion-rate uplift vs control across all simulations. Green bars are simulations where the challenger is better, red where the control is better, and the dashed line is the observed uplift. A narrower distribution means more certainty.
             """)
 
 
@@ -186,9 +191,11 @@ def get_bayesian_inputs():
         "AOV Variability",
         min_value=0.1, max_value=2.0, step=0.1,
         value=st.session_state.get("aov_cv", 0.5),
-        help="Coefficient of variation for order value (std / mean). "
-             "Lower = stable pricing, higher = wide price range. "
-             "Does not affect the average prediction, only the spread."
+        help="How much individual order values vary (std / mean): lower = stable pricing, "
+             "higher = wide price range. It sets how uncertain each variant's average AOV is, "
+             "which matters less the more conversions a variant has. It doesn't change the "
+             "Expected Total Contribution, but higher values widen the range of outcomes, so "
+             "Expected Uplift and Expected Risk both grow."
     )
 
     st.write("---")
@@ -209,7 +216,8 @@ def get_bayesian_inputs():
 
     use_priors = st.checkbox(
         "Apply a lift prior?",
-        help="Express skepticism about large lifts before seeing the data. Recommended for most experiments."
+        help="Express a belief about the lift before seeing the data. Centred on 0%, it guards "
+             "against implausibly large lifts on small samples. Recommended for most experiments."
     )
 
     if use_priors:
@@ -222,28 +230,28 @@ def get_bayesian_inputs():
                 help="Your best guess at the relative lift before seeing results. Use 0 if you have no directional expectation."
             )
         with col2:
-            raw_skepticism = st.selectbox(
-                "Skepticism",
-                ["skeptical", "moderate", "uninformative"],
+            prior_width = st.selectbox(
+                "Prior width",
+                PRIOR_WIDTHS,
                 index=0,
-                help="How strongly you believe large lifts are implausible. 'Skeptical' resists extreme results; 'uninformative' applies almost no pressure."
+                format_func=width_label,
+                help="The range of lifts the prior treats as plausible before seeing data. "
+                     "The ranges shown are for an expected lift of 0%; the text below shows "
+                     "the range for your expected lift. Only a prior centred on 0% is skeptical: "
+                     "a narrow prior around a non-zero lift is a confident belief in that direction."
             )
 
-        valid_scepticism = cast(Literal["skeptical", "moderate", "uninformative"], raw_skepticism)
         lift_prior: Optional[LiftPrior] = get_lift_prior(
-            expected_lift_pct=expected_lift_pct, skepticism=valid_scepticism
+            expected_lift_pct=expected_lift_pct, skepticism=prior_width
         )
         prior_only = prior_prob_positive_lift(lift_prior)
 
-        # 95% of the prior's mass on relative lift (normal prior on log-lift).
-        z = 1.96
-        low_pct = np.expm1(lift_prior.mean_log_lift - z * lift_prior.std_log_lift) * 100
-        high_pct = np.expm1(lift_prior.mean_log_lift + z * lift_prior.std_log_lift) * 100
+        low_pct, high_pct = prior_range_pct(lift_prior)
         strength_note = {
-            "skeptical": "Observed lifts outside this range are pulled back noticeably, especially on small samples.",
-            "moderate": "Only clearly extreme observed lifts are pulled back.",
-            "uninformative": "This range is so wide that the prior has practically no effect on realistic lifts.",
-        }[valid_scepticism]
+            "narrow": "Observed lifts outside this range are pulled back noticeably, especially on small samples.",
+            "medium": "Only clearly extreme observed lifts are pulled back.",
+            "wide": "This range is so wide that the prior has practically no effect on realistic lifts.",
+        }[prior_width]
         if abs(prior_only - 0.5) < 0.005:
             direction_note = "It is neutral about direction: on its own, it gives a challenger a 50% chance to beat control."
         else:
@@ -253,7 +261,7 @@ def get_bayesian_inputs():
             )
 
         st.caption(
-            f"{'An' if valid_scepticism == 'uninformative' else 'A'} **{valid_scepticism}** prior centred on **{expected_lift_pct:+.1f}%** treats lifts between roughly "
+            f"A **{prior_width}** prior centred on **{expected_lift_pct:+.1f}%** treats lifts between roughly "
             f"**{low_pct:+.0f}%** and **{high_pct:+.0f}%** as plausible before seeing any data. "
             f"{strength_note} {direction_note}"
         )
@@ -531,7 +539,6 @@ def run_bayesian_analysis(
                 runtime_days=runtime_days,
                 projection_period=183,
             ),
-            prob_best_overall=probabilities_to_be_best,
             variant_labels=labels,
             lift_prior=lift_prior,
             aov_cv=aov_cv,
@@ -540,7 +547,10 @@ def run_bayesian_analysis(
             {
                 "Variant": r["variant_label"],
                 "Chance to Beat Control": round(r["prob_beat_control"] * 100, 2),
-                "Chance to be Best Overall": round(r["prob_best_overall"] * 100, 2),
+                "Chance of Higher Revenue": round(r["prob_revenue_better"] * 100, 2),
+                # Same 100k-draw estimate as the chart and results summary, so the
+                # page shows one number (the projection's own draws differ by ~0.01).
+                "Chance to be Best Overall": round(probabilities_to_be_best[r["variant_index"]] * 100, 2),
                 "Expected Monetary Uplift": r["expected_uplift"],
                 # FOE reports risk as a non-negative magnitude; this page shows it as a loss.
                 "Expected Monetary Risk": -r["expected_risk"],
@@ -563,13 +573,13 @@ def display_monte_carlo_precision(output: BayesianOutput):
     ess, n = output.effective_sample_size, output.n_samples
     if ess >= LOW_ESS_FRACTION * n:
         return
-    p = max(output.probabilities_to_be_best)
-    margin = 1.96 * math.sqrt(max(p * (1 - p), 1e-12) / ess) * 100
+    p = min(max(output.probabilities_to_be_best), 1.0)
+    margin = mc_margin(p, ess) * 100
     st.warning(
         f"The lift prior and the data disagree strongly: only about {ess:,.0f} of "
         f"{n:,} simulations carry meaningful weight. Probabilities near your winner "
         f"threshold are only accurate to roughly ±{margin:.1f} percentage points. "
-        f"Collect more data, or loosen the skepticism setting."
+        f"Collect more data, or choose a wider prior."
     )
 
 
@@ -707,6 +717,28 @@ def display_results_per_variant(
             unsafe_allow_html=True
         )
 
+        # Conversion rate and revenue can point in opposite directions when the AOVs differ.
+        if df is not None and "Chance of Higher Revenue" in df.columns:
+            row = df.loc[df["Variant"] == challenger_label]
+            if not row.empty:
+                p_rate = float(row["Chance to Beat Control"].iloc[0])
+                p_revenue = float(row["Chance of Higher Revenue"].iloc[0])
+                if (p_rate - 50) * (p_revenue - 50) < 0:
+                    if p_rate > 50:
+                        st.info(
+                            f"Variant {challenger_label} likely converts better than control "
+                            f"({p_rate:.1f}% chance), but is likely to earn **less** "
+                            f"({p_revenue:.1f}% chance of higher revenue) because of its AOV. "
+                            f"Check the Business Risk Assessment before shipping it."
+                        )
+                    else:
+                        st.info(
+                            f"Variant {challenger_label} likely converts worse than control "
+                            f"({p_rate:.1f}% chance to beat it), but is likely to earn **more** "
+                            f"({p_revenue:.1f}% chance of higher revenue) because of its AOV. "
+                            f"Check the Business Risk Assessment before discarding it."
+                        )
+
         if num_variants > 2:
             st.write("---")
 
@@ -714,27 +746,35 @@ def display_results_per_variant(
         if df is not None:
             st.write("#### Business Risk Assessment")
             st.write("""
-                The table below shows the potential contribution to revenue over 6 months.
-                AOV is modelled as a log-normal variable around your input values, adding
-                realistic spread without inflating or deflating the point estimates.
+                The table below shows the potential contribution to revenue over 6 months, with
+                each variant valued at its own AOV. The AOVs you entered are averages over a
+                limited number of orders, so they are treated as uncertain too: the fewer
+                conversions a variant has, the more its average AOV can vary.
                 On smaller datasets of < 1000 conversions, interpret with care.
             """)
             with st.expander("How is the business case calculated?"):
                 st.markdown(r"""
                     The business risk assessment translates the Bayesian simulation into a 6-month monetary projection.
-                    It runs 50,000 simulations per variant and applies the following logic:
+                    It runs 50,000 simulations and applies the following logic:
 
                     **Conversion rate sampling**
-                    For each simulation, a conversion rate is drawn from the posterior Beta distribution, updated with
-                    the observed visitors and conversions. The daily difference in conversions is then estimated at the
-                    same traffic for every variant, so an uneven traffic split cannot decide which variant is better:
-                    $$\text{Daily Difference} = (CR_{challenger} - CR_{control}) \times \frac{\text{Average visitors per variant}}{\text{Runtime (days)}}$$
+                    In each simulation, every variant's conversion rate is drawn from its posterior Beta distribution,
+                    updated with the observed visitors and conversions.
 
                     **AOV sampling**
-                    Rather than treating AOV as a fixed constant, it is drawn from a log-normal distribution on each
-                    simulation. The distribution is parameterised so that the expected value equals your input AOV exactly -
-                    only variance is added, not bias. The degree of spread is controlled by the AOV Variability slider
-                    (coefficient of variation: std / mean).
+                    The AOV you enter is an average over the variant's orders, so it is uncertain. In each simulation,
+                    every variant's average AOV is drawn from a log-normal distribution whose expected value equals your
+                    input exactly, with standard deviation
+                    $$\text{SD} = \frac{\text{AOV} \times \text{CV}}{\sqrt{\text{Conversions}}}$$
+                    where CV is the AOV Variability slider (how much individual order values vary: std / mean). A variant
+                    with many conversions has a precisely known average AOV; one with few conversions does not.
+
+                    **Revenue difference**
+                    Each simulation compares revenue at the same traffic for every variant, so an uneven traffic split
+                    cannot decide the result, and values each variant at its own AOV:
+                    $$\text{Daily Revenue Difference} = (CR_{challenger} \times AOV_{challenger} - CR_{control} \times AOV_{control}) \times \frac{\text{Average visitors per variant}}{\text{Runtime (days)}}$$
+                    A variant with the same conversion rate but a higher AOV therefore shows a gain, and one with a
+                    lower AOV shows a loss.
 
                     **Lift prior**
                     If a lift prior is applied, importance weights are computed for each simulation based on how
@@ -743,19 +783,24 @@ def display_results_per_variant(
                     every simulation counts equally.
 
                     **Uplift and risk**
-                    Positive and negative daily differences are separated:
+                    The daily revenue difference is split into its positive and negative parts across all simulations:
 
                     | | Formula |
                     |---|---|
-                    | Expected Daily Gain | Mean of positive differences × sampled challenger AOV |
-                    | Expected Daily Loss | Mean of negative differences × sampled control AOV |
-                    | Monetary Uplift | Daily Gain × 183 days × P(challenger better) |
-                    | Monetary Risk | Daily Loss × 183 days × P(control better) |
-                    | Total Contribution | Monetary Uplift + Monetary Risk |
+                    | Expected Monetary Uplift | 183 days × average of the revenue difference over all simulations, counting losses as 0 |
+                    | Expected Monetary Risk | 183 days × average of the revenue difference over all simulations, counting gains as 0 |
+                    | Expected Total Contribution | Monetary Uplift + Monetary Risk |
+                    | Chance of Higher Revenue | Share of simulations in which the challenger earns more than the control |
+                    | Chance to Beat Control | Share of simulations in which the challenger's conversion rate is higher (AOV not included) |
 
                     **Interpretation**
+                    - Chance to Beat Control is about conversion rate only; Chance of Higher Revenue also includes AOV.
+                    When they point in different directions, the variant converts differently from how it earns, and a
+                    note appears in the Results Summary.
                     - A positive Total Contribution means the expected gain outweighs the expected loss over 6 months.
                     - Monetary Risk is always negative or zero. It represents the downside if the variant underperforms.
+                    - The AOV Variability slider doesn't change the Total Contribution, but a higher value widens the range
+                    of outcomes, so Uplift and Risk both grow.
                     - On datasets with fewer than 1,000 conversions, the simulation may surface more extreme values.
                     Treat projections on small samples as directional, not precise.
 

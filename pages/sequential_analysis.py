@@ -7,6 +7,7 @@ import uuid
 from pydantic import ValidationError
 from st_supabase_connection import SupabaseConnection
 from foe.bayesian.operations import BayesianEngine, get_lift_prior
+from utility.lift_prior_ui import PRIOR_WIDTHS, normalize_width, width_label
 from foe.core.models import BusinessCaseInput, ExperimentInput
 from foe.sequential.operations import SequentialEngine, TestType as FoeSequentialTestType
 
@@ -60,7 +61,7 @@ def get_deduped_variant_df(df, variant_name):
 
 # --- BUSINESS IMPACT (BAYESIAN REVENUE OVERLAY) ---
 # Ad-hoc monetary lens on top of the locked mSPRT test: delegates the Beta
-# posterior CR sampling, log-normal AOV sampling, lift-plausibility weighting,
+# posterior CR sampling, mean-AOV uncertainty sampling, lift-plausibility weighting,
 # and monetary projection to the shared FOE BayesianEngine (foe.bayesian.operations)
 # rather than re-implementing it here. Never feeds back into alpha/beta/tau or
 # the LLR decision itself. Requires a real Control group, so it only applies
@@ -90,15 +91,13 @@ def _compute_revenue_impact(
     )
     engine = BayesianEngine(seed=42)
 
-    experiment_input = ExperimentInput(
+    # Validates the counts (raises ValidationError, handled by the caller);
+    # run_monetary_projection itself does not check them.
+    ExperimentInput(
         visitors=list(batch_visitors),
         conversions=list(batch_conversions),
         labels=list(batch_labels),
     )
-    probability_results = engine.run_probability_analysis(experiment_input, lift_prior=lift_prior)
-    # index 0 (Control) is unused by run_monetary_projection.
-    prob_best_overall = [0.0] + [r.prob_being_best for r in probability_results]
-
     biz_case = BusinessCaseInput(
         aovs={label: aov_value for label in batch_labels},
         runtime_days=runtime_days,
@@ -108,7 +107,6 @@ def _compute_revenue_impact(
         visitors=list(batch_visitors),
         conversions=list(batch_conversions),
         biz_case=biz_case,
-        prob_best_overall=prob_best_overall,
         variant_labels=list(batch_labels),
         lift_prior=lift_prior,
         aov_cv=aov_cv,
@@ -395,15 +393,18 @@ def analysis_section(df, params):
             min_value=0.1, max_value=2.0, step=0.1,
             value=st.session_state.get("seq_aov_cv", 0.5),
             key="seq_aov_cv",
-            help="Coefficient of variation for order value (std / mean). Does not affect "
-                 "the average prediction, only the spread.",
+            help="How much individual order values vary (std / mean). It sets how uncertain "
+                 "the average AOV is, which matters less the more conversions there are. It "
+                 "doesn't change the value if you stop now, but higher values widen the range "
+                 "of outcomes, so Expected Uplift and Expected Risk both grow.",
         )
 
         use_lift_prior = st.checkbox(
             "Apply a lift prior?",
             value=st.session_state.get("seq_use_lift_prior", False),
             key="seq_use_lift_prior",
-            help="Express skepticism about large lifts before seeing the data.",
+            help="Express a belief about the lift before seeing the data. Centred on 0%, it "
+                 "guards against implausibly large lifts on small samples.",
         )
         if use_lift_prior:
             lp_col1, lp_col2 = st.columns(2)
@@ -412,12 +413,19 @@ def analysis_section(df, params):
                 value=st.session_state.get("seq_expected_lift_pct", 0.0),
                 key="seq_expected_lift_pct",
             )
+            # Settings saved under the old width names ("skeptical", ...) map onto
+            # the current options; FOE accepts both, the dropdown only the new ones.
+            st.session_state["seq_skepticism"] = normalize_width(
+                st.session_state.get("seq_skepticism")
+            )
             skepticism = lp_col2.selectbox(
-                "Skepticism", ["skeptical", "moderate", "uninformative"],
-                index=["skeptical", "moderate", "uninformative"].index(
-                    st.session_state.get("seq_skepticism", "skeptical")
-                ),
+                "Prior width", PRIOR_WIDTHS,
+                format_func=width_label,
                 key="seq_skepticism",
+                help="The range of lifts the prior treats as plausible before seeing data, "
+                     "shown for an expected lift of 0%. Only a prior centred on 0% is "
+                     "skeptical: a narrow prior around a non-zero lift is a confident belief "
+                     "in that direction.",
             )
         else:
             expected_lift_pct = 0.0

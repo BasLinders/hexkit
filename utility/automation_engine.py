@@ -103,7 +103,7 @@ MONETARY_METHOD_NOTES: dict[str, dict[str, list[str]]] = {
         "cons": [
             "Monte Carlo based -- more expensive to compute, and the exact figure carries sampling noise across runs (controlled by the sample-size setting, but never fully eliminated).",
             "Always produces an expected-value number, even for a genuinely inconclusive result -- read alongside prob_beat_control/prob_being_best, never the money figure alone.",
-            "AOV is modelled as log-normal with an assumed variability (CV); if that's a poor match for the real order-value distribution, the estimate's spread (not its mean) is affected.",
+            "Each arm's average AOV is treated as uncertain, with SD = AOV x CV / sqrt(conversions) -- the same model Frequentist uses. The CV is an assumption: if it's off, the spread of uplift and risk is affected, not the net effect on revenue.",
             "Projects revenue at the AVERAGE daily traffic of ONE arm (mean visitors per variant / runtime_days), applied equally to control and variation -- i.e. the difference per arm's worth of traffic, not a full rollout. Frequentist/Continuous instead scale a single combined daily-visitor figure -- i.e. assume the winner is rolled out to 100% of future traffic. The two are not projecting the same future and their revenue figures are not directly comparable.",
         ],
     },
@@ -218,12 +218,12 @@ def run_bayesian_analysis(
     """
     Runs the FOE BayesianEngine (Beta-Binomial Monte Carlo) on a control/variation pair.
 
-    aov_cv is the same "AOV variability (CV)" the UI collects for Frequentist's
-    se_aov propagation, passed through to BayesianEngine.run_monetary_projection's
-    log-normal AOV sampling instead of silently falling back to its 0.5 default
-    regardless of what the user set — the two methods use the CV differently
-    (Frequentist propagates it as an estimation-uncertainty SE; Bayesian samples
-    AOV directly from it each draw), but both should reflect the same input.
+    aov_cv is the same "AOV variability (CV)" the UI collects for Frequentist,
+    passed through to BayesianEngine.run_monetary_projection instead of letting
+    it fall back to its 0.5 default. Both methods now treat it the same way: as
+    uncertainty in each arm's mean AOV, SD = AOV * cv / sqrt(conversions)
+    (Frequentist as an estimation SE, Bayesian by sampling each arm's mean AOV
+    from a log-normal with that SD).
     """
     data = ExperimentInput(
         visitors=[control.visitors, variation.visitors],
@@ -244,15 +244,10 @@ def run_bayesian_analysis(
         runtime_days=runtime_days,
         projection_period=projection_days,
     )
-    # Exact for 2 variants: exactly one of {control, variation} wins each Monte
-    # Carlo draw, so prob_best_overall[control] = 1 - prob_being_best(variation).
-    prob_best_overall = [1.0 - prob_result.prob_being_best, prob_result.prob_being_best]
-
     monetary = engine.run_monetary_projection(
         visitors=[control.visitors, variation.visitors],
         conversions=[control.conversions, variation.conversions],
         biz_case=biz_case,
-        prob_best_overall=prob_best_overall,
         variant_labels=[control.label, variation.label],
         aov_cv=aov_cv,
         n_simulations=n_samples,
