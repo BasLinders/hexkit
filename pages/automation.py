@@ -827,9 +827,9 @@ def _render_stage_configure():
 
     active_methods = [
         m for m, using in (
+            ("Continuous", use_continuous),
             ("Frequentist", use_frequentist),
             ("Bayesian", use_bayesian),
-            ("Continuous", use_continuous),
         ) if using
     ]
     revenue_source = active_methods[0].lower() if active_methods else "frequentist"
