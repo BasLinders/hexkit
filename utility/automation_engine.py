@@ -98,13 +98,13 @@ MONETARY_METHOD_NOTES: dict[str, dict[str, list[str]]] = {
         "pros": [
             "Full posterior distribution, not just a point estimate + CI -- captures asymmetric uncertainty naturally instead of assuming a symmetric normal spread.",
             "Separates expected upside from expected downside risk explicitly, giving a decision-theoretic 'is this bet worth it' read even before conventional significance is reached.",
-            "A lift prior guards against small-sample overestimation of implausibly large effects.",
+            "FOE's engine supports a lift prior to guard against small-sample overestimation of implausibly large effects (not applied in this automation flow, which uses the plain Beta-Binomial posterior).",
         ],
         "cons": [
             "Monte Carlo based -- more expensive to compute, and the exact figure carries sampling noise across runs (controlled by the sample-size setting, but never fully eliminated).",
             "Always produces an expected-value number, even for a genuinely inconclusive result -- read alongside prob_beat_control/prob_being_best, never the money figure alone.",
             "AOV is modelled as log-normal with an assumed variability (CV); if that's a poor match for the real order-value distribution, the estimate's spread (not its mean) is affected.",
-            "Projects future volume by scaling each variant's OWN observed visitors by runtime_days -- i.e. assumes the traffic split observed during the test continues. Frequentist/Continuous instead scale a single combined daily-visitor figure -- i.e. assume the winner is rolled out to 100% of future traffic. The two are not projecting the same future and their revenue figures are not directly comparable.",
+            "Projects revenue at the AVERAGE daily traffic of ONE arm (mean visitors per variant / runtime_days), applied equally to control and variation -- i.e. the difference per arm's worth of traffic, not a full rollout. Frequentist/Continuous instead scale a single combined daily-visitor figure -- i.e. assume the winner is rolled out to 100% of future traffic. The two are not projecting the same future and their revenue figures are not directly comparable.",
         ],
     },
     "continuous": {
@@ -130,9 +130,9 @@ MONETARY_METHOD_GUIDANCE = (
     "finance audience -- Frequentist's closed-form CI is the most transparent. IMPORTANT: the three "
     "figures are not a like-for-like comparison even before uncertainty is considered -- Frequentist "
     "and Continuous project revenue assuming the winning variant is rolled out to 100% of future "
-    "traffic (today's combined daily visitors), while Bayesian projects forward assuming the SAME "
-    "traffic split observed during the test continues (each arm scaled by its own historical daily "
-    "visitors). In an even split, Bayesian's figure will run roughly half of Frequentist/Continuous's "
+    "traffic (today's combined daily visitors), while Bayesian projects the difference at ONE arm's "
+    "average daily traffic (mean visitors per variant), the same for control and variation. In a "
+    "two-arm test, Bayesian's figure will therefore run roughly half of Frequentist/Continuous's "
     "for a comparable effect size -- that gap reflects differing rollout assumptions, not disagreement "
     "about the underlying effect."
 )
@@ -233,21 +233,13 @@ def run_bayesian_analysis(
     engine = BayesianEngine()
     prob_result = engine.run_probability_analysis(data, n_samples=n_samples)[0]
 
-    # BayesianEngine._sample_aov draws AOV samples via
-    # np.log(mean_aov) -- an AOV of exactly 0.0 (VariantData.aov defaults to
-    # 0.0 when a variant has zero conversions, e.g. very early in a test)
-    # sends that straight to log(0) = -inf, raising a RuntimeWarning on every
-    # such run. It doesn't crash -- exp(-inf) underflows cleanly to 0.0,
-    # which is the right degenerate answer (no order data to model an AOV
-    # distribution from) -- but relying on float underflow instead of an
-    # explicit guard is fragile. Clamped to a negligible epsilon instead:
-    # indistinguishable from 0 in any reported figure (every downstream
-    # value rounds to cents) but keeps log() finite.
-    _AOV_EPSILON = 1e-6
+    # A missing AOV (VariantData.aov is 0.0 when a variant has no conversions
+    # yet) is passed as 0.0: FOE's _sample_aov returns zeros for a
+    # non-positive AOV, so that arm simply contributes no revenue.
     biz_case = BusinessCaseInput(
         aovs={
-            control.label: control.aov or _AOV_EPSILON,
-            variation.label: variation.aov or _AOV_EPSILON,
+            control.label: control.aov or 0.0,
+            variation.label: variation.aov or 0.0,
         },
         runtime_days=runtime_days,
         projection_period=projection_days,

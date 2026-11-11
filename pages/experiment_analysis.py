@@ -235,9 +235,27 @@ def get_bayesian_inputs():
         )
         prior_only = prior_prob_positive_lift(lift_prior)
 
+        # 95% of the prior's mass on relative lift (normal prior on log-lift).
+        z = 1.96
+        low_pct = np.expm1(lift_prior.mean_log_lift - z * lift_prior.std_log_lift) * 100
+        high_pct = np.expm1(lift_prior.mean_log_lift + z * lift_prior.std_log_lift) * 100
+        strength_note = {
+            "skeptical": "Observed lifts outside this range are pulled back noticeably, especially on small samples.",
+            "moderate": "Only clearly extreme observed lifts are pulled back.",
+            "uninformative": "This range is so wide that the prior has practically no effect on realistic lifts.",
+        }[valid_scepticism]
+        if abs(prior_only - 0.5) < 0.005:
+            direction_note = "It is neutral about direction: on its own, it gives a challenger a 50% chance to beat control."
+        else:
+            direction_note = (
+                f"It leans {'positive' if prior_only > 0.5 else 'negative'}: on its own, it gives a challenger "
+                f"a **{prior_only:.0%}** chance to beat control."
+            )
+
         st.caption(
-            f"A **{valid_scepticism}** prior is applied with an expected lift of **{expected_lift_pct:+.1f}%**. "
-            f"Before seeing any data, this prior alone gives a challenger a **{prior_only:.0%}** chance to beat control."
+            f"{'An' if valid_scepticism == 'uninformative' else 'A'} **{valid_scepticism}** prior centred on **{expected_lift_pct:+.1f}%** treats lifts between roughly "
+            f"**{low_pct:+.0f}%** and **{high_pct:+.0f}%** as plausible before seeing any data. "
+            f"{strength_note} {direction_note}"
         )
         if abs(prior_only - 0.5) > 0.10:
             st.warning(
