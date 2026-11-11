@@ -81,9 +81,13 @@ def _compute_revenue_impact(
     unrelated widgets). Takes hashable primitives only -- the lift prior is
     rebuilt from its (expected_lift_pct, skepticism) inputs inside the cache
     boundary rather than passed in as an object, so caching doesn't depend on
-    how the foe package's dataclass happens to hash.
+    how the foe package's dataclass happens to hash. skepticism=None means no
+    lift prior (plain Beta-Binomial posterior).
     """
-    lift_prior = get_lift_prior(expected_lift_pct=expected_lift_pct, skepticism=skepticism)
+    lift_prior = (
+        None if skepticism is None
+        else get_lift_prior(expected_lift_pct=expected_lift_pct, skepticism=skepticism)
+    )
     engine = BayesianEngine(seed=42)
 
     experiment_input = ExperimentInput(
@@ -417,7 +421,7 @@ def analysis_section(df, params):
             )
         else:
             expected_lift_pct = 0.0
-            skepticism = "uninformative"
+            skepticism = None  # no lift prior
 
     revenue_enabled = aov_value > 0 and test_type == TEST_TYPE_MULTI_SAMPLE
     if aov_value > 0 and test_type == TEST_TYPE_ONE_SAMPLE:

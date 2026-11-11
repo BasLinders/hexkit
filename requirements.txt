@@ -25,10 +25,12 @@ db-dtypes
 requests>=2.31.0
 pydantic>=2.0.0
 google-genai>=0.3.0
-# Pinned to the commit that added foe.frequentist.boschloo (used by
-# pages/small_sample_analysis.py; foe/data was added earlier) rather
-# than @main -- first-order-engine has no versioned releases yet, and
+# Pinned to the commit that fixed the BayesianEngine lift-prior weighting
+# and added prior_prob_positive_lift / simulate_uplift_distributions (used by
+# pages/experiment_analysis.py; foe.frequentist.boschloo and foe/data were
+# added earlier) rather than @main -- first-order-engine has no versioned
+# releases yet, and
 # utility/sql_builder.py + utility/bq_client.py now prefer this backend when
 # available (see USING_FOE_BACKEND in each), falling back to their own native
 # implementation otherwise. Bump this SHA deliberately, not accidentally.
-foe[bigquery] @ git+https://github.com/BasLinders/first-order-engine.git@904170a8c79b01d69a33cc3962b37d531ec068b2
+foe[bigquery] @ git+https://github.com/BasLinders/first-order-engine.git@f9589750eec1014621f83eee1341578feeae901f

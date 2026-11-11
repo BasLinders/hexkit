@@ -21,7 +21,13 @@ from typing import Literal, List, Tuple, Dict, Any, Optional, cast
 
 from foe.frequentist.operations import FrequentistEngine
 from foe.frequentist.confidence import compute_interval_difference
-from foe.core.models import AlternativeHypothesis
+from foe.core.models import AlternativeHypothesis, BusinessCaseInput, ExperimentInput
+from foe.bayesian.operations import (
+    BayesianEngine,
+    LiftPrior,
+    get_lift_prior,
+    prior_prob_positive_lift,
+)
 
 from utility.small_sample import BOSCHLOO_MAX_PER_ARM
 
@@ -101,10 +107,13 @@ def display_dynamic_documentation(analysis_method):
 
         with st.expander("Bayesian: How it works"):
             st.markdown(r"""
-            1.  **Prior & Posterior:** Unless specified by entering expectations, we start with a **Beta-Binomial conjugate prior** ($\alpha=1, \beta=1$). As data comes in, we update this to a posterior distribution.
-            2. **Uplift Distribution:** Calculates the difference in daily conversions between variants across all simulations to build a full distribution of potential outcomes.
-            3.  **Monte Carlo Simulation:** We run 20,000 simulations per variant to model the probability density.
-            4.  **Revenue Modeling:** Projects the cumulative effect of the daily difference multiplied by the Average Order Value (AOV) over a **183-day horizon**.
+            1.  **Prior & Posterior:** Each variant's conversion rate starts from a flat **Beta-Binomial conjugate prior** ($\alpha=1, \beta=1$) and is updated with the observed visitors and conversions.
+            2.  **Optional lift prior:** If enabled, a normal prior on the log relative lift of every challenger vs control reweights the simulations. It is centred on your expected lift; its width comes from the skepticism setting (95% of prior mass within roughly −18% to +22% for *skeptical*, −39% to +63% for *moderate*, −86% to +610% for *uninformative*, at an expected lift of 0%). If disabled, no lift prior is applied at all.
+            3.  **Monte Carlo Simulation:** 100,000 simulations for the winning probabilities, 20,000 for the uplift distribution and 50,000 for the business case. A warning appears when the lift prior leaves too few effective simulations.
+            4.  **Uplift Distribution:** The relative difference in conversion rate between each challenger and the control, across all simulations.
+            5.  **Revenue Modeling:** The conversion-rate difference times the average daily visitors per variant, multiplied by the Average Order Value (AOV) over a **183-day horizon**. Using the same traffic for every variant means an uneven traffic split cannot decide the result.
+
+            All calculations run in the First Order Engine (FOE) Bayesian engine.
             """)
 
         with st.expander("Bayesian: Interpretation"):
@@ -220,24 +229,30 @@ def get_bayesian_inputs():
                 help="How strongly you believe large lifts are implausible. 'Skeptical' resists extreme results; 'uninformative' applies almost no pressure."
             )
 
-        beta_prior = get_beta_priors()
         valid_scepticism = cast(Literal["skeptical", "moderate", "uninformative"], raw_skepticism)
-        lift_prior = get_lift_prior(expected_lift_pct=expected_lift_pct, skepticism=valid_scepticism)
+        lift_prior: Optional[LiftPrior] = get_lift_prior(
+            expected_lift_pct=expected_lift_pct, skepticism=valid_scepticism
+        )
+        prior_only = prior_prob_positive_lift(lift_prior)
 
         st.caption(
             f"A **{valid_scepticism}** prior is applied with an expected lift of **{expected_lift_pct:+.1f}%**. "
-            f"At your typical sample sizes, this will only meaningfully affect results when the data is ambiguous."
+            f"Before seeing any data, this prior alone gives a challenger a **{prior_only:.0%}** chance to beat control."
         )
+        if abs(prior_only - 0.5) > 0.10:
+            st.warning(
+                f"This prior is directional: on its own it moves the chance to beat control to "
+                f"{prior_only:.0%}, and it can push an inconclusive test past your winner threshold. "
+                f"Only use a non-zero expected lift when it is backed by earlier experiments."
+            )
     else:
-        beta_prior = get_beta_priors()
-        lift_prior = get_lift_prior(expected_lift_pct=0.0, skepticism="uninformative")
+        lift_prior = None
 
     return (
         st.session_state.visitor_counts,
         st.session_state.conversion_counts,
         st.session_state.aovs,
         st.session_state.aov_cv,
-        beta_prior,
         lift_prior,
         st.session_state.probability_winner,
         st.session_state.runtime_days
@@ -441,131 +456,103 @@ def validate_inputs(visitors, conversions, aovs=None) -> bool:
 
 
 # -- Bayesian helper functions --
+#
+# All Bayesian math (posteriors, lift-prior weighting, P(best), uplift
+# distributions, monetary projection) lives in FOE's BayesianEngine. This
+# page only builds the inputs and renders the outputs.
+
+BAYES_SEED = 42
+# Below this share of effectively-used simulations, the lift prior and the
+# data disagree enough that Monte Carlo error becomes visible in the output.
+LOW_ESS_FRACTION = 0.10
+
 
 @dataclass(frozen=True)
-class BetaPrior:
-    alpha: float
-    beta: float
+class BayesianOutput:
+    probabilities_to_be_best: List[float]  # index 0 = control
+    uplift_distributions: List[np.ndarray]  # one per challenger
+    effective_sample_size: float
+    n_samples: int
+    business_case: Optional[pd.DataFrame]
 
 
-@dataclass(frozen=True)
-class LiftPrior:
-    mean_log_lift: float
-    std_log_lift: float
-
-
-_LIFT_PRIOR_STD: dict[str, float] = {
-    "skeptical": 0.10,
-    "moderate": 0.25,
-    "uninformative": 1.00,
-}
-
-
-def calculate_probabilities(
+def run_bayesian_analysis(
     visitor_counts,
     conversion_counts,
-    beta_prior: BetaPrior,
-    lift_prior: LiftPrior,
-    num_samples: int = 10000,
-    seed: int = 42,
-) -> Tuple[List[float], np.ndarray]:
-    rng = np.random.default_rng(seed=seed)
+    aovs,
+    aov_cv: float,
+    runtime_days: int,
+    lift_prior: Optional[LiftPrior],
+) -> BayesianOutput:
+    """
+    Runs the full Bayesian flow through FOE. lift_prior=None means no lift
+    prior: the plain Beta-Binomial posterior, with no reweighting.
+    """
     num_variants = len(visitor_counts)
+    labels = list(string.ascii_uppercase[:num_variants])
+    data = ExperimentInput(
+        visitors=list(visitor_counts),
+        conversions=list(conversion_counts),
+        labels=labels,
+    )
+    engine = BayesianEngine(seed=BAYES_SEED)
 
-    all_samples = []
-    for i in range(num_variants):
-        alpha_post = beta_prior.alpha + conversion_counts[i]
-        beta_post = beta_prior.beta + (visitor_counts[i] - conversion_counts[i])
-        samples = rng.beta(alpha_post, beta_post, size=num_samples)
-        all_samples.append(samples)
+    results = engine.run_probability_analysis(data, lift_prior=lift_prior)
+    challenger_best = [r.prob_being_best for r in results]
+    probabilities_to_be_best = [max(0.0, 1.0 - sum(challenger_best))] + challenger_best
 
-    samples_matrix = np.array(all_samples)
-    control_samples = samples_matrix[0]
+    uplift_distributions = engine.simulate_uplift_distributions(data, lift_prior=lift_prior)
 
-    if num_variants > 1:
-        per_challenger_weights = np.array([
-            compute_lift_weights(control_samples, samples_matrix[i], lift_prior)
-            for i in range(1, num_variants)
-        ])
-        weights = per_challenger_weights.mean(axis=0)
-        weights /= weights.sum()
-    else:
-        weights = np.ones(num_samples) / num_samples
-
-    best_variant_indices = np.argmax(samples_matrix, axis=0)
-    probabilities_to_be_best = [
-        np.average(best_variant_indices == i, weights=weights)
-        for i in range(num_variants)
-    ]
-
-    return probabilities_to_be_best, samples_matrix
-
-
-def get_beta_priors() -> BetaPrior:
-    """
-    Returns a fixed uninformative prior. At typical sample sizes the data
-    dominates regardless; beliefs about lift are expressed via get_lift_prior.
-    """
-    return BetaPrior(alpha=1.0, beta=1.0)
-
-
-def get_lift_prior(
-    expected_lift_pct: float,
-    skepticism: Literal["skeptical", "moderate", "uninformative"],
-) -> LiftPrior:
-    if skepticism not in _LIFT_PRIOR_STD:
-        raise ValueError(
-            f"skepticism must be one of {list(_LIFT_PRIOR_STD)}, got {skepticism!r}."
+    business_case = None
+    if runtime_days > 0 and all((a or 0) > 0 for a in aovs):
+        monetary = engine.run_monetary_projection(
+            visitors=list(visitor_counts),
+            conversions=list(conversion_counts),
+            biz_case=BusinessCaseInput(
+                aovs={label: float(aovs[i]) for i, label in enumerate(labels)},
+                runtime_days=runtime_days,
+                projection_period=183,
+            ),
+            prob_best_overall=probabilities_to_be_best,
+            variant_labels=labels,
+            lift_prior=lift_prior,
+            aov_cv=aov_cv,
         )
-    if expected_lift_pct <= -100:
-        raise ValueError("expected_lift_pct must be greater than -100.")
+        business_case = pd.DataFrame([
+            {
+                "Variant": r["variant_label"],
+                "Chance to Beat Control": round(r["prob_beat_control"] * 100, 2),
+                "Chance to be Best Overall": round(r["prob_best_overall"] * 100, 2),
+                "Expected Monetary Uplift": r["expected_uplift"],
+                # FOE reports risk as a non-negative magnitude; this page shows it as a loss.
+                "Expected Monetary Risk": -r["expected_risk"],
+                "Expected Total Contribution": r["expected_total_contribution"],
+            }
+            for r in monetary
+        ])
 
-    return LiftPrior(
-        mean_log_lift=np.log1p(expected_lift_pct / 100.0),
-        std_log_lift=_LIFT_PRIOR_STD[skepticism],
+    return BayesianOutput(
+        probabilities_to_be_best=probabilities_to_be_best,
+        uplift_distributions=uplift_distributions,
+        effective_sample_size=results[0].effective_sample_size,
+        n_samples=results[0].n_samples,
+        business_case=business_case,
     )
 
 
-def compute_lift_weights(
-    cr_samples_control: np.ndarray,
-    cr_samples_challenger: np.ndarray,
-    prior: LiftPrior,
-) -> np.ndarray:
-    log_lift = np.log(cr_samples_challenger) - np.log(cr_samples_control)
-    log_w = norm.logpdf(log_lift, prior.mean_log_lift, prior.std_log_lift)
-    w = np.exp(log_w - log_w.max())
-    return w / w.sum()
-
-
-def simulate_uplift_distributions(
-    visitor_counts,
-    conversion_counts,
-    beta_prior: BetaPrior,
-    lift_prior: LiftPrior,
-    num_samples: int = 20000,
-    seed: int = 42,
-) -> List[np.ndarray]:
-    rng = np.random.default_rng(seed=seed)
-    num_variants = len(visitor_counts)
-
-    all_samples = []
-    for i in range(num_variants):
-        alpha_post = beta_prior.alpha + conversion_counts[i]
-        beta_post = beta_prior.beta + (visitor_counts[i] - conversion_counts[i])
-        all_samples.append(rng.beta(alpha_post, beta_post, size=num_samples))
-
-    samples_matrix = np.array(all_samples)
-    control_samples = samples_matrix[0]
-
-    uplift_distributions = []
-    for i in range(1, num_variants):
-        challenger_samples = samples_matrix[i]
-        weights = compute_lift_weights(control_samples, challenger_samples, lift_prior)
-        uplift = (challenger_samples - control_samples) / (control_samples + 1e-9)
-        resampled_indices = rng.choice(num_samples, size=num_samples, p=weights)
-        uplift_distributions.append(uplift[resampled_indices])
-
-    return uplift_distributions
+def display_monte_carlo_precision(output: BayesianOutput):
+    """Warns when lift-prior weighting leaves too few effective simulations."""
+    ess, n = output.effective_sample_size, output.n_samples
+    if ess >= LOW_ESS_FRACTION * n:
+        return
+    p = max(output.probabilities_to_be_best)
+    margin = 1.96 * math.sqrt(max(p * (1 - p), 1e-12) / ess) * 100
+    st.warning(
+        f"The lift prior and the data disagree strongly: only about {ess:,.0f} of "
+        f"{n:,} simulations carry meaningful weight. Probabilities near your winner "
+        f"threshold are only accurate to roughly ±{margin:.1f} percentage points. "
+        f"Collect more data, or loosen the skepticism setting."
+    )
 
 
 def plot_uplift_histograms(uplift_distributions, observed_uplifts):
@@ -665,99 +652,6 @@ def plot_winner_probabilities_chart(probabilities_to_be_best):
     plt.close(fig)
 
 
-def sample_aov(mean_aov: float, cv: float, n_samples: int, rng: np.random.Generator) -> np.ndarray:
-    """
-    Draw AOV samples from a log-normal distribution with the given mean
-    and coefficient of variation (CV = std / mean).
-
-    The parameterisation preserves E[AOV] = mean_aov exactly, so predictions
-    are not inflated or deflated; only variance is added.
-    """
-    if mean_aov <= 0:
-        return np.zeros(n_samples)
-    sigma2 = np.log1p(cv ** 2)
-    mu = np.log(mean_aov) - sigma2 / 2
-    return rng.lognormal(mean=mu, sigma=np.sqrt(sigma2), size=n_samples)
-
-
-def perform_multi_variant_risk_assessment(
-    visitor_counts,
-    conversion_counts,
-    aovs,
-    probabilities_to_be_best,
-    runtime_days,
-    beta_prior: BetaPrior,
-    lift_prior: LiftPrior,
-    aov_cv: float = 0.5,
-    projection_period: int = 183,
-    seed: int = 42,
-) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    num_variants = len(visitor_counts)
-    if runtime_days == 0:
-        return pd.DataFrame()
-
-    n_simulations = 20000
-    cr_samples = []
-    all_daily_conversion_samples = []
-
-    for i in range(num_variants):
-        alpha_post = beta_prior.alpha + conversion_counts[i]
-        beta_post = beta_prior.beta + (visitor_counts[i] - conversion_counts[i])
-        samples_cr = rng.beta(alpha_post, beta_post, size=n_simulations)
-        cr_samples.append(samples_cr)
-        all_daily_conversion_samples.append((samples_cr * visitor_counts[i]) / runtime_days)
-
-    control_samples = all_daily_conversion_samples[0]
-    control_cr = cr_samples[0]
-
-    results = []
-    for i in range(1, num_variants):
-        challenger_samples = all_daily_conversion_samples[i]
-        challenger_cr = cr_samples[i]
-
-        weights = compute_lift_weights(control_cr, challenger_cr, lift_prior)
-
-        sampled_control_aov = sample_aov(aovs[0], aov_cv, n_simulations, rng)
-        sampled_challenger_aov = sample_aov(aovs[i], aov_cv, n_simulations, rng)
-
-        difference_samples = challenger_samples - control_samples
-        positive_mask = difference_samples > 0
-        negative_mask = difference_samples < 0
-
-        prob_challenger_is_better = np.average(positive_mask, weights=weights)
-        prob_control_is_better = np.average(negative_mask, weights=weights)
-
-        expected_daily_gain = (
-            np.average(difference_samples * sampled_challenger_aov, weights=weights * positive_mask)
-            if positive_mask.any() else 0
-        )
-        expected_daily_loss = (
-            np.average(difference_samples * sampled_control_aov, weights=weights * negative_mask)
-            if negative_mask.any() else 0
-        )
-
-        expected_monetary_uplift = expected_daily_gain * projection_period * prob_challenger_is_better
-        expected_monetary_risk = expected_daily_loss * projection_period * prob_control_is_better
-        total_contribution = expected_monetary_uplift + expected_monetary_risk
-
-        results.append({
-            "Variant": string.ascii_uppercase[i],
-            "Chance to Beat Control": round(prob_challenger_is_better * 100, 2),
-            "Chance to be Best Overall": round(probabilities_to_be_best[i] * 100, 2),
-            "Expected Monetary Uplift": round(expected_monetary_uplift, 2),
-            "Expected Monetary Risk": round(expected_monetary_risk, 2),
-            "Expected Total Contribution": round(total_contribution, 2),
-        })
-
-    if not results:
-        return pd.DataFrame(columns=[
-            "Variant", "Chance to Beat Control", "Chance to be Best Overall",
-            "Expected Monetary Uplift", "Expected Monetary Risk", "Expected Total Contribution"
-        ])
-    return pd.DataFrame(results)
-
-
 def display_results_per_variant(
     probabilities_to_be_best,
     observed_uplifts,
@@ -810,12 +704,13 @@ def display_results_per_variant(
             with st.expander("How is the business case calculated?"):
                 st.markdown(r"""
                     The business risk assessment translates the Bayesian simulation into a 6-month monetary projection.
-                    It runs 20,000 simulations per variant and applies the following logic:
+                    It runs 50,000 simulations per variant and applies the following logic:
 
                     **Conversion rate sampling**
                     For each simulation, a conversion rate is drawn from the posterior Beta distribution, updated with
-                    the observed visitors and conversions. The daily conversion volume is then estimated as:
-                    $$\text{Daily Conversions} = CR_{sampled} \times \frac{\text{Visitors}}{\text{Runtime (days)}}$$
+                    the observed visitors and conversions. The daily difference in conversions is then estimated at the
+                    same traffic for every variant, so an uneven traffic split cannot decide which variant is better:
+                    $$\text{Daily Difference} = (CR_{challenger} - CR_{control}) \times \frac{\text{Average visitors per variant}}{\text{Runtime (days)}}$$
 
                     **AOV sampling**
                     Rather than treating AOV as a fixed constant, it is drawn from a log-normal distribution on each
@@ -825,12 +720,12 @@ def display_results_per_variant(
 
                     **Lift prior**
                     If a lift prior is applied, importance weights are computed for each simulation based on how
-                    plausible the observed lift is under your prior beliefs. These weights adjust all monetary
-                    figures without discarding any simulations.
+                    plausible its simulated lifts (every challenger vs control) are under your prior beliefs. These
+                    weights adjust all monetary figures without discarding any simulations. Without a lift prior,
+                    every simulation counts equally.
 
                     **Uplift and risk**
-                    The daily difference in conversions between the challenger and control is calculated per simulation.
-                    Positive and negative differences are separated:
+                    Positive and negative daily differences are separated:
 
                     | | Formula |
                     |---|---|
@@ -1966,7 +1861,6 @@ def run():
             conversion_counts,
             aovs,
             aov_cv,
-            beta_prior,
             lift_prior,
             probability_winner,
             runtime_days
@@ -1983,25 +1877,17 @@ def run():
                         for i in range(1, len(visitor_counts))
                     ]
 
-                    probabilities_to_be_best, _ = calculate_probabilities(
-                        visitor_counts, conversion_counts,
-                        beta_prior=beta_prior, lift_prior=lift_prior,
-                    )
-                    uplift_distributions = simulate_uplift_distributions(
-                        visitor_counts, conversion_counts,
-                        beta_prior=beta_prior, lift_prior=lift_prior
-                    )
-                    df_business = perform_multi_variant_risk_assessment(
+                    output = run_bayesian_analysis(
                         visitor_counts, conversion_counts, aovs,
-                        probabilities_to_be_best, runtime_days,
-                        beta_prior=beta_prior, lift_prior=lift_prior, aov_cv=aov_cv
+                        aov_cv=aov_cv, runtime_days=runtime_days, lift_prior=lift_prior,
                     )
 
-                    plot_winner_probabilities_chart(probabilities_to_be_best)
-                    plot_uplift_histograms(uplift_distributions, observed_uplifts)
+                    display_monte_carlo_precision(output)
+                    plot_winner_probabilities_chart(output.probabilities_to_be_best)
+                    plot_uplift_histograms(output.uplift_distributions, observed_uplifts)
                     display_results_per_variant(
-                        probabilities_to_be_best, observed_uplifts,
-                        probability_winner, aovs, runtime_days, df=df_business
+                        output.probabilities_to_be_best, observed_uplifts,
+                        probability_winner, aovs, runtime_days, df=output.business_case
                     )
 
                 except Exception as e:
