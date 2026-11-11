@@ -33,4 +33,4 @@ google-genai>=0.3.0
 # utility/sql_builder.py + utility/bq_client.py now prefer this backend when
 # available (see USING_FOE_BACKEND in each), falling back to their own native
 # implementation otherwise. Bump this SHA deliberately, not accidentally.
-foe[bigquery] @ git+https://github.com/BasLinders/first-order-engine.git@f9589750eec1014621f83eee1341578feeae901f
+foe[bigquery] @ git+https://github.com/BasLinders/first-order-engine.git@ff19c01704bf6637080c6482f906bc856e644592
