@@ -9,128 +9,196 @@ its actual computation, not just that it *could*. Where a page has its own
 parallel implementation of something FOE already provides, that counts as
 **not enginized**, even if the two implementations happen to be equivalent.
 
-## Summary
+Legend: ✅ enginized · ⚠️ partially enginized · ❌ not enginized ·
+🏠 Hexkit-native by decision (no migration planned)
 
-| FOE module | Purpose | Enginized in Hexkit? |
+## Summary per page
+
+| Page | Status | Runs on FOE | Still Hexkit-native |
+|---|---|---|---|
+| Pre-Test Analysis | ⚠️ Partial | `foe.pretest`, `foe.continuous` (sample size, MDE, continuous power, Gamma/NegBin fits) | Binomial power (statsmodels), seasonal Prophet forecast |
+| SRM Check | ✅ Yes | `foe.srm` | — |
+| Experiment Analysis | ⚠️ Partial | Bayesian path (`foe.bayesian`); frequentist difference CI and monetary impact (`foe.frequentist`) | Frequentist z-test, p-values, Šidák, power, non-inferiority, variance factor, inline SRM check |
+| Small Sample Analysis | ✅ Yes | `foe.frequentist` (Boschloo, z-test synthesis, Šidák) | — |
+| User Level Analysis | ⚠️ Partial | Business case only (`foe.continuous`) | Gamma/NegBin tests, outlier handling, ANOVA/Tukey/Kruskal/Mann-Whitney |
+| Behavioral Analysis | ✅ Yes | `foe.behavioral` | Outlier *removal* (row filter; FOE has no removal step) |
+| Interaction Analysis | ✅ Yes | `foe.interaction` | — |
+| Sequential Analysis | ✅ Yes | `foe.sequential`, `foe.bayesian` (revenue overlay) | — |
+| Automation (admin) | ✅ Yes | `foe.frequentist`, `foe.bayesian`, `foe.continuous`, `foe.pretest` incl. forecasting | — |
+| Experimentation Growth (admin) | 🏠 Native | — | Sigmoid/Monte Carlo growth model (kept Hexkit-only by decision) |
+| Home, Data Export | n/a | Data Export queries BigQuery via `foe.data` (see below) | No statistics |
+
+## Summary per FOE module
+
+| FOE module | Purpose | Used in Hexkit? |
 |---|---|---|
-| `foe.core` | Input/output models, validators, priors | ✅ Yes — used everywhere FOE is used |
-| `foe.frequentist` | z-test, Šidák correction, bootstrap power, non-inferiority | ✅ Yes |
-| `foe.bayesian` | Beta-Binomial Monte Carlo, lift prior, monetary projection | ✅ Yes |
-| `foe.continuous` | Revenue/AOV metrics, CUPED, hurdle model | ✅ Yes |
-| `foe.pretest` | Sample size / MDE tables | ✅ Yes |
-| `foe.pretest` (forecasting) | Prophet-based traffic forecasting | ⚠️ Partial — only in the automation pipeline |
-| `foe.sequential` | Always-valid LLR sequential testing | ❌ No — Hexkit has its own inline mSPRT/LLR code |
-| `foe.srm` | Sample Ratio Mismatch (chi-squared) | ❌ No — Hexkit has its own chi-squared calculator |
-| `foe.behavioral` | Funnel & segment analysis | ❌ No — Hexkit has its own statsmodels implementation |
-| `foe.interaction` | Test-vs-test interaction/interference (GLM) | ❌ No — Hexkit has a fully duplicated `InteractionEngine` inlined |
-| `foe.forecasting` | Conversion/revenue forecasting (holidays, covariates) | ❌ No — not used anywhere |
-| `foe.viz` | JSON-ready chart coordinates | ❌ No — every page builds its own charts (Altair/Plotly/Matplotlib) |
+| `foe.core` | Input/output models, validators, priors | ✅ Everywhere FOE is used |
+| `foe.frequentist` | z-test, Šidák, power, non-inferiority, Boschloo, monetary impact | ⚠️ Fully in Small Sample + Automation; only partly in Experiment Analysis |
+| `foe.bayesian` | Beta-Binomial Monte Carlo, lift prior, monetary projection | ✅ Experiment Analysis, Sequential, Automation, `utility/lift_prior_ui.py` |
+| `foe.continuous` | Revenue/AOV metrics, Gamma/NegBin, comparison suite, business case | ⚠️ Pre-Test and Automation; User Level Analysis uses only the business case |
+| `foe.pretest` | Sample size / MDE / power | ⚠️ Pre-Test (binomial power still via statsmodels), Automation |
+| `foe.pretest.forecasting` | Prophet-based traffic forecasting | ⚠️ Automation only; Pre-Test seasonal mode still calls Prophet directly |
+| `foe.sequential` | Always-valid LLR sequential testing | ✅ Sequential Analysis |
+| `foe.srm` | Sample Ratio Mismatch (chi-squared) | ⚠️ SRM Check; Experiment Analysis still has its own inline chi-squared |
+| `foe.behavioral` | Outliers, transforms, Welch's t-test | ✅ Behavioral Analysis |
+| `foe.interaction` | Test-vs-test interaction (GLM) | ✅ Interaction Analysis |
+| `foe.data` | BigQuery SQL building and querying | ✅ `utility/sql_builder.py`, `utility/bq_client.py` (with native fallback, see `USING_FOE_BACKEND`) |
+| `foe.forecasting` | Conversion/revenue forecasting (holidays, covariates) | ❌ Not used anywhere |
+| `foe.viz` | JSON-ready chart coordinates | ❌ Not used; every page builds its own charts |
 
 ---
 
 ## Detail per Hexkit surface
 
-### ✅ `pages/experiment_analysis.py` — Frequentist & Bayesian analysis
-Fully enginized for the frequentist path: uses `foe.frequentist.operations.FrequentistEngine`
-and `foe.frequentist.confidence.compute_interval_difference`, plus `foe.core.models.AlternativeHypothesis`.
+### ⚠️ `pages/pre_test_analysis.py` — Pre-test sample size, MDE & power
+Mostly enginized. Sample size and MDE use `foe.pretest.operations.PretestEngine`,
+continuous-KPI power uses `PretestEngine._power_two_sample`, and the Gamma /
+NegBin baseline fits use `foe.continuous.operations.ContinuousMetricEngine`.
 
-### ✅ `pages/user_level_analysis.py` — Revenue / per-user metrics
-Fully enginized: uses `foe.continuous.operations.ContinuousMetricEngine` and
-`foe.core.models.AnalysisUnit` / `AlternativeHypothesis`.
+**Gaps:**
+- **Seasonal ("Prophet Forecast") mode** calls `prophet.Prophet` directly in
+  `run_prophet_forecast` instead of `foe.pretest.forecasting.TrafficForecastingEngine`.
+  `utility/automation_engine.py` already uses the FOE engine for the same job,
+  and its docstring notes the two are "functionally equivalent" but separately
+  implemented.
+- **Binomial power** (`calculate_power`) uses statsmodels' Cohen's h
+  (`proportion_effectsize` + `zt_ind_solve_power`). FOE's
+  `PretestEngine.calculate_power_binomial` uses an unpooled normal
+  approximation instead, so switching changes the numbers slightly and needs a
+  deliberate decision.
+- **Private API use:** the page calls FOE's private helpers (`_relative_mde`,
+  `_sample_size_per_variant`, `_power_two_sample`). These can change without
+  notice when the pinned FOE commit is bumped.
 
-### ✅ `pages/pre_test_analysis.py` — Pre-test sample size & MDE
-Mostly enginized: uses `foe.pretest.operations.PretestEngine` and
-`foe.continuous.operations.ContinuousMetricEngine` for the core sample-size/MDE math.
+### ✅ `pages/srm_calculator.py` — Sample Ratio Mismatch
+Enginized: the chi-squared goodness-of-fit test runs in
+`foe.srm.operations.SRMEngine.calculate_chi_squared` (α = 0.01). The page only
+computes expected counts for the chart and table. Parity with the previous
+native implementation was verified on 205 inputs.
 
-**Gap:** the seasonal ("Prophet Forecast") mode calls `prophet.Prophet` directly
-inline (`run_prophet_forecast`) instead of `foe.pretest.forecasting.TrafficForecastingEngine`.
-This duplicates logic that `utility/automation_engine.py` already wraps around the
-same FOE engine — the automation engine's own docstring calls out that this page
-has "its own, independent Prophet-based forecast" that is "functionally
-equivalent" but not shared. **Candidate for enginization.**
+### ⚠️ `pages/experiment_analysis.py` — Frequentist & Bayesian analysis
+- **Bayesian path: enginized.** Uses `foe.bayesian.operations.BayesianEngine`
+  (`run_probability_analysis`, `simulate_uplift_distributions`,
+  `run_monetary_projection`) and `get_lift_prior`.
+- **Frequentist path: partial.** Only the difference CI
+  (`foe.frequentist.confidence.compute_interval_difference`) and the monetary
+  impact (`FrequentistEngine.estimate_monetary_impact_per_variant` /
+  `generate_monetary_conclusion`) come from FOE. `calculate_frequentist_statistics`
+  still computes these in the page with `scipy.stats.norm`, although FOE has
+  an equivalent for each:
 
-### ⚠️ `pages/sequential_analysis.py` — Sequential (always-valid) testing
-**Not enginized for its core logic.** The mSPRT/LLR math (`calculate_msprt_llr`,
-alpha/beta boundary logic) is implemented locally with `scipy.stats.norm`, not
-via `foe.sequential.operations.SequentialEngine` — even though FOE ships a
-dedicated sequential engine for exactly this ("Always Valid" LLR bounds).
+  | Hexkit-native | FOE equivalent |
+  |---|---|
+  | z-statistics and p-values | `FrequentistEngine.run_ztest` / `run_synthesis` |
+  | Šidák alpha | `foe.frequentist.operations.apply_sidak` |
+  | Analytical and bootstrap power | `FrequentistEngine.calculate_analytical_power`, `run_vectorized_bootstrap_power` |
+  | `calculate_non_inferiority` | `foe.frequentist.confidence.compute_non_inferiority` |
+  | `calculate_timeseries_reduction_factor` | `FrequentistEngine.calculate_aggregate_variance_factor` |
+  | Inline SRM check (`chisquare`, equal split) | `foe.srm.operations.SRMEngine.calculate_chi_squared` |
 
-FOE *is* used here, but only for an optional add-on: the ad-hoc Revenue Impact
-overlay calls `foe.bayesian.operations.BayesianEngine` / `get_lift_prior`. The
-primary sequential-testing feature this page exists for remains bespoke.
-**High-value candidate for enginization** — this is the biggest gap between
-what FOE already solves and what Hexkit still solves itself.
+  The old version of this doc listed this page as fully enginized; that was
+  wrong.
+
+### ✅ `pages/small_sample_analysis.py` — Small-sample exact tests
+Enginized: uses `foe.frequentist.boschloo.BoschlooEngine` for exact tests and
+`FrequentistEngine.run_synthesis` / `apply_sidak` for the z-test comparison.
+
+### ⚠️ `pages/user_level_analysis.py` — Revenue / per-user metrics
+Mostly **not** enginized. Only the business case runs on FOE
+(`ContinuousMetricEngine.run_business_case`). The page's own code does
+everything else, although `ContinuousMetricEngine` has equivalents:
+
+| Hexkit-native | FOE equivalent |
+|---|---|
+| `fit_gamma`, `fit_unit_model`, `perform_gamma_test`, `run_gamma_posthoc` | `fit_gamma`, `fit_unit_model`, `run_gamma_posthoc` |
+| `is_count_kpi`, `fit_negbin`, `perform_negbin_test`, `run_negbin_posthoc` | `is_count_kpi`, `fit_negbin`, `run_negbin_posthoc` |
+| `detect_outliers`, `winsorize_data` | `detect_outliers_ols`, `winsorize_series` |
+| ANOVA / Tukey / Kruskal-Wallis / Mann-Whitney in `perform_stat_tests_and_conclusions` | `run_comparison_suite` |
+
+Feature parity needs checking before migrating. For example, FOE's comparison
+suite uses Welch's ANOVA (pingouin) for unequal variances and has no Tukey
+post-hoc step. The old version of this doc listed this page as fully
+enginized; that was wrong.
+
+### ✅ `pages/behavioral_analysis.py` — Behavioral metric analysis
+Enginized: outlier detection (IQR / OLS studentized residuals), winsorizing,
+the log1p transform and Welch's t-test run in
+`foe.behavioral.operations.BehavioralEngine`. The page keeps CSV preprocessing,
+charts and outlier removal (a row filter; FOE has no removal step). Parity with
+the previous native implementation was verified on 15 random datasets covering
+both outlier methods.
+
+### ✅ `pages/interaction_analysis.py` — Test-vs-test interaction analysis
+Enginized: uses `foe.interaction.operations.InteractionEngine`
+(`run_interaction_analysis`, `check_data_quality`). The previously inlined copy
+of the engine has been removed. The page only computes the Wald CI bounds for
+the forest plot.
+
+### ✅ `pages/sequential_analysis.py` — Sequential (always-valid) testing
+Enginized: the LLR boundaries and trajectory run in
+`foe.sequential.operations.SequentialEngine` (`calculate_boundaries`,
+`process_test_trajectory`). The Revenue Impact overlay uses
+`foe.bayesian.operations.BayesianEngine.run_monetary_projection`.
 
 ### ✅ `utility/automation_engine.py` (powers `pages/automation.py`) — BigQuery → Airtable pipeline
-The most fully enginized surface in Hexkit — effectively Hexkit's own version
-of the reference `first-order-pipeline` pattern described in FOE's README. Uses:
+The most fully enginized surface in Hexkit. Uses:
 - `foe.frequentist.operations.FrequentistEngine`
 - `foe.bayesian.operations.BayesianEngine`
 - `foe.continuous.operations.ContinuousMetricEngine`
 - `foe.pretest.operations.PretestEngine`
 - `foe.pretest.forecasting.TrafficForecastingEngine` (seasonal traffic forecasting)
 
-### ❌ `pages/srm_calculator.py` — Sample Ratio Mismatch
-Not enginized. Implements its own chi-squared goodness-of-fit test with
-`scipy.stats.chisquare`, duplicating `foe.srm.operations.SRMEngine`
-one-for-one. Straightforward candidate for enginization — small surface, no
-Prophet/statsmodels complexity to migrate.
+### ✅ `utility/sql_builder.py`, `utility/bq_client.py` — BigQuery data layer
+Uses `foe.data` (`foe.data.sql.experiments`, `DataEngine`) when available and
+falls back to Hexkit's own implementation otherwise. `USING_FOE_BACKEND` in
+each module reports which path is active.
 
-### ❌ `pages/behavioral_analysis.py` — Behavioral / funnel metric analysis
-Not enginized. Uses its own `statsmodels`-based preprocessing and modeling,
-duplicating what `foe.behavioral.operations.BehavioralEngine` is meant to
-provide (funnel & segment analysis). Candidate for enginization.
+### 🏠 `pages/experimentation_growth.py` — Compound growth / win-rate projection
+Hexkit-native **by decision**: this module stays in Hexkit and will not be
+migrated to FOE. It implements its own sigmoid-based diminishing-returns model
+and Monte Carlo simulation over a configurable win rate. No FOE module covers
+this.
 
-### ❌ `pages/interaction_analysis.py` — Test-vs-test interaction analysis
-Not enginized, and notably: the file contains a **fully inlined copy** of an
-`InteractionEngine` class (GLM/Binomial interaction model, coefficient regex
-parsing, etc.) with a comment stating it's "inlined — no external import
-required." This is a near-duplicate of `foe.interaction.operations.InteractionEngine`
-and is the clearest case of logic that should be deleted from Hexkit and
-replaced with the FOE import.
-
-### ❌ `pages/experimentation_growth.py` — Compound growth / win-rate projection
-Not enginized, and has no exact 1:1 FOE counterpart today. Implements its own
-sigmoid-based diminishing-returns model and Monte Carlo simulation over a
-configurable win rate. Conceptually adjacent to `foe.forecasting`, but that
-FOE module is built for Prophet-based conversion/revenue forecasting with
-holidays and covariates, not win-rate compounding — so this would need either
-a new FOE capability or a deliberate decision to keep it Hexkit-side.
-
-### ❌ `foe.viz` — not used anywhere
-No page consumes `foe.viz.operations.VizEngine`. Every page builds its own
-chart data/coordinates ad hoc (Altair in `sequential_analysis.py`/`srm_calculator.py`,
-Plotly in `pre_test_analysis.py`, Matplotlib elsewhere). Enginizing this would
-mostly pay off if/when chart logic needs to be consistent across pages or
-reused in the automation pipeline's outputs.
+### ❌ `foe.viz` and `foe.forecasting` — not used anywhere
+No page uses `foe.viz.operations.VizEngine`. Each page builds its own charts
+(Altair, Plotly, Matplotlib/Seaborn). `foe.forecasting` (conversion/revenue
+forecasting with holidays and covariates) is also unused.
 
 ### 🗄️ `hidden_pages/*` — legacy, pre-FOE
-`bayesian_analysis.py`, `frequentist_analysis.py`, `interaction_non_scalable.py`,
-`mab_test.py`, `experimentation_growth_deprecated.py` are earlier, hand-rolled
-precursors to the now-live pages, already superseded and not part of the
-active navigation. No action needed beyond eventual removal — they don't
-represent open enginization work.
+`bayesian_analysis.py`, `behavioral_analysis.py`, `frequentist_analysis.py`,
+`interaction_non_scalable.py`, `mab_test.py` and
+`experimentation_growth_deprecated.py` are older versions of the live pages.
+They aren't in the app's navigation. Nothing to do beyond eventually deleting
+them.
 
 ---
 
-## Recommended order of work
+## Recommended order of remaining work
 
-1. **Sequential analysis → `foe.sequential`** — biggest gap; FOE's LLR engine
-   already exists and directly replaces the bespoke `calculate_msprt_llr` logic.
-2. **Interaction analysis → `foe.interaction`** — lowest risk, since the code
-   is already a near-verbatim copy of the FOE engine; swapping the import
-   removes duplicate maintenance immediately.
-3. **SRM calculator → `foe.srm`** — small, self-contained, low risk.
-4. **Pre-test seasonal forecast → `foe.pretest.forecasting.TrafficForecastingEngine`**
-   — removes a second, independent Prophet integration that already has a
-   known-equivalent FOE counterpart in use elsewhere (`automation_engine.py`).
-5. **Behavioral analysis → `foe.behavioral`** — larger migration (custom
-   preprocessing + statsmodels), needs a closer look at feature parity.
-6. **Experimentation growth** — needs a product decision first: extend FOE
-   with a growth-projection module, or keep this Hexkit-native.
-7. **`foe.viz`** — adopt opportunistically once chart-building logic is
-   consolidated, not urgent on its own.
+1. **Experiment Analysis frequentist core → `foe.frequentist` + `foe.srm`.**
+   This is the biggest remaining gap, on one of the most-used pages. FOE
+   already has equivalents for the z-test, Šidák, power, non-inferiority,
+   variance factor and SRM check. Signatures differ (for example,
+   `compute_non_inferiority` takes `se_diff` and `alpha`), and bootstrap power
+   is random, so parity should be checked with tolerances.
+2. **Pre-Test seasonal forecast → `foe.pretest.forecasting.TrafficForecastingEngine`.**
+   This removes the second Prophet integration; `automation_engine.py` already
+   uses the FOE version.
+3. **User Level Analysis → `foe.continuous`.** A large migration. First decide
+   on the differences in the comparison suite (Welch's ANOVA vs. standard ANOVA
+   + Tukey).
+4. **Pre-Test binomial power → `PretestEngine.calculate_power_binomial`.**
+   Needs a decision first, because it changes the method from Cohen's h to an
+   unpooled normal approximation. At the same time, replace the page's calls to
+   FOE private helpers with public API.
+5. **`foe.viz`.** Adopt when chart code gets consolidated; not urgent.
 
-*This document reflects the code as of 2026-09-14. Re-check `automation_engine.py`'s
-module-level docstring and each page's imports before relying on this for
-planning — both repos are under active development.*
+Done since the previous version of this doc (2026-09-14): Sequential Analysis,
+Interaction Analysis, SRM Check and Behavioral Analysis. Small Sample Analysis
+was built on FOE from the start. Experimentation Growth is now Hexkit-native by
+decision.
+
+*This document reflects the code as of 2026-11-13 (branch
+`feature/srm-behavioral-engines`, FOE pinned at `ff19c01`). Re-check each
+page's `foe` imports before relying on this for planning; both repos are under
+active development.*
