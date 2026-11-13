@@ -1,13 +1,10 @@
 import streamlit as st
+import scipy.stats as stats
 import altair as alt
 import pandas as pd
+import statistics
 import string
 import math
-from foe.srm.operations import SRMEngine
-
-# SRM threshold used by this page. The chi-squared goodness-of-fit test itself
-# runs in the shared FOE SRMEngine (foe.srm.operations).
-SRM_ALPHA = 0.01
 
 st.set_page_config(
     page_title="SRM calculator",
@@ -17,8 +14,7 @@ st.set_page_config(
 
 def calculate_srm(visitor_counts, expected_proportions):
     """
-    Runs the Sample Ratio Mismatch check via FOE's SRMEngine and adds the
-    expected per-variant counts needed for the chart and raw data table.
+    Performs the Chi-squared test to check for Sample Ratio Mismatch.
     """
     total_visitors = sum(visitor_counts)
     sum_props = sum(expected_proportions)
@@ -26,21 +22,21 @@ def calculate_srm(visitor_counts, expected_proportions):
     if sum_props == 0:
         raise ValueError("Total proportions must be greater than zero.")
 
-    result = SRMEngine.calculate_chi_squared(
-        observed=list(visitor_counts),
-        expected=list(expected_proportions),
-        alpha=SRM_ALPHA,
-    )
-
-    # Display-only: expected frequencies E = Total * normalized p
-    expected_counts = [total_visitors * (p / sum_props) for p in expected_proportions]
-
+    expected_distribution = [p / sum_props for p in expected_proportions]
+    
+    # Calculate expected frequencies: E = Total * p
+    expected_counts = [total_visitors * p for p in expected_distribution]
+    
+    # Perform the chi-squared test
+    chi2, p_value = stats.chisquare(f_obs=visitor_counts, f_exp=expected_counts)
+    
     return {
-        "p_value": result["p_value"],
+        "p_value": p_value,
         "expected_counts": expected_counts,
-        "is_mismatch": result["is_mismatch"],
+        "mean_expected": statistics.mean(expected_counts),
+        "is_mismatch": p_value < 0.01
     }
-
+    
 def initialize_state(num_variants):
     for i in range(num_variants):
         if f"obs_{i}" not in st.session_state:

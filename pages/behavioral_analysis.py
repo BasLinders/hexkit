@@ -1,15 +1,10 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import statsmodels.formula.api as smf
+from scipy import stats
 import seaborn as sns
 import matplotlib.pyplot as plt
-from foe.behavioral.operations import BehavioralEngine
-
-# Outlier detection, winsorizing / log transforms and Welch's t-test all run in
-# the shared FOE BehavioralEngine (foe.behavioral.operations). This page only
-# handles CSV preprocessing, visualisation and presentation.
-_engine = BehavioralEngine()
-LARGE_FILE_THRESHOLD = 10000
-WELCH_ALPHA = 0.05
 
 # -------------------------------------------------------------------------
 # PAGE CONFIG
@@ -64,17 +59,35 @@ def preprocess_data(df):
 # -------------------------------------------------------------------------
 # 2. OUTLIER DETECTION
 # -------------------------------------------------------------------------
-def detect_outliers(df, kpi, outlier_stdev, large_file_threshold=LARGE_FILE_THRESHOLD):
-    if len(df) > large_file_threshold:
-        st.info(f"Dataset is large ({len(df):,} rows). Using vectorized IQR method for outlier detection.")
-    else:
-        st.info(f"Dataset is small ({len(df):,} rows). Using OLS Influence method for detection.")
-
+def detect_outliers(df, kpi, outlier_stdev, large_file_threshold=10000):
     try:
-        mask = BehavioralEngine.detect_outliers_mask(
-            df, kpi, threshold=outlier_stdev, large_file_limit=large_file_threshold
-        )
-        return pd.Series(mask, index=df.index, dtype=bool)
+        # Method A: IQR for Large Files (Faster)
+        if len(df) > large_file_threshold:
+            st.info(f"Dataset is large ({len(df):,} rows). Using vectorized IQR method for outlier detection.")
+            
+            q1 = df.groupby('experience_variant_label')[kpi].transform(lambda x: x.quantile(0.25))
+            q3 = df.groupby('experience_variant_label')[kpi].transform(lambda x: x.quantile(0.75))
+            iqr = q3 - q1
+            
+            lower_bound = q1 - (outlier_stdev * iqr)
+            upper_bound = q3 + (outlier_stdev * iqr)
+            
+            mask = (df[kpi] < lower_bound) | (df[kpi] > upper_bound)
+            return mask.fillna(False)
+
+        # Method B: OLS Influence for Smaller Files (More Precise)
+        else:
+            st.info(f"Dataset is small ({len(df):,} rows). Using OLS Influence method for detection.")
+            # Escape column name for statsmodels formula if it has spaces (though we cleaned it)
+            formula = f"{kpi} ~ C(experience_variant_label)"
+            model = smf.ols(formula, data=df).fit()
+            
+            influence = model.get_influence()
+            standardized_residuals = influence.resid_studentized_internal
+            
+            # Simple residual threshold based on user input
+            residuals_outliers = np.abs(standardized_residuals) > outlier_stdev
+            return pd.Series(residuals_outliers, index=df.index)
 
     except Exception as e:
         st.error(f"Error during outlier detection: {e}")
@@ -84,24 +97,38 @@ def detect_outliers(df, kpi, outlier_stdev, large_file_threshold=LARGE_FILE_THRE
 # 3. OUTLIER HANDLING (Winsorization / Log)
 # -------------------------------------------------------------------------
 def winsorize_data(df, kpi, method, outlier_stdev=None, percentile=None):
+    df_copy = df.copy()
+    lower_cap, upper_cap = None, None
+    cap_desc = ""
+
     if method == 'Standard Deviation':
         if outlier_stdev is None: outlier_stdev = 3
-        params = {"logic": "Standard Deviation", "stdev": outlier_stdev}
+        mean = df_copy[kpi].mean()
+        std_dev = df_copy[kpi].std()
+        lower_cap = mean - (outlier_stdev * std_dev)
+        upper_cap = mean + (outlier_stdev * std_dev)
         cap_desc = f"Mean ± {outlier_stdev} SD"
-    else:  # 'Percentile'
+
+    elif method == 'Percentile':
         if percentile is None: percentile = 95
-        params = {"logic": "Percentile", "percentile": percentile}
         lower_p = (100.0 - percentile) / 2.0
         upper_p = 100.0 - lower_p
+        lower_cap = np.percentile(df_copy[kpi], lower_p)
+        upper_cap = np.percentile(df_copy[kpi], upper_p)
         cap_desc = f"{lower_p:.1f}th and {upper_p:.1f}th Percentiles"
 
-    # FOE floors the lower cap at 0, since behavioral metrics are >= 0
-    df_copy, meta = BehavioralEngine.apply_transformations(df, kpi, "Winsorizing", params)
-    return df_copy, meta["lower_cap"], meta["upper_cap"], cap_desc
+    # Apply Caps
+    if lower_cap is not None and upper_cap is not None:
+        # Ensure we don't cap below 0 for behavioral data (metrics usually >= 0)
+        lower_cap = max(0, lower_cap) 
+        df_copy[kpi] = np.clip(df_copy[kpi], lower_cap, upper_cap)
+    
+    return df_copy, lower_cap, upper_cap, cap_desc
 
 def log_transform_data(df, kpi):
-    # FOE uses log1p, which safely handles the 0s common in behavioral data
-    df_copy, _ = BehavioralEngine.apply_transformations(df, kpi, "Log Transform", {})
+    df_copy = df.copy()
+    # log1p is crucial for behavioral data which often contains 0s
+    df_copy[kpi] = np.log1p(df_copy[kpi])
     return df_copy
 
 # -------------------------------------------------------------------------
@@ -115,42 +142,48 @@ def perform_welch_test(df, kpi):
     (e.g., one group might behave erratically while the other is stable).
     """)
 
-    # 1. Validation (kept here so the error can list the variants found)
+    # 1. Validation
     variants = df['experience_variant_label'].unique()
     if len(variants) != 2:
         st.error(f"Error: Welch's t-test requires exactly 2 variants. Your file has {len(variants)}: {list(variants)}.")
         return
 
-    # 2. Calculation via FOE. The first variant in the file is the control,
-    # matching this page's previous behaviour.
-    result = _engine.run_welch_inference(df, kpi, control_label=variants[0], alpha=WELCH_ALPHA)
-    if "error" in result:
-        st.error(result["error"])
-        return
+    group_a_label = variants[0]
+    group_b_label = variants[1]
 
-    group_a_label = result["group_control"]["label"]
-    group_b_label = result["group_challenger"]["label"]
-    mean_a = result["group_control"]["mean"]
-    mean_b = result["group_challenger"]["mean"]
-    n_a = result["group_control"]["n"]
-    n_b = result["group_challenger"]["n"]
-    p_val = result["p_value"]
-    lift = result["lift"]
-    is_sig = result["is_significant"]
+    # 2. Preparation
+    data_a = df[df['experience_variant_label'] == group_a_label][kpi]
+    data_b = df[df['experience_variant_label'] == group_b_label][kpi]
+    
+    # 3. Calculation
+    # equal_var=False triggers Welch's t-test
+    test_result = stats.ttest_ind(data_b, data_a, equal_var=False)
 
+    # 2. Extract exactly what you need via attributes
+    t_stat = test_result.statistic # type: ignore
+    p_val = test_result.pvalue # type: ignore
+
+    # Calculate Means & Lift
+    mean_a = data_a.mean()
+    mean_b = data_b.mean()
+    lift = (mean_b - mean_a) / mean_a if mean_a != 0 else 0
+    
     # 4. Display Summary Stats
     st.subheader("1. Descriptive Statistics")
     
     col1, col2 = st.columns(2)
     with col1:
         st.metric(label=f"Mean: {group_a_label}", value=f"{mean_a:.2f}")
-        st.caption(f"Sample Size: {n_a:,}")
+        st.caption(f"Sample Size: {len(data_a):,}")
     with col2:
         st.metric(label=f"Mean: {group_b_label}", value=f"{mean_b:.2f}", delta=f"{lift:.2%}")
-        st.caption(f"Sample Size: {n_b:,}")
+        st.caption(f"Sample Size: {len(data_b):,}")
 
     # 5. Display Significance
     st.subheader("2. Statistical Conclusion")
+    
+    # Interpret P-Value
+    is_sig = p_val < 0.05 # type: ignore
     
     res_col1, res_col2 = st.columns([1, 2])
     
