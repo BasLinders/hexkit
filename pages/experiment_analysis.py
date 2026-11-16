@@ -346,6 +346,50 @@ def get_frequentist_inputs():
              "(the minimum detectable effect). At 80%, a real effect of that size is missed 1 in 5 times. "
              "Enter it in %, usually 80. Used for the False Positive / Negative Risk below."
     )
+    with st.expander("How the power level and prior are used"):
+        st.markdown(r"""
+        Together with the confidence level, these two inputs drive the **False Positive / Negative Risk** in the results.
+        A p-value tells you P(data | no effect), not P(no effect | data). These metrics flip that around using
+        the power your test was planned for and your prior belief that the variant has a real effect.
+
+        | | Significant result | Non-significant result |
+        |---|---|---|
+        | **Greater** | **FPR**: probability the apparent improvement is false | **FNDR**: probability a real improvement was missed |
+        | **Less** | **FPR**: probability the apparent harm is false | **FNDR**: probability real harm was missed |
+        | **Two-sided** | **FPR**: probability the detected difference (either direction) is false | **FNDR**: probability a real difference (either direction) was missed |
+
+        The prior is how often tests like this one have a real effect:
+        - **Skeptical** (10%, default): most experiments don't move the needle. Across the industry, roughly 10-30% of tests have a real positive effect.
+        - **Neutral** (50%): no expectation either way. Makes the False Positive Risk look better than it usually is.
+        - **Optimistic** (90%): strong belief the variant has a real effect.
+        - **Historical win rate**: the share of your own past tests that produced a real winner. The most honest choice if you track it.
+
+        For significant results, a second metric shows the **False Positive Risk at the observed p-value**. The first metric treats every
+        p-value below alpha the same; this one weighs how strong the evidence actually is, so p = 0.049 carries a much higher risk than p = 0.001.
+        """)
+
+    prior_labels = {
+        "skeptical": "Skeptical (10%)",
+        "neutral": "Neutral (50%)",
+        "optimistic": "Optimistic (90%)",
+        "custom": "Historical win rate",
+    }
+    sensitivity_mode = st.selectbox(
+        "Prior belief that the variant has a real effect",
+        list(prior_labels),
+        index=0,
+        format_func=prior_labels.get,
+        key="f_sensitivity_mode",
+        help="How often tests like this one have a real effect. Skeptical (10%) is the safe default; "
+             "use your historical win rate if you know it."
+    )
+    custom_prior = None
+    if sensitivity_mode == "custom":
+        custom_prior = st.number_input(
+            "In %, what share of your past tests produced a real winner?",
+            min_value=1, max_value=99, step=1, value=20,
+            key="f_custom_prior_pct",
+        ) / 100
     st.session_state.test_duration = st.number_input(
         "How many days has this test been running?",
         min_value=1,
@@ -413,41 +457,6 @@ def get_frequentist_inputs():
         """)
 
     reduction_factor = render_variance_reduction_ui()
-
-    st.write("---")
-    st.write("### False Positive / Negative Risk")
-    with st.expander("What is this?"):
-        st.markdown(r"""
-        Standard p-values tell you P(data | H0), not P(H0 | data). These metrics flip that using your prior belief that the variant has a real effect
-        and the power the test was designed for (the desired power entered above).
-
-        | | Significant result | Non-significant result |
-        |---|---|---|
-        | **Greater** | **FPR**: probability the apparent improvement is false | **FNDR**: probability a real improvement was missed |
-        | **Less** | **FPR**: probability the apparent harm is false | **FNDR**: probability real harm was missed |
-        | **Two-sided** | **FPR**: probability the detected difference (either direction) is false | **FNDR**: probability a real difference (either direction) was missed |
-
-        The prior belief setting controls how much weight is given to the hypothesis that a real effect exists before seeing the data:
-        - **Skeptical** (10%): most experiments don't move the needle
-        - **Neutral** (50%): no strong expectation either way
-        - **Optimistic** (90%): strong belief the variant has a real effect
-
-        For significant results, a second metric shows the **False Positive Risk at the observed p-value**. The first metric treats every
-        p-value below alpha the same; this one weighs how strong the evidence actually is, so p = 0.049 carries a much higher risk than p = 0.001.
-        """)
-
-    sensitivity_mode = st.selectbox(
-        "Prior belief that the variant has a real effect",
-        ["skeptical", "neutral", "optimistic", "custom"],
-        index=1,
-        help="Skeptical = 10% prior, Neutral = 50%, Optimistic = 90%."
-    )
-    custom_prior = None
-    if sensitivity_mode == "custom":
-        custom_prior = st.number_input(
-            "Custom prior probability P(H1)",
-            min_value=0.0, max_value=1.0, step=0.01, value=0.5
-        )
 
     return (
         st.session_state.visitor_counts,
@@ -1532,7 +1541,7 @@ def plot_conversion_distributions(results, reduction_factor=1.0):
     plt.close(fig)
 
 
-def resolve_prior(sensitivity_mode='neutral', custom_prior=None):
+def resolve_prior(sensitivity_mode='skeptical', custom_prior=None):
     priors = {'skeptical': 0.1, 'neutral': 0.5, 'optimistic': 0.9}
     if sensitivity_mode == 'custom':
         if custom_prior is None:
@@ -1596,7 +1605,7 @@ def display_frequentist_summary(
     visitor_counts,
     conversion_counts,
     reduction_factor=1.0,
-    prior=0.5,
+    prior=0.1,
     test_duration=None,
     aovs=None,
     aov_cv=0.0,
@@ -1719,30 +1728,31 @@ def display_frequentist_summary(
                 st.info("There is no strong evidence of a difference, and the effect size remains uncertain.")
 
         st.write("#### False Positive / Negative Risk")
+        assumptions = f" (prior {prior:.0%}, power {power:.0%})"
         fpr_alpha = results['sidak_alpha']
 
         if tail == 'Greater':
             fpr_label = "False Positive Risk"
-            fpr_help = "Probability this apparent improvement is a false positive, given your prior."
+            fpr_help = "Probability this apparent improvement is a false positive, given your prior and power" + assumptions + "."
             fpr_warning_suffix = "Consider replication before acting."
             fndr_label = "False Negative Discovery Rate"
-            fndr_help = "Probability a real improvement was missed, given your prior and desired power."
+            fndr_help = "Probability a real improvement was missed, given your prior and power" + assumptions + "."
             fndr_warning_suffix = "Power may be insufficient to detect a real improvement."
             fndr_success = "False Negative Risk is low: If a real improvement exists, this test was likely sensitive enough to find it."
         elif tail == 'Less':
             fpr_label = "False Positive Risk (Harm Detection)"
-            fpr_help = "Probability this apparent harm is a false positive, given your prior."
+            fpr_help = "Probability this apparent harm is a false positive, given your prior and power" + assumptions + "."
             fpr_warning_suffix = "Review before concluding the variant is worse."
             fndr_label = "False Negative Discovery Rate (Missed Harm)"
-            fndr_help = "Probability real harm was missed, given your prior and desired power."
+            fndr_help = "Probability real harm was missed, given your prior and power" + assumptions + "."
             fndr_warning_suffix = "Power may be insufficient to detect real harm."
             fndr_success = "False Negative Risk is low: If the variant truly underperforms, this test was likely sensitive enough to detect it."
         else:
             fpr_label = "False Positive Risk"
-            fpr_help = "Probability this detected difference (in either direction) is a false positive, given your prior."
+            fpr_help = "Probability this detected difference (in either direction) is a false positive, given your prior and power" + assumptions + "."
             fpr_warning_suffix = "Direction is uncertain: Treat with caution before acting."
             fndr_label = "False Negative Discovery Rate"
-            fndr_help = "Probability a real difference in either direction was missed, given your prior and desired power."
+            fndr_help = "Probability a real difference in either direction was missed, given your prior and power" + assumptions + "."
             fndr_warning_suffix = "Power may be insufficient to detect a real difference in either direction."
             fndr_success = "False Negative Risk is low: If a real difference exists in either direction, this test was likely sensitive enough to find it."
 
@@ -1764,22 +1774,25 @@ def display_frequentist_summary(
                 st.metric(
                     label="False Positive Risk at observed p-value",
                     value=f"{fpr_at_p:.1%}",
-                    help="Same prior and desired power, but uses the exact p-value instead of only 'p is below alpha'.",
+                    help=f"Same prior and power{assumptions}, but uses the exact p-value instead of only 'p is below alpha'.",
                 )
             st.caption(
                 f"The first metric treats every significant result alike. The second weighs how strong this result is "
                 f"(p = {p_values[challenger_index_in_lists]:.4f}): results just under the threshold carry a much higher "
                 "risk than very small p-values."
             )
-            if fpr > 0.20:
-                st.warning(f"With a {prior:.0%} prior, there's a {fpr:.1%} chance this result is a false positive. {fpr_warning_suffix}")
+            # Warn on the p-value-based FPR: the standard FPR is the same for every
+            # significant result at a given prior/power, so it can't tell strong
+            # evidence from borderline evidence.
+            if fpr_at_p > 0.20:
+                st.warning(f"With a {prior:.0%} prior and {power:.0%} power, there's a {fpr_at_p:.1%} chance this result is a false positive, given its p-value. {fpr_warning_suffix}")
             else:
-                st.success(f"False Positive Risk is low at {fpr:.1%}.")
+                st.success(f"False Positive Risk at the observed p-value is low at {fpr_at_p:.1%}.")
         else:
             fndr = calculate_fndr(alpha=fpr_alpha, power=power, prior=prior)
             st.metric(label=fndr_label, value=f"{fndr:.1%}", help=fndr_help)
             if fndr > 0.20:
-                st.warning(f"With a {prior:.0%} prior, there's a {fndr:.1%} chance a real effect was missed. {fndr_warning_suffix}")
+                st.warning(f"With a {prior:.0%} prior and {power:.0%} power, there's a {fndr:.1%} chance a real effect was missed. {fndr_warning_suffix}")
             else:
                 st.success(fndr_success)
 
