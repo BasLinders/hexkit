@@ -7,7 +7,6 @@ import pandas as pd
 import numpy as np
 import string
 import io
-import concurrent.futures
 import altair as alt
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -56,6 +55,7 @@ def initialize_session_state():
     st.session_state.setdefault("aovs", [None] * num_variants)
     st.session_state.setdefault("aov_cv", 0.5)
     st.session_state.setdefault("confidence_level", 95)
+    st.session_state.setdefault("desired_power", 80)
     st.session_state.setdefault("test_duration", 7)
     st.session_state.setdefault("tail", "Greater")
     st.session_state.setdefault("probability_winner", 80.0)
@@ -338,6 +338,14 @@ def get_frequentist_inputs():
              "the entire real line (unbounded in both directions), which is a degenerate, "
              "not a stricter, result."
     )
+    st.session_state.desired_power = st.number_input(
+        "What is the power level your test was planned for?",
+        min_value=50, max_value=99, step=1,
+        value=st.session_state.get("desired_power", 80),
+        help="Power is the chance that your test detects a real effect of the size you planned for "
+             "(the minimum detectable effect). At 80%, a real effect of that size is missed 1 in 5 times. "
+             "Enter it in %, usually 80. Used for the False Positive / Negative Risk below."
+    )
     st.session_state.test_duration = st.number_input(
         "How many days has this test been running?",
         min_value=1,
@@ -410,7 +418,8 @@ def get_frequentist_inputs():
     st.write("### False Positive / Negative Risk")
     with st.expander("What is this?"):
         st.markdown(r"""
-        Standard p-values tell you P(data | H0), not P(H0 | data). These metrics flip that using your prior belief that the variant has a real effect.
+        Standard p-values tell you P(data | H0), not P(H0 | data). These metrics flip that using your prior belief that the variant has a real effect
+        and the power the test was designed for (the desired power entered above).
 
         | | Significant result | Non-significant result |
         |---|---|---|
@@ -422,6 +431,9 @@ def get_frequentist_inputs():
         - **Skeptical** (10%): most experiments don't move the needle
         - **Neutral** (50%): no strong expectation either way
         - **Optimistic** (90%): strong belief the variant has a real effect
+
+        For significant results, a second metric shows the **False Positive Risk at the observed p-value**. The first metric treats every
+        p-value below alpha the same; this one weighs how strong the evidence actually is, so p = 0.049 carries a much higher risk than p = 0.001.
         """)
 
     sensitivity_mode = st.selectbox(
@@ -446,6 +458,7 @@ def get_frequentist_inputs():
         sensitivity_mode,
         custom_prior,
         st.session_state.aovs,
+        st.session_state.desired_power,
     )
 
 
@@ -1365,86 +1378,13 @@ def calculate_frequentist_statistics(
         for i in range(1, num_variants)
     ]
 
-    power_method_used = ""
-    observed_powers = []
-
-    def analytical_power():
-        powers = []
-        for i in range(1, num_variants):
-            se_diff = np.sqrt(standard_errors[i] ** 2 + standard_errors[0] ** 2)
-            if se_diff == 0:
-                powers.append(1.0)
-                continue
-            z_delta = abs(conversion_rates[i] - conversion_rates[0]) / se_diff
-            if tail in ['Greater', 'Less']:
-                z_alpha = norm.ppf(1 - sidak_alpha)
-                power = norm.cdf(z_delta - z_alpha)
-            else:
-                z_alpha = norm.ppf(1 - sidak_alpha / 2)
-                power = norm.cdf(z_delta - z_alpha) + norm.cdf(-z_delta - z_alpha)
-            powers.append(power)
-        return powers
-
-    if all(v > 1000 for v in visitor_counts):
-        power_method_used = "Analytical"
-        observed_powers = analytical_power()
-
-    elif reduction_factor != 1.0:
-        power_method_used = "Analytical"
-        st.warning(
-            "Overdispersion Safety Net is active. Bootstrap power estimation is not compatible "
-            "with adjusted standard errors; falling back to the analytical method."
-        )
-        observed_powers = analytical_power()
-
-    else:
-        power_method_used = "Bootstrap"
-
-        # FIX #3: use the SAME unpooled SE as the reported analytical p-value
-        # so the bootstrap power and the significance decision share variance
-        # assumptions.
-        def bootstrap_sample(data_control, data_variant, threshold_alpha, tail):
-            sample_control = np.random.choice(data_control, size=len(data_control), replace=True)
-            sample_variant = np.random.choice(data_variant, size=len(data_variant), replace=True)
-
-            p_c = np.mean(sample_control)
-            p_v = np.mean(sample_variant)
-            n_c = len(sample_control)
-            n_v = len(sample_variant)
-
-            se_unpooled = np.sqrt(
-                p_c * (1 - p_c) / n_c + p_v * (1 - p_v) / n_v
-            )
-            z_stat = 0 if se_unpooled == 0 else (p_v - p_c) / se_unpooled
-
-            if tail == 'Greater':
-                return (1 - norm.cdf(z_stat)) < threshold_alpha
-            elif tail == 'Less':
-                return norm.cdf(z_stat) < threshold_alpha
-            else:
-                return (2 * (1 - norm.cdf(abs(z_stat)))) < threshold_alpha
-
-        def bootstrap_power(data_control, data_variant, threshold_alpha, tail, n_bootstraps=10000):
-            significant_count = 0
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = [
-                    executor.submit(bootstrap_sample, data_control, data_variant, threshold_alpha, tail)
-                    for _ in range(n_bootstraps)
-                ]
-                for future in concurrent.futures.as_completed(futures):
-                    if future.result():
-                        significant_count += 1
-            return significant_count / n_bootstraps
-
-        data_controls = [
-            np.concatenate([np.ones(c), np.zeros(v - c)])
-            for c, v in zip(conversion_counts, visitor_counts)
-        ]
-        # Use the same threshold the significance decision uses (sidak_alpha).
-        observed_powers = [
-            bootstrap_power(data_controls[0], data_controls[i], sidak_alpha, tail)
-            for i in range(1, num_variants)
-        ]
+    # A zero standard error for the difference (e.g. 0 conversions in both
+    # arms, or 100% in both) means the data carry no information about the
+    # effect, so FPR / FNDR are not meaningful for that comparison.
+    insufficient_data = [
+        (standard_errors[i] ** 2 + standard_errors[0] ** 2) == 0
+        for i in range(1, num_variants)
+    ]
 
     results = {
         "num_variants": num_variants,
@@ -1459,8 +1399,7 @@ def calculate_frequentist_statistics(
         "p_values": p_values,
         "is_significant": significant_results,
         "non_inferiority": non_inferiority,
-        "observed_powers": observed_powers,
-        "power_method": power_method_used,
+        "insufficient_data": insufficient_data,
         "srm_p_value": srm_p_value,
         "sidak_alpha": sidak_alpha,
         "alpha": alpha,
@@ -1622,6 +1561,36 @@ def calculate_fndr(alpha, power, prior):
     return numerator / denominator if denominator else 0.0
 
 
+def calculate_fpr_at_p(z, alpha, power, prior, tail):
+    """
+    False Positive Risk given the observed test statistic itself (the
+    "p-equals" approach, Colquhoun 2017), not just the fact that p <= alpha.
+
+    H1 is the effect the test was designed to detect: the effect size, in
+    standard errors, at which the test reaches `power` at `alpha`. The
+    likelihood ratio of H1 vs H0 at the observed z is computed in log space
+    so extreme z values do not overflow.
+    """
+    if prior <= 0.0:
+        return 1.0
+    if prior >= 1.0:
+        return 0.0
+
+    z_power = norm.ppf(power)
+    if tail == 'Two-sided':
+        delta = norm.ppf(1 - alpha / 2) + z_power
+        a = abs(z)
+        # H1 is +/-delta with equal weight; the density of |z| under H0 is 2*phi(z).
+        log_lr = -delta ** 2 / 2 + np.logaddexp(a * delta, -a * delta) - np.log(2)
+    else:
+        delta = norm.ppf(1 - alpha) + z_power
+        z_dir = z if tail == 'Greater' else -z
+        log_lr = z_dir * delta - delta ** 2 / 2
+
+    log_posterior_odds_h1 = np.log(prior / (1 - prior)) + log_lr
+    return float(1.0 / (1.0 + np.exp(np.clip(log_posterior_odds_h1, -700, 700))))
+
+
 def display_frequentist_summary(
     results,
     visitor_counts,
@@ -1631,6 +1600,7 @@ def display_frequentist_summary(
     test_duration=None,
     aovs=None,
     aov_cv=0.0,
+    power=0.8,
 ):
     if not results:
         st.error("Calculation results are missing, cannot display summary.")
@@ -1640,7 +1610,8 @@ def display_frequentist_summary(
     srm_p_value = results['srm_p_value']
     is_significant = results['is_significant']
     p_values = results['p_values']
-    observed_powers = results['observed_powers']
+    insufficient_data = results['insufficient_data']
+    z_stats = results['z_stats']
     conversion_rates = results['conversion_rates']
     sidak_alpha = results['sidak_alpha']
     alpha_unadjusted = results['alpha']
@@ -1748,7 +1719,6 @@ def display_frequentist_summary(
                 st.info("There is no strong evidence of a difference, and the effect size remains uncertain.")
 
         st.write("#### False Positive / Negative Risk")
-        power = observed_powers[challenger_index_in_lists]
         fpr_alpha = results['sidak_alpha']
 
         if tail == 'Greater':
@@ -1756,7 +1726,7 @@ def display_frequentist_summary(
             fpr_help = "Probability this apparent improvement is a false positive, given your prior."
             fpr_warning_suffix = "Consider replication before acting."
             fndr_label = "False Negative Discovery Rate"
-            fndr_help = "Probability a real improvement was missed, given your prior and observed power."
+            fndr_help = "Probability a real improvement was missed, given your prior and desired power."
             fndr_warning_suffix = "Power may be insufficient to detect a real improvement."
             fndr_success = "False Negative Risk is low: If a real improvement exists, this test was likely sensitive enough to find it."
         elif tail == 'Less':
@@ -1764,7 +1734,7 @@ def display_frequentist_summary(
             fpr_help = "Probability this apparent harm is a false positive, given your prior."
             fpr_warning_suffix = "Review before concluding the variant is worse."
             fndr_label = "False Negative Discovery Rate (Missed Harm)"
-            fndr_help = "Probability real harm was missed, given your prior and observed power."
+            fndr_help = "Probability real harm was missed, given your prior and desired power."
             fndr_warning_suffix = "Power may be insufficient to detect real harm."
             fndr_success = "False Negative Risk is low: If the variant truly underperforms, this test was likely sensitive enough to detect it."
         else:
@@ -1772,13 +1742,35 @@ def display_frequentist_summary(
             fpr_help = "Probability this detected difference (in either direction) is a false positive, given your prior."
             fpr_warning_suffix = "Direction is uncertain: Treat with caution before acting."
             fndr_label = "False Negative Discovery Rate"
-            fndr_help = "Probability a real difference in either direction was missed, given your prior and observed power."
+            fndr_help = "Probability a real difference in either direction was missed, given your prior and desired power."
             fndr_warning_suffix = "Power may be insufficient to detect a real difference in either direction."
             fndr_success = "False Negative Risk is low: If a real difference exists in either direction, this test was likely sensitive enough to find it."
 
-        if is_significant[challenger_index_in_lists]:
+        if insufficient_data[challenger_index_in_lists]:
+            st.info(
+                "Not enough data to estimate the False Positive / Negative Risk: "
+                f"the difference between {alphabet[i]} and {alphabet[0]} has no measurable variance "
+                "(for example, 0 conversions in both variants)."
+            )
+        elif is_significant[challenger_index_in_lists]:
             fpr = calculate_fpr(alpha=fpr_alpha, power=power, prior=prior)
-            st.metric(label=fpr_label, value=f"{fpr:.1%}", help=fpr_help)
+            fpr_at_p = calculate_fpr_at_p(
+                z=z_stats[challenger_index_in_lists], alpha=fpr_alpha, power=power, prior=prior, tail=tail
+            )
+            fpr_col1, fpr_col2 = st.columns(2)
+            with fpr_col1:
+                st.metric(label=fpr_label, value=f"{fpr:.1%}", help=fpr_help)
+            with fpr_col2:
+                st.metric(
+                    label="False Positive Risk at observed p-value",
+                    value=f"{fpr_at_p:.1%}",
+                    help="Same prior and desired power, but uses the exact p-value instead of only 'p is below alpha'.",
+                )
+            st.caption(
+                f"The first metric treats every significant result alike. The second weighs how strong this result is "
+                f"(p = {p_values[challenger_index_in_lists]:.4f}): results just under the threshold carry a much higher "
+                "risk than very small p-values."
+            )
             if fpr > 0.20:
                 st.warning(f"With a {prior:.0%} prior, there's a {fpr:.1%} chance this result is a false positive. {fpr_warning_suffix}")
             else:
@@ -1970,6 +1962,7 @@ def run():
             sensitivity_mode,
             custom_prior,
             aovs,
+            desired_power,
         ) = get_frequentist_inputs()
         st.write("---")
         st.session_state.tail = st.radio(
@@ -2049,6 +2042,7 @@ def run():
                             test_duration=test_duration,
                             aovs=aovs,
                             aov_cv=st.session_state.get("aov_cv", 0.0),
+                            power=desired_power / 100,
                         )
 
                 except Exception as e:
