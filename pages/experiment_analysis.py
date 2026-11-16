@@ -20,6 +20,7 @@ from typing import List, Tuple, Dict, Any, Optional
 
 from foe.frequentist.operations import FrequentistEngine
 from foe.frequentist.confidence import compute_interval_difference
+from foe.frequentist import risk as foe_risk
 from foe.core.models import AlternativeHypothesis, BusinessCaseInput, ExperimentInput
 from foe.bayesian.operations import (
     BayesianEngine,
@@ -369,15 +370,13 @@ def get_frequentist_inputs():
         """)
 
     prior_labels = {
-        "skeptical": "Skeptical (10%)",
-        "neutral": "Neutral (50%)",
-        "optimistic": "Optimistic (90%)",
-        "custom": "Historical win rate",
+        mode: f"{mode.capitalize()} ({value:.0%})" for mode, value in foe_risk.PRIOR_PRESETS.items()
     }
+    prior_labels["custom"] = "Historical win rate"
     sensitivity_mode = st.selectbox(
         "Prior belief that the variant has a real effect",
         list(prior_labels),
-        index=0,
+        index=list(prior_labels).index(foe_risk.DEFAULT_SENSITIVITY_MODE),
         format_func=prior_labels.get,
         key="f_sensitivity_mode",
         help="How often tests like this one have a real effect. Skeptical (10%) is the safe default; "
@@ -1433,16 +1432,33 @@ def plot_conversion_distributions(results, reduction_factor=1.0):
     st.write("")
     st.write("### Probability Density of Estimated Conversion Rates")
 
+    # A variant at 0% or 100% conversion has SE = 0: no density to draw, only a
+    # point. Plotting it with a clamped tiny SE creates a ~1e8 spike that hides
+    # the other curves, and with every variant at SE = 0 the near-zero-width
+    # axis pushes the labels so far out that the figure can't be rendered.
+    has_variance = [se > 0 for se in se_list]
+    if not any(has_variance):
+        st.info(
+            "No distribution to plot: no variant's conversion rate has any variance "
+            "(for example, 0% or 100% conversion in every variant)."
+        )
+        return
+
     fig, ax = plt.subplots(figsize=(12, 7))
 
     all_means = np.array(conversion_rates)
     all_ses = np.array(se_list)
-    plot_min = np.min(all_means - 4 * np.maximum(all_ses, 1e-9))
-    plot_max = np.max(all_means + 4 * np.maximum(all_ses, 1e-9))
+    plot_min = min(np.min(all_means), np.min((all_means - 4 * all_ses)[has_variance]))
+    plot_max = max(np.max(all_means), np.max((all_means + 4 * all_ses)[has_variance]))
     x_min = max(0, plot_min)
     x_max = min(1, plot_max)
-    if x_max <= x_min:
-        x_max = x_min + 1e-6
+    # Keep the axis at least 0.1 percentage point wide so labels stay inside it.
+    min_width = 0.001
+    if x_max - x_min < min_width:
+        centre = (x_min + x_max) / 2
+        x_min = max(0.0, centre - min_width / 2)
+        x_max = min(1.0, x_min + min_width)
+        x_min = max(0.0, x_max - min_width)
     x_range = np.linspace(x_min, x_max, 1000)
 
     colors = ['#808080', '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
@@ -1452,15 +1468,18 @@ def plot_conversion_distributions(results, reduction_factor=1.0):
 
     pdfs = []
     for i in range(num_variants):
-        se = max(se_list[i], 1e-9)
-        pdf = norm.pdf(x_range, conversion_rates[i], se)
-        pdfs.append(pdf)
-
         variant_label = f'Variant {string.ascii_uppercase[i]}' if i > 0 else 'Control (A)'
         line_color = colors[i % len(colors)]
 
-        ax.plot(x_range * 100, pdf, label=variant_label, color=line_color, alpha=base_alpha, linewidth=1.5)
-        ax.axvline(conversion_rates[i] * 100, color=line_color, linestyle='--', alpha=base_alpha * 0.8)
+        if has_variance[i]:
+            pdf = norm.pdf(x_range, conversion_rates[i], se_list[i])
+            ax.plot(x_range * 100, pdf, label=variant_label, color=line_color, alpha=base_alpha, linewidth=1.5)
+            ax.axvline(conversion_rates[i] * 100, color=line_color, linestyle='--', alpha=base_alpha * 0.8)
+        else:
+            pdf = None
+            ax.axvline(conversion_rates[i] * 100, color=line_color, linestyle='--', linewidth=2,
+                       alpha=base_alpha, label=f'{variant_label} (no variance)')
+        pdfs.append(pdf)
 
         text_left_margin = 0.005
         ax.text(conversion_rates[i] * 100 + text_left_margin,
@@ -1472,7 +1491,8 @@ def plot_conversion_distributions(results, reduction_factor=1.0):
     control_se = max(se_list[0], 1e-9)
 
     for i in range(1, num_variants):
-        if significant_results[i - 1]:
+        # No density to shade for a variant without variance.
+        if significant_results[i - 1] and pdfs[i] is not None:
             variant_cr = conversion_rates[i]
             variant_se = max(se_list[i], 1e-9)
             pdf_variant = pdfs[i]
@@ -1541,71 +1561,12 @@ def plot_conversion_distributions(results, reduction_factor=1.0):
     plt.close(fig)
 
 
-def resolve_prior(sensitivity_mode='skeptical', custom_prior=None):
-    priors = {'skeptical': 0.1, 'neutral': 0.5, 'optimistic': 0.9}
-    if sensitivity_mode == 'custom':
-        if custom_prior is None:
-            raise ValueError("custom_prior must be provided when sensitivity_mode is 'custom'.")
-        if not (0.0 <= custom_prior <= 1.0):
-            raise ValueError(f"custom_prior must be between 0 and 1, got {custom_prior}.")
-        return custom_prior
-    if sensitivity_mode not in priors:
-        raise ValueError(f"Unknown sensitivity_mode '{sensitivity_mode}'.")
-    return priors[sensitivity_mode]
-
-
-def calculate_fpr(alpha, power, prior):
-    p1, p0 = prior, 1 - prior
-    numerator = alpha * p0
-    denominator = (alpha * p0) + (power * p1)
-    return numerator / denominator if denominator else 0.0
-
-
-def calculate_fndr(alpha, power, prior):
-    p1, p0 = prior, 1 - prior
-    beta_err = 1 - power
-    specificity = 1 - alpha
-    numerator = beta_err * p1
-    denominator = (beta_err * p1) + (specificity * p0)
-    return numerator / denominator if denominator else 0.0
-
-
-def calculate_fpr_at_p(z, alpha, power, prior, tail):
-    """
-    False Positive Risk given the observed test statistic itself (the
-    "p-equals" approach, Colquhoun 2017), not just the fact that p <= alpha.
-
-    H1 is the effect the test was designed to detect: the effect size, in
-    standard errors, at which the test reaches `power` at `alpha`. The
-    likelihood ratio of H1 vs H0 at the observed z is computed in log space
-    so extreme z values do not overflow.
-    """
-    if prior <= 0.0:
-        return 1.0
-    if prior >= 1.0:
-        return 0.0
-
-    z_power = norm.ppf(power)
-    if tail == 'Two-sided':
-        delta = norm.ppf(1 - alpha / 2) + z_power
-        a = abs(z)
-        # H1 is +/-delta with equal weight; the density of |z| under H0 is 2*phi(z).
-        log_lr = -delta ** 2 / 2 + np.logaddexp(a * delta, -a * delta) - np.log(2)
-    else:
-        delta = norm.ppf(1 - alpha) + z_power
-        z_dir = z if tail == 'Greater' else -z
-        log_lr = z_dir * delta - delta ** 2 / 2
-
-    log_posterior_odds_h1 = np.log(prior / (1 - prior)) + log_lr
-    return float(1.0 / (1.0 + np.exp(np.clip(log_posterior_odds_h1, -700, 700))))
-
-
 def display_frequentist_summary(
     results,
     visitor_counts,
     conversion_counts,
     reduction_factor=1.0,
-    prior=0.1,
+    prior=foe_risk.DEFAULT_PRIOR,
     test_duration=None,
     aovs=None,
     aov_cv=0.0,
@@ -1620,7 +1581,6 @@ def display_frequentist_summary(
     is_significant = results['is_significant']
     p_values = results['p_values']
     insufficient_data = results['insufficient_data']
-    z_stats = results['z_stats']
     conversion_rates = results['conversion_rates']
     sidak_alpha = results['sidak_alpha']
     alpha_unadjusted = results['alpha']
@@ -1763,9 +1723,15 @@ def display_frequentist_summary(
                 "(for example, 0 conversions in both variants)."
             )
         elif is_significant[challenger_index_in_lists]:
-            fpr = calculate_fpr(alpha=fpr_alpha, power=power, prior=prior)
-            fpr_at_p = calculate_fpr_at_p(
-                z=z_stats[challenger_index_in_lists], alpha=fpr_alpha, power=power, prior=prior, tail=tail
+            # Uses the page's own significance decision (p <= alpha) rather than
+            # foe_risk.assess_risk, which counts p == alpha as not significant.
+            fpr = foe_risk.false_positive_risk(alpha=fpr_alpha, power=power, prior=prior)
+            fpr_at_p = foe_risk.fpr_at_p_value(
+                p_value=p_values[challenger_index_in_lists],
+                alpha=fpr_alpha,
+                power=power,
+                prior=prior,
+                alternative=_TAIL_TO_ALTERNATIVE[tail],
             )
             fpr_col1, fpr_col2 = st.columns(2)
             with fpr_col1:
@@ -1789,7 +1755,7 @@ def display_frequentist_summary(
             else:
                 st.success(f"False Positive Risk at the observed p-value is low at {fpr_at_p:.1%}.")
         else:
-            fndr = calculate_fndr(alpha=fpr_alpha, power=power, prior=prior)
+            fndr = foe_risk.false_negative_discovery_rate(alpha=fpr_alpha, power=power, prior=prior)
             st.metric(label=fndr_label, value=f"{fndr:.1%}", help=fndr_help)
             if fndr > 0.20:
                 st.warning(f"With a {prior:.0%} prior and {power:.0%} power, there's a {fndr:.1%} chance a real effect was missed. {fndr_warning_suffix}")
@@ -1994,7 +1960,7 @@ def run():
 
         if st.button("Calculate Frequentist Results", type="primary"):
             if validate_inputs(visitor_counts, conversion_counts):
-                prior = resolve_prior(sensitivity_mode, custom_prior)
+                prior = foe_risk.resolve_prior(sensitivity_mode, custom_prior)
                 st.write("---")
                 try:
                     with st.spinner("Analysis in progress..."):
