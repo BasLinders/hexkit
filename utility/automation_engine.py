@@ -21,6 +21,7 @@ from foe.core.models import (
     ExperimentInput,
 )
 from foe.frequentist.operations import FrequentistEngine
+from foe.frequentist import risk as foe_risk
 from foe.bayesian.operations import BayesianEngine
 from foe.continuous.operations import ContinuousMetricEngine
 from foe.pretest.operations import PretestEngine
@@ -146,6 +147,26 @@ class VariantData:
     aov: float = 0.0
 
 
+def assess_decision_risk(
+    p_value: float,
+    alternative: AlternativeHypothesis,
+    alpha: float,
+    power: float,
+    prior: float,
+) -> Optional[dict]:
+    """
+    FOE false-positive / false-negative risk for one comparison, as a plain
+    dict (stored in session state and sent to the AI step). None when the
+    p-value is not usable (e.g. nan from a degenerate fit), so the UI can
+    show "insufficient data" instead.
+    """
+    if p_value is None or not math.isfinite(p_value):
+        return None
+    return foe_risk.assess_risk(
+        p_value=p_value, alternative=alternative, alpha=alpha, power=power, prior=prior,
+    ).model_dump(mode="json")
+
+
 def run_frequentist_analysis(
     control: VariantData,
     variation: VariantData,
@@ -154,6 +175,8 @@ def run_frequentist_analysis(
     daily_visitors: float,
     projection_days: int,
     aov_cv: float = 0.0,
+    power: float = 0.80,
+    prior: float = foe_risk.DEFAULT_PRIOR,
 ) -> dict:
     """Runs the FOE FrequentistEngine (z-test) on a single control/variation pair."""
     alternative = _TAIL_MAP[tail]
@@ -193,6 +216,13 @@ def run_frequentist_analysis(
         alternative=alternative,
     )
 
+    # Zero variance in the difference (e.g. 0 conversions in both arms): the
+    # data carry no information about the effect, so no risk is reported.
+    decision_risk = (
+        None if se_ctrl == 0 and se_var == 0
+        else assess_decision_risk(result.p_value, alternative, alpha, power, prior)
+    )
+
     return {
         "method": "frequentist",
         "p_value": result.p_value,
@@ -204,6 +234,7 @@ def run_frequentist_analysis(
         "effect_on_revenue": monetary["point_estimate"],
         "effect_on_revenue_ci": (monetary["ci_low"], monetary["ci_high"]),
         "projection_days": projection_days,
+        "decision_risk": decision_risk,
     }
 
 
@@ -354,12 +385,13 @@ def run_continuous_analysis(
     daily_visitors: float,
     projection_days: int,
     confidence_level: float = 0.95,
-    tail: Literal["Two-sided", "Greater", "Less"] = "Two-sided",
     kpi: str = "purchase_revenue",
     mode: Literal["rpv", "rpt"] = "rpv",
     winsorize_method: Optional[Literal["Standard Deviation", "Percentile"]] = None,
     winsorize_stdev: Optional[int] = None,
     winsorize_percentile: Optional[int] = None,
+    power: float = 0.80,
+    prior: float = foe_risk.DEFAULT_PRIOR,
 ) -> dict:
     """
     Runs the FOE ContinuousMetricEngine on row-level revenue data via the
@@ -394,8 +426,13 @@ def run_continuous_analysis(
     case needs a true visitor count (not an order count) to derive an order
     rate (n orders / total visitors); a repeat purchaser's extra rows must not
     inflate it.
+
+    Always two-sided, with no tail parameter: the likelihood-ratio test
+    compares whole revenue distributions (conversion, order-value level and
+    spread), so "significant" has no single direction. The business-case CI
+    is two-sided too, so it agrees with the test.
     """
-    alternative = _TAIL_MAP[tail]
+    alternative = AlternativeHypothesis.TWO_SIDED
     alpha = 1.0 - confidence_level
 
     # per_visitor is already collapsed to one row per (variant, visitor), so
@@ -464,6 +501,8 @@ def run_continuous_analysis(
         if monetary else None
     )
 
+    decision_risk = assess_decision_risk(result.p_value, alternative, alpha, power, prior)
+
     return {
         "method": "continuous",
         "mode": mode,
@@ -478,6 +517,7 @@ def run_continuous_analysis(
         "effect_on_revenue_ci": (monetary["ci_low"], monetary["ci_high"]) if monetary else (0.0, 0.0),
         "projection_days": projection_days,
         "winsorize_info": winsorize_info,
+        "decision_risk": decision_risk,
     }
 
 

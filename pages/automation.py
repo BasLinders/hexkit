@@ -55,6 +55,7 @@ from utility.automation_engine import (
     best_match_field,
     guess_field_by_hints,
 )
+from foe.frequentist import risk as foe_risk
 from utility.airtable_client import (
     get_credentials, push_record, update_record, search_records, list_bases, list_tables,
 )
@@ -706,6 +707,53 @@ def _render_stage_configure():
                 tail = st.radio(
                     "Tail", options=TAILS, index=0, horizontal=True, key="auto_tail",
                 )
+                if use_continuous:
+                    st.caption(
+                        "Applies to Frequentist and Pre-test. Continuous always tests two-sided: "
+                        "its test compares whole revenue distributions, which have no single direction."
+                    )
+            if use_frequentist or use_continuous:
+                st.markdown("**False Positive / Negative Risk**")
+                st.caption(
+                    "Turns the p-value into the chance a winner is a false positive (or a flat result "
+                    "missed a real effect), using the power the test was planned for and how often "
+                    "tests like this have a real effect."
+                )
+                rk1, rk2 = st.columns(2)
+                with rk1:
+                    if use_pretest:
+                        st.caption("Planned power: uses the power target from the Pre-test settings below.")
+                    else:
+                        planned_power_pct = st.slider(
+                            "Planned power (%)", min_value=50, max_value=99,
+                            value=80, step=1, key="auto_planned_power",
+                            help="The chance the test detects a real effect of the size it was planned for "
+                                 "(the minimum detectable effect). At 80%, a real effect of that size is "
+                                 "missed 1 in 5 times.",
+                        )
+                with rk2:
+                    prior_labels = {
+                        mode: f"{mode.capitalize()} ({value:.0%})"
+                        for mode, value in foe_risk.PRIOR_PRESETS.items()
+                    }
+                    prior_labels["custom"] = "Historical win rate"
+                    sensitivity_mode = st.selectbox(
+                        "Prior belief that the variation has a real effect",
+                        list(prior_labels),
+                        index=list(prior_labels).index(foe_risk.DEFAULT_SENSITIVITY_MODE),
+                        format_func=prior_labels.get,
+                        key="auto_sensitivity_mode",
+                        help="How often tests like this one have a real effect. Across the industry roughly "
+                             "10-30% of tests have a real positive effect, so Skeptical (10%) is the default. "
+                             "Use your historical win rate if you track it.",
+                    )
+                    custom_prior = None
+                    if sensitivity_mode == "custom":
+                        custom_prior = st.number_input(
+                            "In %, what share of your past tests produced a real winner?",
+                            min_value=1, max_value=99, step=1, value=20,
+                            key="auto_custom_prior_pct",
+                        ) / 100
     else:
         confidence_level, tail = 0.95, "Two-sided"
 
@@ -800,6 +848,14 @@ def _render_stage_configure():
     else:
         trust_pct = 80
 
+    # Planned power for the risk metrics: the pre-test power target when a
+    # pre-test runs (same test plan, not asked twice), else the slider above.
+    if use_frequentist or use_continuous:
+        planned_power = (trust_pct if use_pretest else planned_power_pct) / 100
+        risk_prior = foe_risk.resolve_prior(sensitivity_mode, custom_prior)
+    else:
+        planned_power, risk_prior = 0.80, foe_risk.DEFAULT_PRIOR
+
     with st.expander("Revenue projection", expanded=True):
         rc1, rc2 = st.columns(2)
         with rc1:
@@ -873,6 +929,8 @@ def _render_stage_configure():
                     daily_visitors=daily_visitors,
                     projection_days=int(projection_days),
                     aov_cv=aov_cv,
+                    power=planned_power,
+                    prior=risk_prior,
                 )
             if use_bayesian:
                 results["bayesian"] = run_bayesian_analysis(
@@ -890,11 +948,12 @@ def _render_stage_configure():
                     daily_visitors=daily_visitors_continuous,
                     projection_days=int(projection_days),
                     confidence_level=confidence_level,
-                    tail=tail,
                     mode=continuous_mode,
                     winsorize_method=winsorize_method,
                     winsorize_stdev=winsorize_stdev,
                     winsorize_percentile=winsorize_percentile,
+                    power=planned_power,
+                    prior=risk_prior,
                 )
             if use_pretest:
                 if pretest_meta.get("seasonal"):
@@ -944,6 +1003,66 @@ def _render_stage_configure():
 
 def _fmt_money(x: float) -> str:
     return "Unbounded" if math.isinf(x) else f"€{x:,.0f}"
+
+
+# Above this, a risk gets a warning instead of a success message.
+_RISK_WARNING_THRESHOLD = 0.20
+
+
+def _render_decision_risk(result: dict):
+    """
+    FPR / FNDR block for one frequentist or continuous result, mirroring the
+    Experiment Analysis page: FPR (+ FPR at the observed p-value) for a
+    significant result, FNDR otherwise. The warning is based on the FPR at
+    the observed p-value, since the standard FPR is the same for every
+    significant result at a given prior and power.
+    """
+    risk = result.get("decision_risk")
+    if not risk:
+        st.info(
+            "Not enough data to estimate the False Positive / Negative Risk "
+            "(the difference has no measurable variance)."
+        )
+        return
+
+    assumptions = f"prior {risk['prior']:.0%}, power {risk['power']:.0%}"
+    if result["is_significant"]:
+        fpr_at_p = risk.get("fpr_at_p")
+        c1, c2 = st.columns(2)
+        c1.metric(
+            "False Positive Risk",
+            f"{risk['fpr']:.1%}",
+            help=f"Chance a significant result is a false positive, given your {assumptions}. "
+                 "The same for every significant result at these settings.",
+        )
+        if fpr_at_p is None:
+            return
+        c2.metric(
+            "False Positive Risk at observed p-value",
+            f"{fpr_at_p:.1%}",
+            help=f"Same {assumptions}, but uses this test's exact p-value, so it weighs how strong the evidence is.",
+        )
+        if fpr_at_p > _RISK_WARNING_THRESHOLD:
+            st.warning(
+                f"With a {risk['prior']:.0%} prior and {risk['power']:.0%} power, there's a {fpr_at_p:.1%} "
+                "chance this result is a false positive, given its p-value. Consider replication before acting."
+            )
+        else:
+            st.success(f"False Positive Risk at the observed p-value is low at {fpr_at_p:.1%}.")
+    else:
+        fndr = risk["fndr"]
+        st.metric(
+            "False Negative Discovery Rate",
+            f"{fndr:.1%}",
+            help=f"Chance a real effect was missed, given your {assumptions}.",
+        )
+        if fndr > _RISK_WARNING_THRESHOLD:
+            st.warning(
+                f"With a {risk['prior']:.0%} prior and {risk['power']:.0%} power, there's a {fndr:.1%} "
+                "chance a real effect was missed. Power may be insufficient."
+            )
+        else:
+            st.success("False Negative Risk is low: if a real effect exists, this test was likely sensitive enough to find it.")
 
 
 def _render_stage_results():
@@ -1002,6 +1121,7 @@ def _render_stage_results():
         st.caption(freq["conclusion"])
         if freq.get("monetary_conclusion"):
             st.caption(freq["monetary_conclusion"])
+        _render_decision_risk(freq)
         _render_monetary_notes("frequentist")
         st.divider()
 
@@ -1040,6 +1160,7 @@ def _render_stage_results():
         st.caption(cont["conclusion"])
         if cont.get("monetary_conclusion"):
             st.caption(cont["monetary_conclusion"])
+        _render_decision_risk(cont)
         if cont.get("winsorize_info"):
             wi = cont["winsorize_info"]
             if wi["lower_cap"] is not None:
@@ -1394,6 +1515,15 @@ def _render_stage_ai():
             if result.get("conclusion") or result.get("monetary_conclusion")
         },
     }
+    # Planned power, prior and the resulting false-positive / false-negative
+    # risk per method -- also gives Gemini the power for its KPI headlines.
+    decision_risk = {
+        method: results[method]["decision_risk"]
+        for method in ("frequentist", "continuous")
+        if results.get(method) and results[method].get("decision_risk")
+    }
+    if decision_risk:
+        ai_input["decision_risk"] = decision_risk
     active_monetary_methods = [
         m for m in ("frequentist", "bayesian", "continuous") if results.get(m)
     ]

@@ -75,6 +75,14 @@ one the payload happens to use for its "effect_on_revenue" field. If two
 methods disagree noticeably, say so and explain which number you'd trust
 more and why, rather than silently picking one.
 
+When the data includes "decision_risk" (per method), use it to judge how
+confident to be. "power" is the power the test was planned for and "prior" the
+assumed share of tests with a real effect. For a significant result,
+"fpr_at_p" is the chance it is a false positive given its actual p-value: lead
+with that, not with "fpr", which is the same for every significant result at
+these settings. For a non-significant result, "fndr" is the chance a real
+effect was missed.
+
 Make sure that you structure your answer thorougly by KPI. Each KPI should have a headline like this before summarizing the results:
 KPI: [KPI] ([test type], [Percentage] Confidence, [Percentage] Power)
 
