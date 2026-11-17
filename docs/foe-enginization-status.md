@@ -1,8 +1,8 @@
 # FOE Enginization Status
 
 How much of Hexkit's statistics currently runs on **First Order Engine (FOE)** —
-Bas Linders' standalone stats library (`first-order-engine`, imported as `foe`) —
-versus how much still lives as bespoke logic inside Hexkit itself.
+A standalone stats library (`first-order-engine`, imported as `foe`) —
+versus how much still exists as bespoke logic inside Hexkit itself.
 
 "Enginized" here means: the page/module imports and calls a `foe.*` engine as
 its actual computation, not just that it *could*. Where a page has its own
