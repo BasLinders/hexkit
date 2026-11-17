@@ -1734,7 +1734,13 @@ def display_frequentist_summary(
                 )
             st.caption(
                 FrequentistEngine.generate_monetary_conclusion(
-                    alphabet[i], monetary, is_significant[challenger_index_in_lists]
+                    alphabet[i],
+                    monetary,
+                    is_significant[challenger_index_in_lists],
+                    # Must match the alternative passed to
+                    # estimate_monetary_impact_per_variant, or the wording
+                    # misdescribes a one-sided (unbounded) range.
+                    alternative=_TAIL_TO_ALTERNATIVE[tail],
                 )
             )
 
