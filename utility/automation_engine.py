@@ -577,14 +577,11 @@ def run_pretest_analysis_seasonal(
     average, so weekday/holiday patterns in the baseline period inform the
     projection rather than being averaged away.
 
-    Note: pages/pre_test_analysis.py has its own, independent Prophet-based
-    seasonal forecast (run_prophet_forecast + perform_mde_calculation_forecast)
-    for its dedicated planning tool. This uses FOE's TrafficForecastingEngine /
-    PretestEngine.calculate_mde_from_forecast instead, since that page's helpers
-    aren't safely importable here (it calls st.set_page_config at module level,
-    which collides with automation.py's own call) — the two seasonal paths are
-    functionally equivalent (same Prophet weekly/yearly-seasonality fit, same
-    cumulative-week MDE formula) but independently implemented.
+    pages/pre_test_analysis.py's seasonal mode uses the same FOE pair
+    (TrafficForecastingEngine + PretestEngine.calculate_mde_from_forecast), so
+    the two seasonal paths share one implementation. That page's own wrappers
+    aren't imported here because it calls st.set_page_config at module level,
+    which collides with automation.py's own call.
 
     daily_df needs a 'report_date' column (as produced by
     BaselineParams(output_shape="daily")) plus 'visitors' and `value_col`

@@ -9,15 +9,13 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 from dataclasses import dataclass
-from scipy.stats import norm
 from scipy.stats import gamma as scipy_gamma
 from scipy.stats import nbinom
-from statsmodels.stats.proportion import proportion_effectsize
-from statsmodels.stats.power import zt_ind_solve_power
-from prophet import Prophet  # type: ignore[import-untyped]  # Prophet stubs are incomplete
 from foe.pretest.operations import PretestEngine
+from foe.pretest.forecasting import TrafficForecastingEngine
 from foe.continuous.operations import ContinuousMetricEngine
 from foe.core.models import AlternativeHypothesis as FoeAlternative
+from foe.core.models import AnalysisUnit, VarianceScaling
 
 st.set_page_config(
     page_title="Pre-test analysis",
@@ -124,30 +122,27 @@ def _foe_alternative(tails: str) -> FoeAlternative:
     return FoeAlternative.TWO_SIDED if tails == "Two-sided" else FoeAlternative.GREATER
 
 
-def get_critical_z(num_variants: int, alpha: float, tails: str) -> float:
-    """Return the adjusted critical z-value via foe's PretestEngine, which
-    applies Holm-Bonferroni step-down correction when there are more than two
-    variants (shared with the post-test/business engines elsewhere in the app)."""
-    return PretestEngine.get_z_alpha(num_variants, alpha, _foe_alternative(tails))
+def _foe_scaling(variance_scaling: str) -> VarianceScaling:
+    """Map 'equal' / 'cv_constant' onto foe's VarianceScaling enum."""
+    return (
+        VarianceScaling.CV_CONSTANT if variance_scaling == "cv_constant"
+        else VarianceScaling.EQUAL
+    )
 
 
-def mde_from_visitors(
-    visitors_per_variant: float,
-    mean: float,
-    variance: float,
-    z_alpha: float,
-    z_power: float,
-) -> float:
-    """
-    Minimum detectable effect for a two-sample test of means, expressed as a
-    percentage of the baseline `mean`. Delegates to foe's PretestEngine, which
-    implements the same two-group SE formula this file used to compute locally:
-        SE = sqrt(2 * variance / n); MDE = (z_alpha + z_power) * SE / mean * 100
+def _foe_unit(analysis_unit: str) -> AnalysisUnit:
+    """Map 'per_visitor' / 'per_transaction' onto foe's AnalysisUnit enum."""
+    return (
+        AnalysisUnit.PER_VISITOR if analysis_unit == "per_visitor"
+        else AnalysisUnit.PER_TRANSACTION
+    )
 
-    For a binomial KPI pass variance = p*(1-p) and mean = p; for a continuous
-    KPI pass variance = sigma**2 and mean = mu.
-    """
-    return PretestEngine._relative_mde(mean, variance, visitors_per_variant, z_alpha, z_power)
+
+def _mde_or_nan(value: float | None) -> float:
+    """foe returns MDE None when no finite lift reaches the target power
+    (CV-constant scaling with too little volume) or the week has no volume;
+    the display code works with NaN ('N/A')."""
+    return float("nan") if value is None else float(value)
 
 
 def fit_gamma(data: np.ndarray) -> GammaFit:
@@ -222,101 +217,94 @@ def fit_negbin_count(data: np.ndarray) -> NegBinFit:
 # Core calculations
 # ---------------------------------------------------------------------------
 
+# All power, sample-size and MDE maths below runs in foe's PretestEngine. Its
+# formulas target the unpooled z-test that the post-test analysis runs
+# (FrequentistEngine.run_synthesis), and each MDE table is the exact inverse
+# of the matching sample-size function (and power its inverse in turn), so the
+# three modes on this page agree with each other and with the eventual test.
+
+
 def perform_mde_calculation(
     inputs: BaselineInputs,
     traffic_multiplier: float = 1.0,
 ) -> list[MDERow]:
     """
-    Calculate relative MDE for weeks 1-6.
+    Calculate relative MDE for weeks 1-6 via foe's PretestEngine.
 
-    `traffic_multiplier` scales the weekly visitor volume to model traffic
-    scenarios (e.g. 0.7 = -30%, 1.3 = +30%).
+    `traffic_multiplier` scales the weekly volume to model traffic scenarios
+    (e.g. 0.7 = -30%, 1.3 = +30%). For a binomial KPI both visitors and
+    conversions are scaled, so the baseline rate is unchanged. A continuous KPI
+    honours `variance_scaling`; under CV-constant a week with too little volume
+    for any lift to reach the target power gets an MDE of NaN.
     """
-    alpha = 1 - (inputs.risk / 100)
-    power = inputs.trust / 100
-    mean, variance = metric_moments(inputs)
+    alternative = _foe_alternative(inputs.tails)
+    weekly_volume = inputs.baseline_visitors * traffic_multiplier
 
-    z_alpha = get_critical_z(inputs.num_variants, alpha, inputs.tails)
-    z_power = float(norm.ppf(power))
-
-    weekly_visitors = int(
-        np.ceil(inputs.baseline_visitors * traffic_multiplier / inputs.num_variants)
-    )
-
-    results: list[MDERow] = []
-    for week in range(1, 7):
-        visitors_per_variant = weekly_visitors * week
-        relative_mde = mde_from_visitors(
-            visitors_per_variant, mean, variance, z_alpha, z_power
+    if inputs.kpi_type == "Binomial":
+        result = PretestEngine.calculate_mde_table(
+            num_variants=inputs.num_variants,
+            baseline_visitors=weekly_volume,
+            baseline_conversions=inputs.baseline_conversions * traffic_multiplier,
+            risk_pct=inputs.risk,
+            trust_pct=inputs.trust,
+            alternative=alternative,
         )
-        results.append(MDERow(week, visitors_per_variant, relative_mde))
+        size_key = "Visitors_Per_Variant"
+    else:
+        result = PretestEngine.calculate_mde_table_continuous(
+            num_variants=inputs.num_variants,
+            weekly_units=weekly_volume,
+            mean=inputs.kpi_mean,
+            variance=inputs.kpi_variance,
+            risk_pct=inputs.risk,
+            trust_pct=inputs.trust,
+            alternative=alternative,
+            unit=_foe_unit(inputs.analysis_unit),
+            variance_scaling=_foe_scaling(inputs.variance_scaling),
+        )
+        size_key = "Units_Per_Variant"
 
-    return results
+    return [
+        MDERow(row["Week"], row[size_key], _mde_or_nan(row["MDE"]))
+        for row in result["table"]
+    ]
 
 
 def perform_mde_calculation_forecast(
-    forecast_df: pd.DataFrame,
+    forecast_records: list[dict],
     inputs: BaselineInputs,
 ) -> list[MDERow]:
     """
-    Calculate MDE using accumulated forecasted volume rather than a static
-    weekly average, accounting for seasonality.
+    Seasonal MDE from TrafficForecastingEngine records, via foe's
+    PretestEngine.calculate_mde_from_forecast.
 
-    Works for both KPI families by reconstructing the per-unit mean from the
-    forecasted count and the forecasted sum-of-metric for each cumulative week:
-
-        * Binomial   -> mean = sum(pred_conversions) / sum(pred_visitors)
-                        variance = mean * (1 - mean)
-        * Continuous -> mean = sum(pred_kpi_total) / sum(pred_visitors)
-                        variance = (kpi_cv * mean)**2
-
-    Here `pred_visitors` is the forecasted count of the analysis unit; visitors
-    for a per-visitor metric, transactions for a per-transaction metric (the
-    caller standardises the chosen count column to this name before forecasting).
-    The continuous variance uses the user-supplied coefficient of variation,
-    assumed stationary even as seasonal volume (and hence the weekly mean)
-    shifts. Aggregated daily data cannot reveal the per-observation spread on
-    its own, so the CV must be provided.
+    For each cumulative week the per-unit mean is sum(pred_value) /
+    sum(pred_count). A binomial KPI uses the unpooled binomial variance; a
+    continuous KPI uses variance = (kpi_cv * mean)**2 with the chosen
+    `variance_scaling`. The user-supplied CV is assumed stationary even as
+    seasonal volume (and hence the weekly mean) shifts: aggregated daily data
+    cannot reveal the per-observation spread on its own.
     """
-    alpha = 1 - (inputs.risk / 100)
-    power = inputs.trust / 100
-
-    z_alpha = get_critical_z(inputs.num_variants, alpha, inputs.tails)
-    z_power = float(norm.ppf(power))
-
     is_binomial = inputs.kpi_type == "Binomial"
-    value_col = "pred_conversions" if is_binomial else "pred_kpi_total"
-
-    results: list[MDERow] = []
-    for week in range(1, 7):
-        current_slice = forecast_df.head(week * 7)
-        total_visitors = current_slice["pred_visitors"].sum()
-        total_value = current_slice[value_col].sum()
-
-        if total_visitors <= 0:
-            results.append(MDERow(week, 0, float("nan")))
-            continue
-
-        if is_binomial:
-            mean = float(np.clip(total_value / total_visitors, 1e-4, 1 - 1e-4))
-            variance = mean * (1 - mean)
-        else:
-            mean = float(total_value / total_visitors)
-            if mean <= 0:
-                results.append(MDERow(week, int(total_visitors / inputs.num_variants),
-                                      float("nan"), period_mean=mean))
-                continue
-            variance = (inputs.kpi_cv * mean) ** 2
-
-        visitors_per_variant = total_visitors / inputs.num_variants
-        relative_mde = mde_from_visitors(
-            visitors_per_variant, mean, variance, z_alpha, z_power
+    result = PretestEngine.calculate_mde_from_forecast(
+        forecast_records,
+        num_variants=inputs.num_variants,
+        risk_pct=inputs.risk,
+        trust_pct=inputs.trust,
+        alternative=_foe_alternative(inputs.tails),
+        kpi_cv=None if is_binomial else inputs.kpi_cv,
+        unit=AnalysisUnit.PER_VISITOR if is_binomial else _foe_unit(inputs.analysis_unit),
+        variance_scaling=_foe_scaling(inputs.variance_scaling),
+    )
+    return [
+        MDERow(
+            row["Week"],
+            row["Units_Per_Variant"],
+            _mde_or_nan(row["MDE"]),
+            period_mean=row["Mean"],
         )
-        results.append(MDERow(
-            week, int(visitors_per_variant), relative_mde, period_mean=mean
-        ))
-
-    return results
+        for row in result["table"]
+    ]
 
 
 def calculate_sample_size_required(
@@ -326,45 +314,45 @@ def calculate_sample_size_required(
     """
     Return (sample_size_per_group, estimated_days).
 
-    Uses the two-sample formula consistent with `perform_mde_calculation`:
-        n = (z_alpha * sqrt(V0) + z_power * sqrt(V1))**2 / delta**2
-    where V0 is the summed two-group variance under H0 and V1 under H1.
-
-    For a binomial KPI the alternative variance changes with the lifted rate
-    (p2). For a continuous KPI the treatment variance depends on the chosen
-    `variance_scaling`:
-        * 'equal'       -> sigma_treat**2 = sigma**2 (homoscedastic; V1 = 2*sigma**2)
+    The per-variant n comes from foe's PretestEngine. A binomial KPI uses the
+    unpooled variance p1*q1 + p2*q2 for both the alpha and the power term. A
+    continuous KPI uses the summed variance under the chosen `variance_scaling`:
+        * 'equal'       -> sigma_treat**2 = sigma**2 (homoscedastic)
         * 'cv_constant' -> the lift scales the mean and the coefficient of
                            variation is held constant, so the std scales with
                            the mean: sigma_treat**2 = sigma**2 * (1 + r)**2.
 
-    estimated_days is an int on success, or a descriptive string on failure.
+    The caller must reject a binomial lift that pushes the treatment rate
+    above 100% (see render_sample_size_mode). estimated_days is an int on
+    success, or a descriptive string on failure.
     """
     alpha = 1 - (inputs.risk / 100)
     power = inputs.trust / 100
-    mean, var0 = metric_moments(inputs)
-    mde_absolute = mean * (mde_pct / 100)
-
-    z_alpha = get_critical_z(inputs.num_variants, alpha, inputs.tails)
-    z_power = float(norm.ppf(power))
+    alternative = _foe_alternative(inputs.tails)
 
     if inputs.kpi_type == "Binomial":
-        p2 = mean + mde_absolute
-        var_treat = float(np.clip(p2 * (1 - p2), 0, None))
-    elif inputs.variance_scaling == "cv_constant":
-        # Constant CV: std scales with the mean.
-        var_treat = var0 * (1 + mde_pct / 100) ** 2
+        mean, _ = metric_moments(inputs)
+        result = PretestEngine.calculate_fixed_sample_size(
+            baseline_cr=mean,
+            mde_relative=mde_pct / 100,
+            num_variants=inputs.num_variants,
+            alpha=alpha,
+            power=power,
+            alternative=alternative,
+        )
     else:
-        # Equal-variance assumption for a continuous metric.
-        var_treat = var0
-
-    sample_size = PretestEngine._sample_size_per_variant(
-        mde_absolute=mde_absolute,
-        var_null_sum=2 * var0,
-        var_alt_sum=var0 + var_treat,
-        z_alpha=z_alpha,
-        z_power=z_power,
-    )
+        result = PretestEngine.calculate_fixed_sample_size_continuous(
+            mean=inputs.kpi_mean,
+            variance=inputs.kpi_variance,
+            mde_relative=mde_pct / 100,
+            num_variants=inputs.num_variants,
+            alpha=alpha,
+            power=power,
+            alternative=alternative,
+            variance_scaling=_foe_scaling(inputs.variance_scaling),
+            unit=_foe_unit(inputs.analysis_unit),
+        )
+    sample_size = int(result["n_per_variant"])
 
     # Estimate runtime (per-variant daily volume from the weekly total)
     daily_per_group = (inputs.baseline_visitors / 7) / inputs.num_variants
@@ -382,75 +370,56 @@ def calculate_power(
     weeks_to_run: int,
 ) -> PowerResult:
     """
-    Calculate statistical power with Holm-Bonferroni correction when
-    num_variants > 2.
+    Statistical power via foe's PretestEngine, with Holm-Bonferroni's most
+    conservative step (alpha / comparisons) when num_variants > 2.
 
-    The two KPI families use different but exact engines:
-        * Binomial   -> Cohen's h (arcsine transform) via `zt_ind_solve_power`.
-        * Continuous -> the closed-form two-sample z-test power, which lets the
-          control and treatment variances differ. Under H0 both groups sit at
-          the baseline variance (SE_null); under H1 the treatment variance
-          follows `variance_scaling`. This reduces to the standard equal-
-          variance result when scaling is 'equal', and is the exact inverse of
-          the sample-size formula above.
+    Power is the exact inverse of calculate_sample_size_required: running for
+    the n it returns gives the target power. A binomial lift that pushes the
+    treatment rate above 100% is capped at 100% (by foe) and flagged in
+    `capped` for the UI.
 
     The per-variant sample size is derived from the TOTAL weekly volume,
     divided by the number of variants, matching the MDE and sample-size modes.
     """
     alpha = 1 - (inputs.risk / 100)
     target_power = inputs.trust / 100
+    alternative = _foe_alternative(inputs.tails)
+    lift = expected_lift_pct / 100
+    mean, _ = metric_moments(inputs)
 
-    # Apply Holm-Bonferroni: for power planning we use the first (most
-    # conservative) step, i.e. alpha / num_comparisons.
-    num_comparisons = inputs.num_variants - 1
-    if num_comparisons > 1:
-        alpha = alpha / num_comparisons
-
-    mean, var0 = metric_moments(inputs)
-    alternative = "two-sided" if inputs.tails == "Two-sided" else "larger"
-
-    # FIX (#1): per-variant n derived from the total weekly volume.
     n_per_variant = (inputs.baseline_visitors / inputs.num_variants) * weeks_to_run
 
     capped = False
     if inputs.kpi_type == "Binomial":
-        rate_b_raw = mean * (1 + expected_lift_pct / 100)
+        rate_b_raw = mean * (1 + lift)
         capped = rate_b_raw > 1.0
-        rate_b_used = float(np.clip(rate_b_raw, 0, 1))
-        effect_size = abs(proportion_effectsize(mean, rate_b_used))
-        reported_rate = float(rate_b_raw)
-        power = float(zt_ind_solve_power(
-            effect_size=effect_size,
-            nobs1=n_per_variant,
-            ratio=1.0,
-            alpha=alpha,
-            alternative=alternative,
-        ))
-    else:
-        delta = mean * (expected_lift_pct / 100)
-        reported_rate = float(mean + delta)
-
-        if inputs.variance_scaling == "cv_constant":
-            var_treat = var0 * (1 + expected_lift_pct / 100) ** 2
-        else:
-            var_treat = var0
-
-        if alternative == "two-sided":
-            z_crit = float(norm.ppf(1 - alpha / 2))
-        else:
-            z_crit = float(norm.ppf(1 - alpha))
-
-        power = PretestEngine._power_two_sample(
-            delta=delta,
-            var_null_sum=2 * var0,
-            var_alt_sum=var0 + var_treat,
+        result = PretestEngine.calculate_power_binomial(
+            baseline_cr=mean,
+            expected_lift=lift,
             n_per_variant=n_per_variant,
-            z_alpha=z_crit,
-            alternative=_foe_alternative("Two-sided" if alternative == "two-sided" else "One-sided"),
+            num_variants=inputs.num_variants,
+            alpha=alpha,
+            target_power=target_power,
+            alternative=alternative,
         )
+        reported_rate = float(rate_b_raw)
+    else:
+        result = PretestEngine.calculate_power_continuous(
+            mean=inputs.kpi_mean,
+            variance=inputs.kpi_variance,
+            expected_lift=lift,
+            n_per_variant=n_per_variant,
+            num_variants=inputs.num_variants,
+            alpha=alpha,
+            target_power=target_power,
+            alternative=alternative,
+            variance_scaling=_foe_scaling(inputs.variance_scaling),
+            unit=_foe_unit(inputs.analysis_unit),
+        )
+        reported_rate = float(mean * (1 + lift))
 
     return PowerResult(
-        power=float(power),
+        power=float(result["power"]),
         target_power=float(target_power),
         rate_b=reported_rate,
         capped=bool(capped),
@@ -458,52 +427,34 @@ def calculate_power(
 
 
 # ---------------------------------------------------------------------------
-# Prophet forecasting
+# Seasonal forecasting (Prophet, via foe's TrafficForecastingEngine)
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
-def run_prophet_forecast(
+def run_seasonal_forecast(
     df: pd.DataFrame,
-    value_col: str = "conversions",
+    count_col: str,
+    value_col: str,
+    analysis_unit: str = "per_visitor",
     periods: int = 42,
-    interval_width: float = 0.95,
-) -> pd.DataFrame:
-    """Fit Prophet models on `visitors` and a second `value_col` (the daily
-    sum-of-metric: `conversions` for a binomial KPI, `kpi_total` for a
-    continuous one) and return a 6-week daily forecast.  Results are cached by
-    Streamlit based on the arguments; hashing large DataFrames may add
-    overhead."""
-
-    def _fit_predict(series_df: pd.DataFrame, col: str) -> pd.DataFrame:
-        m = Prophet(  # type: ignore[call-arg]  # Prophet stubs are incomplete
-            yearly_seasonality=True,  # type: ignore[arg-type]  # stub types seasonality as str; bool is valid at runtime
-            weekly_seasonality=True,  # type: ignore[arg-type]
-            interval_width=interval_width,
-        )
-        m.fit(series_df[["ds", col]].rename(columns={col: "y"}))
-        future = m.make_future_dataframe(periods=periods)
-        forecast = m.predict(future)
-        last_date = series_df["ds"].max()
-        return (
-            forecast[forecast["ds"] > last_date][["ds", "yhat", "yhat_lower", "yhat_upper"]]
-            .rename(columns={
-                "yhat": f"pred_{col}",
-                "yhat_lower": f"{col[:3]}_lower",
-                "yhat_upper": f"{col[:3]}_upper",
-            })
-        )
-
-    future_vis = _fit_predict(df, "visitors")
-    future_val = _fit_predict(df, value_col)
-
-    forecast_final = pd.merge(future_vis, future_val, on="ds")
-
-    # All forecasted quantities (counts and metric sums) are non-negative.
-    for col in forecast_final.columns:
-        if col != "ds":
-            forecast_final[col] = forecast_final[col].clip(lower=0)
-
-    return forecast_final
+    interval: float = 0.95,
+) -> dict:
+    """Forecast daily `count_col` (the analysis unit) and `value_col` (the
+    daily sum-of-metric: conversions for a binomial KPI, the KPI total for a
+    continuous one) for the next `periods` days with foe's
+    TrafficForecastingEngine. Returns its dict: 'forecast' records
+    {ds, pred_count, count_lower, count_upper, pred_value, value_lower,
+    value_upper} and a 'conclusion'; 'forecast' is empty (with the reason in
+    'conclusion') when the input is unusable, e.g. under 14 days. Cached by
+    Streamlit on the arguments."""
+    return TrafficForecastingEngine.run_seasonal_forecast(
+        df,
+        periods=periods,
+        interval=interval,
+        unit=_foe_unit(analysis_unit),
+        count_col=count_col,
+        value_col=value_col,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -977,11 +928,11 @@ def get_baseline_inputs(
     kpi_mean, kpi_variance, variance_scaling = 0.0, 0.0, "equal"
     if kpi_type == "Continuous":
         st.write("#### Continuous KPI")
-        # The treatment-variance assumption only matters when a target effect
-        # is present (sample-size and power modes set include_mde=True). MDE
-        # projection uses the baseline variance only, so the toggle is hidden.
+        # The treatment-variance assumption applies to all three modes: foe's
+        # MDE table is the exact inverse of its sample size under the same
+        # scaling, so MDE, sample size and power stay consistent.
         kpi_mean, kpi_variance, variance_scaling = _continuous_metric_inputs(
-            analysis_unit, show_variance_toggle=include_mde
+            analysis_unit, show_variance_toggle=True
         )
 
     return BaselineInputs(
@@ -1077,6 +1028,16 @@ def _render_copyable_table(df: pd.DataFrame, key: str) -> None:
     components.html(html, height=48 + 33 * (len(df) + 1), scrolling=True)
 
 
+_NO_MDE_NOTE = (
+    "N/A: with the treatment variance scaling with the mean (constant CV), "
+    "this volume is too small for any lift to reach the target power."
+)
+
+
+def _format_mde(value: float) -> str:
+    return f"{value:.2f}%" if not np.isnan(value) else "N/A"
+
+
 def _display_mde_table(inputs: BaselineInputs, results: list[MDERow]) -> None:
     unit = _unit_label(inputs.kpi_type, inputs.analysis_unit)
     st.write("## MDE Calculation Results")
@@ -1097,10 +1058,12 @@ def _display_mde_table(inputs: BaselineInputs, results: list[MDERow]) -> None:
             {
                 "Week": [r.week for r in results],
                 f"{unit} / Variant": [r.visitors_per_variant for r in results],
-                "Relative MDE (%)": [f"{r.relative_mde_pct:.2f}%" for r in results],
+                "Relative MDE (%)": [_format_mde(r.relative_mde_pct) for r in results],
             }
         )
         _render_copyable_table(df, key="mde-standard")
+        if any(np.isnan(r.relative_mde_pct) for r in results):
+            st.caption(_NO_MDE_NOTE)
 
     with tab_sensitivity:
         st.write(
@@ -1127,10 +1090,13 @@ def _display_mde_table(inputs: BaselineInputs, results: list[MDERow]) -> None:
             for week_idx in range(6)
         ]
 
-        z = np.array(mde_matrix)
-        text_labels = [[f"{v:.1f}%" for v in row] for row in mde_matrix]
+        z = np.array(mde_matrix, dtype=float)
+        text_labels = [
+            [f"{v:.1f}%" if not np.isnan(v) else "N/A" for v in row] for row in mde_matrix
+        ]
         y_labels = [f"Week {w}" for w in weeks]
-        z_capped = np.clip(z, 0, 20)
+        # No detectable lift (N/A) is shown in the worst (≥20%) colour.
+        z_capped = np.where(np.isnan(z), 20, np.clip(z, 0, 20))
 
         fig = go.Figure(
             data=go.Heatmap(
@@ -1210,11 +1176,13 @@ def render_sample_size_mode(kpi_type: str) -> None:
                 p1 = inputs.baseline_conversions / inputs.baseline_visitors
                 p2 = p1 * (1 + mde / 100)
                 if p2 > 1.0:
-                    st.warning(
+                    st.error(
                         f"The expected treatment conversion rate ({p2:.2%}) exceeds 100% "
                         f"given the baseline rate ({p1:.2%}) and MDE ({mde}%). "
-                        "Please review your inputs."
+                        "Lower the MDE to calculate a sample size."
                     )
+                    st.session_state.pop("ss_result", None)
+                    return
 
             sample_size, estimated_days = calculate_sample_size_required(inputs, mde)
             st.session_state["ss_result"] = (sample_size, estimated_days, inputs, mde)
@@ -1436,6 +1404,18 @@ def render_seasonal_mode(kpi_type: str) -> None:
                 key="seas_cv",
                 help=cv_help,
             )
+            st.radio(
+                "Treatment variance assumption:",
+                ["Equal variance (homoscedastic)", "Scale with mean (constant CV)"],
+                horizontal=True,
+                key="seas_var_scaling",
+                help=(
+                    "**Equal variance** keeps the treatment group's spread the same "
+                    "as the control's. **Scale with mean** holds the coefficient of "
+                    "variation constant as the lift raises the mean; for a positive "
+                    "lift this is the more conservative choice (larger MDE)."
+                ),
+            )
     with col2:
         st.number_input(
             "Confidence level (%):",
@@ -1515,6 +1495,11 @@ def render_seasonal_mode(kpi_type: str) -> None:
                 trust=st.session_state["seas_trust"],
                 tails=st.session_state["seas_tails"],
                 kpi_cv=cv,
+                variance_scaling=(
+                    "cv_constant"
+                    if str(st.session_state.get("seas_var_scaling", "")).startswith("Scale")
+                    else "equal"
+                ),
                 analysis_unit=analysis_unit,
             )
             forecast_confidence = seasonal_inputs.risk / 100
@@ -1531,24 +1516,33 @@ def render_seasonal_mode(kpi_type: str) -> None:
             })
 
             with st.spinner("Running Prophet Forecast…"):
-                forecast_data = run_prophet_forecast(
-                    fit_df, value_col=forecast_value,
-                    periods=42, interval_width=forecast_confidence,
+                forecast_result = run_seasonal_forecast(
+                    fit_df,
+                    count_col="visitors",
+                    value_col=forecast_value,
+                    analysis_unit="per_visitor" if is_binomial else analysis_unit,
+                    periods=42,
+                    interval=forecast_confidence,
                 )
+            if not forecast_result["forecast"]:
+                st.error(forecast_result["conclusion"])
+                return
+            forecast_records = forecast_result["forecast"]
+            forecast_data = pd.DataFrame(forecast_records)
 
             st.write(f"### {unit} Forecast (Next 6 Weeks)")
 
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=forecast_data["ds"],
-                y=forecast_data["pred_visitors"],
+                y=forecast_data["pred_count"],
                 mode="lines",
                 name=f"Predicted {unit}",
                 line=dict(color="#0072B2"),
             ))
             fig.add_trace(go.Scatter(
                 x=forecast_data["ds"],
-                y=forecast_data["vis_upper"],
+                y=forecast_data["count_upper"],
                 mode="lines",
                 line=dict(width=0),
                 showlegend=False,
@@ -1556,7 +1550,7 @@ def render_seasonal_mode(kpi_type: str) -> None:
             ))
             fig.add_trace(go.Scatter(
                 x=forecast_data["ds"],
-                y=forecast_data["vis_lower"],
+                y=forecast_data["count_lower"],
                 mode="lines",
                 line=dict(width=0),
                 fill="tonexty",
@@ -1570,8 +1564,9 @@ def render_seasonal_mode(kpi_type: str) -> None:
                 hovermode="x",
             )
             st.plotly_chart(fig, width="stretch")
+            st.caption(forecast_result["conclusion"])
 
-            results = perform_mde_calculation_forecast(forecast_data, seasonal_inputs)
+            results = perform_mde_calculation_forecast(forecast_records, seasonal_inputs)
 
             table: dict[str, list] = {
                 "Week": [r.week for r in results],
@@ -1582,10 +1577,7 @@ def render_seasonal_mode(kpi_type: str) -> None:
                     f"{r.period_mean:,.2f}" if r.period_mean is not None else "N/A"
                     for r in results
                 ]
-            table["Relative MDE (%)"] = [
-                f"{r.relative_mde_pct:.2f}%" if not np.isnan(r.relative_mde_pct) else "N/A"
-                for r in results
-            ]
+            table["Relative MDE (%)"] = [_format_mde(r.relative_mde_pct) for r in results]
             res_df = pd.DataFrame(table)
 
             st.write("### Seasonal MDE Results")
@@ -1606,6 +1598,11 @@ def render_seasonal_mode(kpi_type: str) -> None:
                     f"(CV = {cv:.2f}), accounting for seasonality."
                 )
             st.table(res_df)
+            if (
+                seasonal_inputs.variance_scaling == "cv_constant"
+                and any(np.isnan(r.relative_mde_pct) for r in results)
+            ):
+                st.caption(_NO_MDE_NOTE)
 
     except Exception as e:
         st.error(f"Error parsing file: {e}")
