@@ -854,9 +854,12 @@ def display_results_per_variant(
 #   residual, biasing φ DOWNWARD on short windows (the anti-conservative
 #   direction). A degrees-of-freedom correction n/(n-k) restores an unbiased
 #   estimate of the residual variance under the null.
+#
+#   The estimate itself (DoW baseline, dof correction, clipping and regime)
+#   runs in FOE: FrequentistEngine.calculate_aggregate_variance_factor.
 # ─────────────────────────────────────────────────────────────────────────────
 
-PHI_LOWER_CLIP = 0.10
+PHI_LOWER_CLIP = 0.10  # FOE's fixed lower clip; only used in the UI message.
 PHI_UPPER_CLIP = 5.0  # Guard a single bad data day from spiking SE unboundedly.
 
 
@@ -928,70 +931,6 @@ def validate_timeseries_data(
         return False, "Conversion rate is identical across all periods (zero variance).", n_periods
 
     return True, "Data quality looks good.", n_periods
-
-
-def calculate_timeseries_reduction_factor(
-    df: pd.DataFrame,
-    visitors_col: str,
-    conversions_col: str,
-    date_col: str
-) -> Tuple[float, float, str, bool]:
-    """
-    Estimates a variance scaling factor (φ) from aggregate historical
-    time-series data, controlling for day-of-week seasonality.
-
-    Returns (reduction_factor, phi, regime, was_clipped).
-    """
-    df = df.copy()
-
-    df[date_col] = pd.to_datetime(df[date_col])
-    df['dow'] = df[date_col].dt.dayofweek
-
-    visitors = df[visitors_col].astype(float)
-    conversions = df[conversions_col].astype(float)
-    rates = conversions / visitors
-
-    dow_totals = df.groupby('dow').agg(
-        dow_visitors=(visitors_col, 'sum'),
-        dow_conversions=(conversions_col, 'sum')
-    )
-    dow_totals['dow_baseline_rate'] = dow_totals['dow_conversions'] / dow_totals['dow_visitors']
-
-    df['expected_dow_rate'] = df['dow'].map(dow_totals['dow_baseline_rate'])
-
-    weights = visitors / visitors.sum()
-
-    observed_var = (weights * (rates - df['expected_dow_rate']) ** 2).sum()
-    expected_binomial_var = (weights * rates * (1 - rates) / visitors).sum()
-
-    # Correct the in-sample DoW fit. n rows minus the number of
-    # distinct day-of-week baselines estimated gives the residual dof.
-    n_periods = len(df)
-    n_dow_params = int(df['dow'].nunique())
-    residual_dof = n_periods - n_dow_params
-    if residual_dof > 0:
-        dof_correction = n_periods / residual_dof
-        observed_var *= dof_correction
-
-    if expected_binomial_var == 0:
-        return 1.0, 1.0, "clean", False
-
-    phi = observed_var / expected_binomial_var
-
-    # Clip on both ends and report whether clipping occurred.
-    reduction_factor = float(np.clip(phi, PHI_LOWER_CLIP, PHI_UPPER_CLIP))
-    was_clipped = phi > PHI_UPPER_CLIP or phi < PHI_LOWER_CLIP
-
-    if phi < 0.90:
-        regime = "textbook"
-    elif phi < 1.15:
-        regime = "clean"
-    elif phi < 1.50:
-        regime = "overdispersed"
-    else:
-        regime = "highly_overdispersed"
-
-    return reduction_factor, phi, regime, was_clipped
 
 
 def parse_uploaded_timeseries(uploaded_file) -> pd.DataFrame:
@@ -1086,16 +1025,27 @@ def render_variance_reduction_ui() -> float:
         st.warning(message)
         return reduction_factor
 
-    reduction_factor, phi, regime, was_clipped = calculate_timeseries_reduction_factor(
-        df_hist, visitors_col, conversions_col, date_col
+    # φ is always day-of-week controlled here (date_col is passed). Row-level
+    # checks were done above, so FOE's own ValueErrors aren't expected.
+    dispersion = FrequentistEngine.calculate_aggregate_variance_factor(
+        df_hist,
+        visitors_col=visitors_col,
+        conversions_col=conversions_col,
+        date_col=date_col,
+        phi_upper=PHI_UPPER_CLIP,
     )
+    reduction_factor = dispersion["reduction_factor"]
+    phi = dispersion["phi"]
+    regime = dispersion["regime"]
+    was_clipped = dispersion["clipped"]
 
     with st.expander("Data Quality & Adjustment Details", expanded=False):
         regime_labels = {
-            "textbook": ("**Textbook / Underdispersed**", "green", "Your conversion rate is mathematically pristine, rarely seen in the wild."),
-            "clean": ("**Clean**", "blue", "Your conversion rate behaves very closely to pure binomial theory."),
-            "overdispersed": ("**Overdispersed**", "orange", "Typical real-world noise detected. SE safely inflated to protect your false positive rate."),
-            "highly_overdispersed": ("**Highly Overdispersed**", "red", "Strong environmental noise detected. SE inflated substantially. Ensure no tracking errors are present."),
+            # FOE regimes: stable < 0.80 <= neutral < 1.05 <= noisy < 1.50 <= high_noise.
+            "stable": ("**Stable / Underdispersed**", "green", "Your conversion rate is more stable than pure binomial theory predicts, which is rarely seen in the wild."),
+            "neutral": ("**Neutral**", "blue", "Your conversion rate behaves very closely to pure binomial theory."),
+            "noisy": ("**Noisy / Overdispersed**", "orange", "Typical real-world noise detected. SE safely inflated to protect your false positive rate."),
+            "high_noise": ("**High Noise / Highly Overdispersed**", "red", "Strong environmental noise detected. SE inflated substantially. Ensure no tracking errors are present."),
         }
         label, color, advice = regime_labels[regime]
 
@@ -1123,7 +1073,7 @@ def render_variance_reduction_ui() -> float:
                 f"campaign spikes) before relying on this adjustment."
             )
 
-    if regime in ("textbook", "clean"):
+    if regime in ("stable", "neutral"):
         pct_change = abs(1 - reduction_factor) * 100
         st.success(f"**φ = {phi:.2f}**: Traffic is clean and highly predictable.")
         st.metric(
