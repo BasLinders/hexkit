@@ -9,13 +9,11 @@ gspread-dataframe>=4.0.0
 st_supabase_connection
 pyarrow>=14.0.0
 scikit-learn==1.7.0
-scikit-posthocs==0.11.4
 seaborn==0.13.2
 scipy==1.15.3
 pandas==2.3.0
 numpy==2.3.1
 matplotlib==3.10.3
-pingouin==0.5.5
 statsmodels==0.14.4
 statistics
 prophet
@@ -25,11 +23,15 @@ db-dtypes
 requests>=2.31.0
 pydantic>=2.0.0
 google-genai>=0.3.0
-# Pinned to first-order-engine d6a9ec3 (#21): pretest power, sample size and
-# MDE tables target run_synthesis's unpooled z-test (#20) and the MDE tables
-# accept variance_scaling. Pinned to a SHA rather than @main because
-# first-order-engine has no versioned releases yet. utility/sql_builder.py and
-# utility/bq_client.py prefer this backend when available (see
-# USING_FOE_BACKEND in each), falling back to their own native implementation
-# otherwise. Bump this SHA deliberately, not accidentally.
-foe[bigquery] @ git+https://github.com/BasLinders/first-order-engine.git@d6a9ec39735ab46f6c985c24099f753c3ca0d06c
+# Pinned to first-order-engine dc13050 (#24): the Negative Binomial LRT no
+# longer returns p = 1 on equi-/underdispersed counts (alpha at the Poisson
+# boundary) and reports alpha = 0 there. Builds on 11ba165 (#23):
+# ContinuousMetricEngine runs Welch's ANOVA, Tukey HSD, Games-Howell and Dunn
+# natively (no pingouin / scikit-posthocs), reports effect sizes and
+# diagnostics, has zero-aware outlier helpers and an exact Gamma MLE.
+# pages/user_level_analysis.py runs on it. Pinned to a SHA rather than @main
+# because first-order-engine has no versioned releases yet.
+# utility/sql_builder.py and utility/bq_client.py prefer this backend when
+# available (see USING_FOE_BACKEND in each), falling back to their own native
+# implementation otherwise. Bump this SHA deliberately, not accidentally.
+foe[bigquery] @ git+https://github.com/BasLinders/first-order-engine.git@dc1305013e2f092234e049f7abc0904103e2c4c3
