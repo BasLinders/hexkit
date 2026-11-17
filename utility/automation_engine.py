@@ -345,11 +345,15 @@ def winsorize_continuous_data(
     percentile: Optional[int] = None,
 ) -> tuple["pd.DataFrame", Optional[float], Optional[float], str]:
     """
-    Caps `kpi` via FOE's ContinuousMetricEngine.winsorize_series, restricted to
-    non-zero rows -- zero-revenue visitors are left at exactly 0 rather than
-    pulled up to a positive lower bound (mirrors pages/user_level_analysis.py's
-    own winsorize_data, which applies the same non-zero restriction on top of
-    the same bound logic FOE now exposes).
+    Caps `kpi` via FOE's ContinuousMetricEngine.winsorize_series with
+    exclude_zeros=True: the caps come from the non-zero rows only and only
+    non-zero rows are capped, so zero-revenue visitors stay at exactly 0
+    rather than being pulled up to a positive lower bound. Also used by
+    pages/user_level_analysis.py.
+
+    Returns (frame, lower_cap, upper_cap, description). The caps are None when
+    no capping was applied (no non-zero values, or zero spread under the
+    standard-deviation method); FOE itself would return 0.0 caps there.
     """
     df_copy = df.copy()
     nonzero_mask = df_copy[kpi] != 0
@@ -362,19 +366,20 @@ def winsorize_continuous_data(
         stdev = stdev or 3
         if nonzero_values.std() == 0:
             return df_copy, None, None, "Standard deviation of non-zero values is zero — no capping applied"
-        clipped, lower_cap, upper_cap = ContinuousMetricEngine.winsorize_series(
-            nonzero_values, method="Standard Deviation", param=float(stdev),
-        )
+        foe_method, param = "Standard Deviation", float(stdev)
         description = f"{stdev} standard deviations from the mean (non-zero rows)"
     else:
         percentile = percentile or 95
         lower_p = (100.0 - percentile) / 2.0
-        clipped, lower_cap, upper_cap = ContinuousMetricEngine.winsorize_series(
-            nonzero_values, method="Percentile", param=lower_p,
-        )
+        foe_method, param = "Central Percentile", float(percentile)
         description = f"the {lower_p:.1f}th and {100.0 - lower_p:.1f}th percentiles (non-zero rows)"
 
-    df_copy.loc[nonzero_mask, kpi] = clipped
+    clipped, lower_cap, upper_cap = ContinuousMetricEngine.winsorize_series(
+        df_copy[kpi], method=foe_method, param=param, exclude_zeros=True,
+    )
+    # Only non-zero rows can change; assigning just those keeps the column's
+    # dtype the same as before the FOE call.
+    df_copy.loc[nonzero_mask, kpi] = pd.Series(clipped, index=df_copy.index)[nonzero_mask]
     return df_copy, lower_cap, upper_cap, description
 
 

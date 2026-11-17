@@ -2,23 +2,19 @@ import pandas as pd
 import numpy as np
 import csv
 import statsmodels.api as sm
-import statsmodels.discrete.discrete_model as dm
-from statsmodels.formula.api import ols
 import statsmodels.formula.api as smf
-from statsmodels.stats.multicomp import pairwise_tukeyhsd
-import scipy.stats as stats
-from scipy.stats import normaltest, levene, kruskal, mannwhitneyu
-from scipy.optimize import minimize
-from scipy.special import gammaln
 import seaborn as sns
 import matplotlib.pyplot as plt
-from pingouin import welch_anova, qqplot, pairwise_gameshowell
-import scikit_posthocs as sp
 import streamlit as st
-import itertools
 
 from foe.continuous.operations import ContinuousMetricEngine
-from foe.core.models import AnalysisUnit, AlternativeHypothesis
+from foe.core.models import (
+    AlternativeHypothesis,
+    AnalysisUnit,
+    ContinuousApproach,
+    ContinuousMetricConfig,
+)
+from utility.automation_engine import winsorize_continuous_data
 
 st.set_page_config(
     page_title="User level analysis",
@@ -96,10 +92,17 @@ def render_documentation():
         order is enough.
 
         ### Outlier Handling
-        Before running tests, you can choose how to handle extreme values:
-        * **None:** Keep all data points as-is.
-        * **Capping (Winsorization):** Replaces values above the $n^{th}$ percentile with the $n^{th}$ percentile value (or $n$ standard deviations). This reduces noise without losing sample size.
-        * **Removal:** Entirely deletes rows where the KPI exceeds the $n^{th}$ percentile (or $n$ standard deviations). Use this if you suspect outliers are tracking errors.
+        Before running tests, you can choose how to handle extreme values. Zero-value rows
+        (non-converting visitors) are never treated as outliers and are never capped.
+        * **None:** Keep all data points as-is. Outliers (at 5 standard deviations) are still detected and reported.
+        * **Capping (Winsorization):** Replaces values outside mean ± $n$ standard deviations, or outside the central $n$% of values (e.g. 95 → the 2.5th and 97.5th percentiles), with that bound. The bounds come from the non-zero rows. This reduces noise without losing sample size.
+        * **Log Transform:** Tests $\log(1 + x)$ instead of the raw values.
+        * **Removal:** Entirely deletes rows flagged as outliers. Up to 10,000 non-zero rows, a row is flagged by an OLS influence check (studentized residual, leverage or DFFITS beyond the threshold); above that, by each variant's mean ± $n$ standard deviations. With the Percentile method, removal uses a 5 standard deviation threshold. Use this if you suspect outliers are tracking errors.
+
+        ### Control Variant
+        The control you select is the baseline for the business case and for the post-hoc
+        comparisons of the Gamma and Negative Binomial tests (each variant against the control).
+        The Tukey, Games-Howell and Dunn post-hocs compare all pairs and don't use it.
 
         ### Choosing an Approach
         * Use **Heuristic (Auto-detect)** for metrics that can contain negative values (i.e. profit), or discrete count metrics (i.e. items/tickets per buyer) — the count-data gate inside this path routes those automatically to Negative Binomial regression.
@@ -116,14 +119,17 @@ def render_documentation():
 
         ### 2. Effect Size
         While the p-value tells you *if* there is a difference, the effect size tells you *how much it matters*. 
-        * For ANOVA, we report **Partial Eta-Squared**.
-        * For non-parametric tests, we report **Rank-Biserial Correlation** or **Eta-squared_H**.
-        * For Negative Binomial regression, we report the dispersion parameter **α** and defer to the relative lift in means for practical magnitude.
+        * For Standard ANOVA, we report **Eta-Squared** (between-group share of the total variance); for Welch's ANOVA, **Partial Eta-Squared** (the same quantity in a one-way design).
+        * For Kruskal-Wallis, we report **Eta-squared_H**, clamped at 0 (no effect).
+        * For Mann-Whitney U, we report the **Rank-Biserial Correlation**; positive means the second variant (in alphabetical order) tends to be higher.
+        * For Negative Binomial regression, we report the dispersion parameter **α** and defer to the relative lift in means for practical magnitude. The Gamma test has no effect size; use the business case or the relative lift.
 
         ### 3. Post-Hoc Analysis
         If you have more than two groups and the main test is significant, look at the **Post-Hoc** table.
-        * It performs pairwise comparisons (Group A vs Group B, B vs C, etc.).
-        * It uses corrections (like **Tukey**, **Games-Howell**, **Bonferroni**, or pairwise NB LRTs with Bonferroni) to prevent "p-hacking" or false positives that occur when running multiple simultaneous tests.
+        * After ANOVA (**Tukey HSD**), Welch's ANOVA (**Games-Howell**) or Kruskal-Wallis (**Dunn**, Bonferroni), every pair is compared. **"X vs Y"** reads as X minus Y; Tukey and Games-Howell also show the mean difference with its confidence interval.
+        * After the Gamma or Negative Binomial test, each variant is compared against the control you selected, with pairwise Likelihood Ratio Tests and a Bonferroni correction.
+        * The corrections prevent "p-hacking" or false positives that occur when running multiple simultaneous tests.
+        * If a model can't be fitted (e.g. too few positive values in a variant), the test is treated as not significant (p = 1) and a warning explains why.
         
         ### 4. Gamma GLM Specifics
         When using the Gamma approach, the output focuses on **Model Fit** rather than variance:
@@ -176,436 +182,12 @@ def preprocess_data(df):
 
     return df, errors
 
-# Gamma model
-def fit_gamma(data):
-    """
-    Fits a Gamma distribution (shape k, scale theta) to data using MLE.
-    Returns: (k, theta, log_likelihood)
-    """
-    # Remove zeros/negatives as Gamma is defined for x > 0
-    data = data[data > 0]
-    
-    # Initial guesses using Method of Moments
-    mean_x = np.mean(data)
-    var_x = np.var(data)
-    k_start = mean_x**2 / var_x
-    theta_start = var_x / mean_x
-
-    # Negative Log-Likelihood function
-    def neg_log_likelihood(params):
-        k, theta = params
-        if k <= 0 or theta <= 0:
-            return 1e10
-        # Gamma PDF log-likelihood formula
-        n = len(data)
-        ll = (n * (k - 1) * np.mean(np.log(data)) - 
-              n * k * np.log(theta) - 
-              n * np.mean(data) / theta - 
-              n * gammaln(k))
-        return -ll
-
-    res = minimize(neg_log_likelihood, [k_start, theta_start], method='L-BFGS-B', bounds=[(1e-5, None), (1e-5, None)])
-    k_mle, theta_mle = res.x
-    return k_mle, theta_mle, -res.fun
-
-
-def fit_unit_model(data, unit):
-    """
-    Fit the likelihood model for the chosen analysis unit and return
-    (log_likelihood, num_parameters).
-
-    * per_transaction -> a single Gamma on the positive values (2 params: k, theta).
-    * per_visitor     -> a two-part hurdle model that *accepts zeros*:
-                         a Bernoulli on P(value > 0) plus a Gamma on the positive
-                         values. The log-likelihoods add; parameters are
-                         (p, k, theta) = 3.
-
-    The per-visitor model is what lets the Gamma approach handle non-converting
-    visitors (zeros) instead of silently discarding them.
-    """
-    data = np.asarray(data, dtype=float)
-    data = data[~np.isnan(data)]
-
-    if unit == "per_visitor":
-        n = len(data)
-        positives = data[data > 0]
-        n_pos = len(positives)
-        if n == 0:
-            return np.nan, 3
-
-        # Bernoulli (conversion) part, evaluated at its MLE p = n_pos / n.
-        p = n_pos / n
-        if 0.0 < p < 1.0:
-            ll_bern = n_pos * np.log(p) + (n - n_pos) * np.log(1.0 - p)
-        else:
-            # p == 0 (no buyers) or p == 1 (no zeros): Bernoulli LL is 0 at the MLE.
-            ll_bern = 0.0
-
-        # Gamma (spend among buyers) part.
-        if n_pos >= 2 and np.var(positives) > 0:
-            _, _, ll_gamma = fit_gamma(positives)
-        else:
-            ll_gamma = 0.0
-
-        return ll_bern + ll_gamma, 3
-
-    # per_transaction
-    positives = data[data > 0]
-    if len(positives) < 2 or np.var(positives) == 0:
-        return np.nan, 2
-    _, _, ll_gamma = fit_gamma(positives)
-    return ll_gamma, 2
-
-
-def perform_gamma_test(df, kpi, unit="per_transaction"):
-    # 1. Null Model: one model fit to all data
-    all_data = df[kpi].values
-    ll_null, n_params_per_model = fit_unit_model(all_data, unit)
-
-    # 2. Alternative Model: a separate model fit to each variant
-    variants = df['experience_variant_label'].unique()
-    num_variants = len(variants)
-
-    ll_alt = 0.0
-    for v in variants:
-        variant_data = df[df['experience_variant_label'] == v][kpi].values
-        ll_v, _ = fit_unit_model(variant_data, unit)
-        ll_alt += ll_v
-
-    if np.isnan(ll_null) or np.isnan(ll_alt):
-        return np.nan, np.nan
-
-    # 3. Likelihood Ratio Test
-    #    df = (params in Alt) - (params in Null)
-    #       = n_params_per_model * num_variants - n_params_per_model
-    df_diff = n_params_per_model * (num_variants - 1)
-    lr_stat = max(2.0 * (ll_alt - ll_null), 0.0)
-    p_value = stats.chi2.sf(lr_stat, df=df_diff)
-
-    return p_value, lr_stat
-
-
-# ---------------------------------------------------------------------------
-# Negative Binomial model (discrete count KPIs, e.g. items/tickets per buyer)
-# ---------------------------------------------------------------------------
-
-def is_count_kpi(series, max_unique_for_check=50, max_unique_ratio=0.05):
-    """
-    Heuristic gate: treat the KPI as a discrete count metric if all
-    non-null values are non-negative integers (or integer-valued floats,
-    e.g. 3.0), AND the cardinality looks like a true count rather than a
-    continuous KPI that happens to have round values (e.g. revenue
-    rounded to whole euros).
-
-    This check runs BEFORE the normality/homogeneity assumption checks,
-    since a count metric (discrete, often mean > 1, frequently
-    overdispersed) violates the continuous-data assumptions those tests
-    are built on regardless of what a normality test reports on a large
-    sample.
-
-    Both cardinality thresholds are exposed as parameters (rather than
-    hardcoded) because what "looks like a count" varies a lot by business
-    context — a KPI with 40 distinct values might be a clear count metric
-    for a low-volume B2B funnel, or a coincidentally-round continuous KPI
-    for a high-volume consumer funnel. Callers are expected to surface
-    these as UI inputs rather than relying on one global default.
-
-    max_unique_for_check: absolute cap on distinct values to still call it
-        a count metric (e.g. 50 -> KPIs with more than 50 distinct values
-        are treated as continuous unless the ratio check below applies).
-    max_unique_ratio: distinct-values-to-row-count ratio below which the
-        KPI is still treated as a count metric even if it exceeds the
-        absolute cap above (relevant for very large datasets where a
-        genuine count metric can have many distinct values in absolute
-        terms while still being a tiny fraction of total rows).
-    """
-    s = series.dropna()
-    if s.empty:
-        return False
-    if (s < 0).any():
-        return False
-    if not np.allclose(s, np.round(s)):
-        return False
-    n_unique = s.nunique()
-    return n_unique <= max_unique_for_check or (n_unique / len(s)) < max_unique_ratio
-
-
-def fit_negbin(data, exog=None):
-    """
-    Fits a Negative Binomial (NB2) model via MLE.
-    If exog is None, fits an intercept-only model.
-    Returns (log_likelihood, alpha, fitted_results).
-    """
-    data = np.asarray(data, dtype=float)
-    n = len(data)
-    if exog is None:
-        exog = np.ones((n, 1))
-    model = dm.NegativeBinomial(data, exog, loglike_method='nb2')
-    try:
-        res = model.fit(disp=0, maxiter=200)
-    except Exception:
-        start = np.zeros(exog.shape[1] + 1)
-        start[0] = np.log(np.mean(data) + 1e-6)
-        start[-1] = 1.0
-        res = model.fit(disp=0, maxiter=200, start_params=start)
-    return res.llf, res.params[-1], res
-
-
-def perform_negbin_test(df, kpi, group_col='experience_variant_label'):
-    """
-    Likelihood Ratio Test comparing a Null NB model (single mean for all
-    variants) against an Alternative model (separate mean per variant).
-    Mirrors perform_gamma_test's LRT structure.
-
-    Returns (p_value, lr_stat, alpha_estimate, fitted_alt_model).
-    """
-    data = df[kpi].values.astype(float)
-    groups = pd.Categorical(df[group_col])
-    dummies = pd.get_dummies(groups, drop_first=True).values.astype(float)
-    n = len(data)
-
-    # Null model: intercept only
-    exog_null = np.ones((n, 1))
-    ll_null, _, _ = fit_negbin(data, exog_null)
-
-    # Alternative model: intercept + variant dummies
-    exog_alt = np.column_stack([np.ones(n), dummies]) if dummies.shape[1] > 0 else exog_null
-    ll_alt, alpha_alt, res_alt = fit_negbin(data, exog_alt)
-
-    df_diff = exog_alt.shape[1] - exog_null.shape[1]
-    if df_diff <= 0:
-        return np.nan, np.nan, alpha_alt, res_alt
-
-    lr_stat = max(2.0 * (ll_alt - ll_null), 0.0)
-    p_value = stats.chi2.sf(lr_stat, df=df_diff)
-
-    return p_value, lr_stat, alpha_alt, res_alt
-
-
 def _fmt_pair(a, b, p=None):
     """Format a post-hoc pair for the conclusion, e.g. 'B vs A (p=0.0012)'."""
     label = f"{a} vs {b}"
     if p is not None and pd.notna(p):
         label += f" (p={p:.4g})"
     return label
-
-
-def run_gamma_posthoc(df, kpi, group_col, control_label, unit="per_transaction"):
-    st.write("### Pairwise Post-Hoc Comparisons (Gamma LRT)")
-    model_desc = "two-part hurdle" if unit == "per_visitor" else "Gamma"
-    st.markdown(f"_Each treatment variant is compared against the control using "
-                f"{model_desc} Likelihood Ratio Tests._")
-
-    variants = [v for v in df[group_col].unique() if v != control_label]
-    posthoc_data = []
-    significant_pairs = []
-
-    # Bonferroni correction factor
-    num_comparisons = len(variants)
-
-    for variant in variants:
-        # Filter data for pairwise comparison
-        pair_df = df[df[group_col].isin([control_label, variant])]
-
-        # 1. Null Model (single model for both groups combined)
-        null_log_lik, n_params_per_model = fit_unit_model(pair_df[kpi].values, unit)
-
-        # 2. Alternative Model (separate models for control and variant)
-        ctrl_data = pair_df[pair_df[group_col] == control_label][kpi].values
-        var_data = pair_df[pair_df[group_col] == variant][kpi].values
-        ll_ctrl, _ = fit_unit_model(ctrl_data, unit)
-        ll_var, _ = fit_unit_model(var_data, unit)
-        alt_log_lik = ll_ctrl + ll_var
-
-        if np.isnan(null_log_lik) or np.isnan(alt_log_lik):
-            p_val = np.nan
-            lrt_stat = np.nan
-            adj_p = np.nan
-            sig = "—"
-        else:
-            # df = params(Alt) - params(Null) = 2*k - k = k (2 or 3)
-            lrt_stat = max(2.0 * (alt_log_lik - null_log_lik), 0.0)
-            p_val = stats.chi2.sf(lrt_stat, df=n_params_per_model)
-            adj_p = min(p_val * num_comparisons, 1.0)
-            sig = "✅" if adj_p < 0.05 else "❌"
-            if adj_p < 0.05:
-                significant_pairs.append(_fmt_pair(variant, control_label, adj_p))
-
-        posthoc_data.append({
-            "Comparison": f"{variant} vs {control_label}",
-            "LRT Stat": np.round(lrt_stat, 4) if not np.isnan(lrt_stat) else "N/A",
-            "p-value": np.round(p_val, 4) if not np.isnan(p_val) else "N/A",
-            "p-adj (Bonferroni)": np.round(adj_p, 4) if not np.isnan(adj_p) else "N/A",
-            "Significant": sig
-        })
-
-    st.dataframe(pd.DataFrame(posthoc_data))
-    return significant_pairs
-
-
-def run_negbin_posthoc(df, kpi, group_col, control_label):
-    """
-    Pairwise Negative Binomial LRTs against a chosen control, Bonferroni
-    corrected. Mirrors run_gamma_posthoc's structure and output format so
-    significant pairs fold into the same conclusion formatting.
-    """
-    st.write("### Pairwise Post-Hoc Comparisons (Negative Binomial LRT)")
-    st.markdown("_Each treatment variant is compared against the control using "
-                "pairwise Negative Binomial Likelihood Ratio Tests._")
-
-    variants = [v for v in df[group_col].unique() if v != control_label]
-    posthoc_data = []
-    significant_pairs = []
-    num_comparisons = len(variants)
-
-    for variant in variants:
-        pair_df = df[df[group_col].isin([control_label, variant])]
-
-        try:
-            p_val, lrt_stat, alpha_est, _ = perform_negbin_test(pair_df, kpi, group_col)
-            if pd.isna(p_val):
-                raise ValueError("LRT degrees of freedom <= 0")
-            adj_p = min(p_val * num_comparisons, 1.0)
-            sig = "✅" if adj_p < 0.05 else "❌"
-            if adj_p < 0.05:
-                significant_pairs.append(_fmt_pair(variant, control_label, adj_p))
-        except Exception as e:
-            st.error(f"Error during pairwise NB test ({variant} vs {control_label}): {e}")
-            p_val, lrt_stat, adj_p, sig = np.nan, np.nan, np.nan, "—"
-
-        posthoc_data.append({
-            "Comparison": f"{variant} vs {control_label}",
-            "LRT Stat": np.round(lrt_stat, 4) if pd.notna(lrt_stat) else "N/A",
-            "p-value": np.round(p_val, 4) if pd.notna(p_val) else "N/A",
-            "p-adj (Bonferroni)": np.round(adj_p, 4) if pd.notna(adj_p) else "N/A",
-            "Significant": sig,
-        })
-
-    st.dataframe(pd.DataFrame(posthoc_data))
-    return significant_pairs
-
-
-# Detect outliers
-
-def detect_outliers(df, kpi, outlier_stdev, large_file_threshold=10000):
-    try:
-        # An outlier is an unusually extreme actual value (e.g. an abnormal
-        # order). Zero rows (non-converting visitors, or non-order rows that
-        # haven't been filtered out yet) are never outliers, and including
-        # them would skew the mean/std or OLS fit used to find the real ones.
-        # Bounds are computed on non-zero rows only; zero rows always stay
-        # non-outliers in the returned mask.
-        nonzero_df = df[df[kpi] != 0]
-        outliers_mask = pd.Series([False] * len(df), index=df.index)
-
-        if nonzero_df.empty:
-            return outliers_mask, None, large_file_threshold
-
-        if len(nonzero_df) > large_file_threshold:
-            st.info(f"Dataset has {len(df):,} rows ({len(nonzero_df):,} non-zero).")
-            for variant in nonzero_df['experience_variant_label'].unique():
-                variant_data = nonzero_df[nonzero_df['experience_variant_label'] == variant][kpi].dropna()
-                if not variant_data.empty:
-                    # Calculate actual standard deviations instead of IQR
-                    mean_val = variant_data.mean()
-                    std_val = variant_data.std()
-                    lower_bound = mean_val - (outlier_stdev * std_val)
-                    upper_bound = mean_val + (outlier_stdev * std_val)
-
-                    variant_outliers = (variant_data < lower_bound) | (variant_data > upper_bound)
-                    outliers_mask[variant_data.index] = variant_outliers
-            return outliers_mask, None, large_file_threshold
-        else:
-            st.info(f"Dataset has {len(df):,} rows ({len(nonzero_df):,} non-zero).")
-            model = smf.ols(f'{kpi} ~ C(experience_variant_label)', data=nonzero_df).fit()
-            influence = model.get_influence()
-            standardized_residuals = influence.resid_studentized_internal
-            leverage = influence.hat_matrix_diag
-            dffits = influence.dffits[0]
-
-            residual_threshold = outlier_stdev
-            leverage_threshold = outlier_stdev * (model.df_model + 1) / len(nonzero_df)
-            dffits_threshold = outlier_stdev * np.sqrt((model.df_model + 1) / len(nonzero_df))
-
-            residuals_outliers = np.abs(standardized_residuals) > residual_threshold
-            leverage_outliers = leverage > leverage_threshold
-            dffits_outliers = np.abs(dffits) > dffits_threshold
-            nonzero_outliers = residuals_outliers | leverage_outliers | dffits_outliers
-            outliers_mask[nonzero_df.index] = nonzero_outliers
-            return outliers_mask, model, large_file_threshold
-
-    except Exception as e:
-        st.error(f"Error during outlier detection: {e}")
-        return pd.Series([False] * len(df), index=df.index), None, large_file_threshold
-
-# Winsorize and IQR filter combined
-
-def winsorize_data(df, kpi, method, outlier_stdev=None, percentile=None):
-    df_copy = df.copy() # Create a copy to avoid modifying the original DataFrame
-    lower_cap = None
-    upper_cap = None
-    cap_description = "No capping applied" # Default description
-
-    # Bounds should reflect the actual value distribution among real
-    # orders/spenders, not the zero mass (non-converting visitors, or
-    # not-yet-filtered non-order rows) — otherwise a positive lower_cap would
-    # also get applied to zero rows below, incorrectly raising them above zero.
-    # Capping itself is likewise restricted to non-zero rows further down.
-    nonzero_mask = df_copy[kpi] != 0
-    nonzero_values = df_copy.loc[nonzero_mask, kpi]
-
-    if nonzero_values.empty:
-        st.warning(f"Warning: No non-zero {kpi} values to compute Winsorization bounds from. No capping applied.")
-        return df_copy, None, None, "No non-zero values"
-
-    if method == 'Standard Deviation':
-        if outlier_stdev is None:
-            outlier_stdev = 3 # Sensible default
-            st.warning(f"Winsorization Standard Deviation not specified, defaulting to {outlier_stdev}.") # Inform user
-        if nonzero_values.std() == 0:
-             st.warning(f"Warning: Standard deviation of non-zero {kpi} values is zero. Cannot apply standard deviation Winsorization.")
-             return df_copy, None, None, "Standard deviation is zero"
-
-        mean = nonzero_values.mean()
-        std_dev = nonzero_values.std()
-        lower_cap = mean - (outlier_stdev * std_dev)
-        upper_cap = mean + (outlier_stdev * std_dev)
-        cap_description = f"{outlier_stdev} standard deviations from the mean (non-zero rows)"
-        st.write(f"_Calculating Winsorization bounds based on: mean ± {outlier_stdev} * std_dev, non-zero rows_") # Add clarity
-
-    elif method == 'Percentile':
-        if percentile is None:
-            percentile = 95 # Sensible default
-            st.warning(f"Winsorization Percentile not specified, defaulting to {percentile}th.") # Inform user
-
-        # Calculate the actual lower/upper percentile values (e.g., 95th -> 2.5th and 97.5th)
-        lower_p = (100.0 - percentile) / 2.0
-        upper_p = 100.0 - lower_p
-        lower_cap = np.percentile(nonzero_values, lower_p) # Use np.percentile for robustness
-        upper_cap = np.percentile(nonzero_values, upper_p) # Use np.percentile for robustness
-        # Provide more specific description
-        cap_description = f"the {lower_p:.1f}th and {upper_p:.1f}th percentiles (non-zero rows)"
-        st.write(f"_Calculating Winsorization bounds based on percentiles: {lower_p:.1f} and {upper_p:.1f}, non-zero rows_") # Add clarity
-
-    else:
-        # This case should ideally not be reached if UI logic is correct
-        st.error(f"Error: Unknown Winsorization method '{method}' provided.")
-        return df_copy, None, None, "Unknown method" # Return original df
-
-    # Apply capping using the determined lower and upper bounds
-    # Ensure caps are not None before proceeding
-    if lower_cap is not None and upper_cap is not None:
-        capped = df_copy.loc[nonzero_mask, kpi]
-        capped = np.where(capped < lower_cap, lower_cap, capped)
-        capped = np.where(capped > upper_cap, upper_cap, capped)
-        df_copy.loc[nonzero_mask, kpi] = capped
-        st.write(f"_Applied capping between {lower_cap:.4f} and {upper_cap:.4f} (non-zero rows only)_")
-    else:
-        st.warning("Warning: Could not determine capping bounds. No Winsorization applied.")
-        cap_description = "No capping applied (bounds indeterminate)"
-
-
-    return df_copy, lower_cap, upper_cap, cap_description
 
 # Log transform data
 def log_transform_data(df, kpi):
@@ -622,365 +204,243 @@ def _fmt_money(x):
     return f"€{x:,.0f}"
 
 
+GROUP_COL = 'experience_variant_label'
+
+APPROACHES = {
+    "Heuristic (Auto-detect)": ContinuousApproach.HEURISTIC,
+    "Gamma GLM (Best for Revenue)": ContinuousApproach.GAMMA_GLM,
+}
+
+NB_TEST = "Negative Binomial Regression (LRT)"
+
+# Why FOE picked each test, keyed by ContinuousMetricResult.test_name.
+TEST_REASONS = {
+    "Standard ANOVA": "Residuals are normal and variances are homogeneous.",
+    "Welch's ANOVA": "Residuals are normal, but variances are heterogeneous. Welch's is robust to unequal variances.",
+    "Kruskal-Wallis": "Data is not normally distributed; non-parametric test suitable for 3+ groups.",
+    "Mann-Whitney U": "Data is not normally distributed (Non-parametric alternative to ANOVA).",
+    NB_TEST: (
+        "KPI is a discrete, non-negative count metric — Negative Binomial models the "
+        "mean-variance relationship natively (including overdispersion) rather than "
+        "assuming a continuous or bounded-proportion distribution."
+    ),
+    "Gamma GLM (Likelihood Ratio Test)": (
+        "Gamma GLM selected. A Gamma model per variant is compared against one shared "
+        "Gamma model with a Likelihood Ratio Test."
+    ),
+    "Two-Part Hurdle (Likelihood Ratio Test)": (
+        "Gamma GLM selected with per-visitor analysis. A two-part model per variant "
+        "(Bernoulli for converting × Gamma for the value of converters) is compared "
+        "against one shared model with a Likelihood Ratio Test."
+    ),
+}
+
+STAT_LABELS = {
+    "F": "F-statistic",
+    "H": "H-statistic",
+    "U": "U-statistic",
+    "LR": "Likelihood Ratio Statistic",
+}
+
+EFFECT_LABELS = {
+    "eta_squared": "Eta-Squared",
+    "partial_eta_squared": "Partial Eta-Squared",
+    "eta_squared_h": "Eta-squared_H",
+    "rank_biserial": "Rank-Biserial Correlation",
+}
+
+ADJUSTMENT_LABELS = {
+    "bonferroni": "Bonferroni",
+    "tukey": "Tukey",
+    "games-howell": "Games-Howell",
+}
+
+
+def _posthoc_table(posthoc):
+    """One row per PairwiseComparisonResult; 'X vs Y' means X minus Y."""
+    adjustment = ADJUSTMENT_LABELS.get(posthoc[0].adjustment, posthoc[0].adjustment)
+    stat_name = posthoc[0].statistic_name
+    has_ci = any(r.mean_diff is not None for r in posthoc)
+    rows = []
+    for r in posthoc:
+        row = {"Comparison": r.comparison, f"Statistic ({stat_name})": round(r.statistic, 4)}
+        if posthoc[0].adjustment == "bonferroni":
+            # Tukey / Games-Howell p-values are adjusted by construction, so
+            # only Bonferroni has a separate raw p-value worth showing.
+            row["p-value"] = round(r.p_value, 4)
+        row[f"p-adj ({adjustment})"] = round(r.p_adj, 4)
+        if has_ci:
+            row["Mean diff (X − Y)"] = round(r.mean_diff, 4)
+            row["CI low"] = round(r.ci_low, 4)
+            row["CI high"] = round(r.ci_high, 4)
+        row["Significant"] = "✅" if r.is_significant else "❌"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _significance_vs_control(result, control, labels):
+    """Per-challenger significance against the control, for the business case."""
+    if len(labels) == 2:
+        return {label: result.is_significant for label in labels if label != control}
+    significance = {}
+    for r in result.posthoc_results or []:
+        if control in (r.group_a, r.group_b):
+            other = r.group_b if r.group_a == control else r.group_a
+            significance[other] = r.is_significant
+    return significance
+
+
 def perform_stat_tests_and_conclusions(
-    df, kpi, model_after, approach, unit="per_transaction",
+    df, kpi, approach, unit="per_transaction", control_label=None,
     count_max_unique=50, count_max_unique_ratio=0.05,
     include_business_case=False, test_duration_days=None, visitor_counts=None,
-    control_label=None,
 ):
     st.write("---") # Separator
     st.write("## Statistical Test Results")
     kpi_label = kpi.replace('_', ' ')
     unit_label = f"{kpi_label} per visitor" if unit == "per_visitor" else f"{kpi_label} per transaction"
     st.write(f"_Analysis unit: **{unit_label}**._")
-    st.write("_(Based on Normality of Residuals and Homogeneity of Variance)_")
 
-    # --- Input Validation ---
-    if kpi not in df.columns:
-        st.error(f"Error: KPI column '{kpi}' not found in DataFrame.")
-        return
-    if 'experience_variant_label' not in df.columns:
-        st.error("Error: Column 'experience_variant_label' not found in DataFrame.")
-        return
-    if not hasattr(model_after, 'resid'):
-         st.error("Error: The provided 'model' object does not have residuals ('model.resid'). Please provide a fitted statsmodels model.")
-         return
+    # FOE compares variant labels as strings. Casting once keeps the control,
+    # the post-hoc labels and the business-case keys aligned, also for
+    # numeric labels such as 0 / 1.
+    analysis_df = df[[GROUP_COL, kpi]].copy()
+    analysis_df[GROUP_COL] = analysis_df[GROUP_COL].astype(str)
+    control = str(control_label) if control_label is not None else None
 
-    # Drop rows where KPI or group label is missing for group-based tests
-    df_clean = df[[kpi, 'experience_variant_label']].dropna()
-    if df_clean.empty:
-        st.warning("Warning: No valid data remaining after dropping missing KPI or group labels.")
-        return
-
-    # Get unique groups and count
-    unique_groups = df_clean['experience_variant_label'].unique()
-    num_groups = len(unique_groups)
-
-    if num_groups < 2:
-        st.warning(f"Warning: Only {num_groups} group found. Cannot perform comparison tests.")
-        return
-
-    # --- Assumption Checks ---
-    is_count = False
-
-    if approach == "Heuristic (Auto-detect)":
-        st.write("### 1. Assumption Checks")
-
-        # --- Count-data gate: check BEFORE normality/Levene ---
-        # Discrete, non-negative count metrics (e.g. items/tickets per buyer)
-        # are structurally unsuited to ANOVA/Welch/KW's continuous-data
-        # assumptions even when they "pass" normality by accident of large N,
-        # and the binomial-style p(1-p) variance base breaks once the mean
-        # exceeds 1. These route to Negative Binomial regression instead.
-        is_count = is_count_kpi(
-            df_clean[kpi],
-            max_unique_for_check=count_max_unique,
-            max_unique_ratio=count_max_unique_ratio,
+    try:
+        config = ContinuousMetricConfig(
+            kpi=kpi,
+            group_col=GROUP_COL,
+            approach=APPROACHES[approach],
+            unit=AnalysisUnit(unit),
+            control_label=control,
+            count_max_unique=int(count_max_unique),
+            count_max_unique_ratio=float(count_max_unique_ratio),
         )
+        result = ContinuousMetricEngine().run_comparison_suite(analysis_df, config)
+    except ValueError as e:
+        st.error(f"The analysis could not be run: {e}")
+        return
+    except Exception as e:
+        st.error(f"An error occurred during the statistical analysis: {e}")
+        return
 
+    is_heuristic = config.approach == ContinuousApproach.HEURISTIC
+    is_count = result.test_name == NB_TEST
+    labels = [row[GROUP_COL] for row in result.summary_stats]  # sorted, as FOE tests them
+    num_groups = len(labels)
+
+    # --- 1. Assumption Checks ---
+    if is_heuristic:
+        st.write("### 1. Assumption Checks")
         if is_count:
             st.info("**Detected: discrete count metric.** Routing to Negative Binomial "
                     "regression instead of the continuous-data decision tree.")
-            mean_val = df_clean[kpi].mean()
-            var_val = df_clean[kpi].var()
-            ratio = var_val / mean_val if mean_val > 0 else np.nan
-            st.write(f"* Mean = {mean_val:.4f}, Variance = {var_val:.4f} "
-                     f"(Variance/Mean ratio = {ratio:.2f})")
-            if pd.notna(ratio) and ratio <= 1.05:
+            kpi_values = pd.to_numeric(analysis_df[kpi], errors="coerce").dropna()
+            ratio = result.variance_mean_ratio
+            ratio_text = f" (Variance/Mean ratio = {ratio:.2f})" if ratio is not None else ""
+            st.write(f"* Mean = {kpi_values.mean():.4f}, Variance = {kpi_values.var():.4f}{ratio_text}")
+            if ratio is not None and ratio <= 1.05:
                 st.caption("_Variance ≈ Mean: a Poisson model would likely also fit, "
                            "but Negative Binomial is used as the general-purpose default._")
             else:
                 st.caption("_Variance > Mean: overdispersion present, consistent with "
                            "why Negative Binomial (rather than Poisson or a binomial "
                            "z-test) is the appropriate model here._")
-            is_normal = False
-            is_homogeneous = False
         else:
-            # Normality of residuals via D'Agostino's K^2 omnibus test (skewness +
-            # kurtosis). Unlike Shapiro-Wilk it is reliable for large samples and
-            # emits no N > 5000 warning, so we use the full residual vector. Its
-            # kurtosis component is only valid for N >= 20, so very small samples
-            # fall back to non-parametric handling.
-            try:
-                resid_for_test = model_after.resid.dropna()
-                st.write("**Normality of Residuals (D'Agostino's K² Test):**")
-                if len(resid_for_test) >= 20:
-                    norm_stat, norm_p_val = normaltest(resid_for_test)
-                    st.write(f"* Statistic (K²) = {norm_stat:.4f}")
-                    st.write(f"* p-value = {norm_p_val:.4f}")
-                    is_normal = norm_p_val >= 0.05
-                    st.write(f"* _Conclusion: Residuals are likely {'normally distributed' if is_normal else 'NOT normally distributed'}._")
-                else:
-                    is_normal = False
-                    st.caption(
-                        "Fewer than 20 residuals — too few for a reliable omnibus "
-                        "normality test; defaulting to non-parametric handling."
-                    )
-            except Exception as e:
-                st.error(f"Error during normality test: {e}")
-                st.write("_Skipping further analysis due to normality test error._")
-                return
+            st.write("_(Based on Normality of Residuals and Homogeneity of Variance)_")
+            st.write("**Normality of Residuals (D'Agostino's K² Test):**")
+            if result.normality_stat is not None:
+                st.write(f"* Statistic (K²) = {result.normality_stat:.4f}")
+                st.write(f"* p-value = {result.normality_p:.4f}")
+                st.write(f"* _Conclusion: Residuals are likely {'normally distributed' if result.is_normal else 'NOT normally distributed'}._")
+            else:
+                st.caption(
+                    "Fewer than 20 residuals — too few for a reliable omnibus "
+                    "normality test; defaulting to non-parametric handling."
+                )
 
-            # Prepare groups for Levene's test (and potential non-parametric tests)
-            # Use the cleaned data to avoid errors with tests
-            groups = [group_data[kpi] for _, group_data in df_clean.groupby('experience_variant_label', observed=True)]
-
-            # Homogeneity of Variance (Levene's Test)
-            try:
-                # Ensure there's data in each group being passed to Levene
-                if any(len(g) < 1 for g in groups):
-                    st.error("Error: At least one group has no data after cleaning. Cannot perform Levene's test.")
-                    return
-                # Levene's test requires at least 2 samples per group if center='median' (default)
-                # or center='mean'. Check group sizes. Let's use default ('median').
-                min_group_size = min(len(g) for g in groups)
-                if min_group_size < 2 and num_groups > 1 :
-                    st.warning(f"Warning: Levene's test might be unreliable as at least one group has only {min_group_size} sample(s).")
-
-                levene_stat, levene_p_val = levene(*groups)
-                st.write("**Homogeneity of Variance (Levene's Test):**")
-                st.write(f"* Statistic = {levene_stat:.4f}")
-                st.write(f"* p-value = {levene_p_val:.4f}")
-                is_homogeneous = levene_p_val >= 0.05
-                st.write(f"* _Conclusion: Variances are likely {'homogeneous (equal)' if is_homogeneous else 'NOT homogeneous (unequal)'}._")
-            except Exception as e:
-                st.error(f"Error during Levene's test: {e}")
-                st.write("_Skipping further analysis due to variance test error._")
-                return
-
-    elif approach == "Gamma GLM (Best for Revenue)":
-        # Skip diagnostics and go straight to GLM
+            st.write("**Homogeneity of Variance (Levene's Test):**")
+            if result.levene_stat is not None:
+                st.write(f"* Statistic = {result.levene_stat:.4f}")
+                st.write(f"* p-value = {result.levene_p:.4f}")
+            else:
+                st.write("* Levene's test could not be computed (e.g. a variant without spread).")
+            st.write(f"* _Conclusion: Variances are likely {'homogeneous (equal)' if result.is_homogeneous else 'NOT homogeneous (unequal)'}._")
+    else:
         if unit == "per_visitor":
             st.info("Diagnostic tests (normality/Levene) skipped. Using a two-part hurdle model (Bernoulli × Gamma) that includes non-converting visitors (zeros).")
         else:
             st.info("Diagnostic tests (normality/Levene) skipped. Gamma GLM is robust to non-normal, skewed data.")
-        is_normal = False
-        is_homogeneous = False
 
-    # --- Main Statistical Test ---
+    # --- 2. Main Statistical Test ---
     st.write("### 2. Main Comparison Test")
+    st.info(f"**Test Chosen:** {result.test_name}")
+    reason = TEST_REASONS.get(result.test_name)
+    if reason:
+        st.markdown(f"_Reason: {reason}_")
 
-    test_name = "Generic Comparison"
-    p_value = np.nan
-    test_statistic = np.nan
-    effect_size = None
-    posthoc_results = None
+    if result.test_statistic is not None:
+        stat_line = f"* {STAT_LABELS.get(result.test_statistic_name, result.test_statistic_name)} = {result.test_statistic:.4f}"
+        if result.test_statistic_name == "U":
+            stat_line += f" (for '{labels[0]}')"
+        st.write(stat_line)
+    st.write(f"* p-value = {result.p_value:.4g}")
+    if result.dispersion_alpha is not None:
+        st.write(f"* Estimated dispersion (α): {result.dispersion_alpha:.4f}")
+        if result.dispersion_alpha == 0.0:
+            st.caption("α = 0: the counts show no overdispersion, so the Negative Binomial "
+                       "model reduces to Poisson. The test is still valid.")
+    if result.effect_size is not None:
+        effect_label = EFFECT_LABELS.get(result.effect_size_name, result.effect_size_name)
+        st.write(f"* _Effect Size ({effect_label}): {result.effect_size:.4f}_")
+        if result.effect_size_name == "rank_biserial":
+            st.caption(f"Positive values mean '{labels[1]}' tends to be higher than '{labels[0]}'.")
+        elif result.effect_size_name == "eta_squared_h":
+            st.caption("Clamped at 0: values below 0 mean no effect.")
+
+    for warning in result.warnings:
+        st.warning(warning)
+
+    # --- Post-hoc ---
     significant_pairs = []
-    is_significant = False # Initialize
+    posthoc = result.posthoc_results
+    if posthoc:
+        st.info(f"**Post-Hoc Test ({result.posthoc_test_name}):**")
+        if posthoc[0].statistic_name == "LR":
+            st.markdown(f"_Reason: the global test was significant. Each treatment variant is "
+                        f"compared against the control **'{control}'** with a pairwise Likelihood "
+                        f"Ratio Test, Bonferroni-corrected._")
+        else:
+            st.markdown("_Reason: the global test was significant. Every pair of variants is "
+                        "compared to identify which specific groups differ. **'X vs Y'** "
+                        "reads as X minus Y._")
+        st.dataframe(_posthoc_table(posthoc), hide_index=True)
+        significant_pairs = [_fmt_pair(r.group_a, r.group_b, r.p_adj) for r in posthoc if r.is_significant]
+    elif num_groups > 2 and not result.is_significant:
+        st.info("Global test is not significant; pairwise comparisons are not required.")
 
-    try:
-        if approach == "Gamma GLM (Best for Revenue)":
-            if unit == "per_visitor":
-                st.info("Native two-part (hurdle) Likelihood Ratio Test")
-            else:
-                st.info("Native Gamma Likelihood Ratio Test")
-            try:
-                p_value, lr_stat = perform_gamma_test(df_clean, kpi, unit)
-
-                if pd.isna(p_value):
-                    st.warning("The likelihood model could not be fit (check that each variant has enough positive values).")
-                else:
-                    st.write(f"* Likelihood Ratio Statistic: {lr_stat:.4f}")
-                    st.write(f"* p-value: {p_value:.4g}")
-
-                    is_significant = p_value < 0.05
-                    test_name = "Two-Part Hurdle MLE" if unit == "per_visitor" else "Native Gamma MLE"
-
-                    if is_significant and num_groups > 2:
-                        control_label = st.selectbox("Select Control Variant for Post-Hoc", df_clean['experience_variant_label'].unique())
-
-                        significant_pairs = run_gamma_posthoc(
-                            df=df_clean,
-                            kpi=kpi,
-                            group_col='experience_variant_label',
-                            control_label=control_label,
-                            unit=unit,
-                        )
-
-                    elif not is_significant and num_groups > 2:
-                        st.info("Global test is not significant; pairwise comparisons are not required.")
-
-            except Exception as e:
-                st.error(f"Native Gamma Fit failed: {e}")
-                p_value = np.nan
-
-        elif approach == "Heuristic (Auto-detect)" and is_count:
-            st.info("**Test Chosen:** Negative Binomial Regression (LRT)")
-            st.markdown("_Reason: KPI is a discrete, non-negative count metric — Negative "
-                        "Binomial models the mean-variance relationship natively (including "
-                        "overdispersion) rather than assuming a continuous or bounded-proportion "
-                        "distribution._")
-            try:
-                p_value, lr_stat, alpha_est, res_alt = perform_negbin_test(df_clean, kpi)
-
-                if pd.isna(p_value):
-                    st.warning("The Negative Binomial model could not be fit or compared "
-                               "(check that there is more than one variant with data).")
-                else:
-                    test_statistic = lr_stat
-                    test_name = "Negative Binomial Regression (LRT)"
-                    st.write(f"* Likelihood Ratio Statistic: {lr_stat:.4f}")
-                    st.write(f"* p-value: {p_value:.4g}")
-                    st.write(f"* Estimated dispersion (α): {alpha_est:.4f}")
-
-                    is_significant = p_value < 0.05
-
-                    if is_significant and num_groups > 2:
-                        control_label = st.selectbox(
-                            "Select Control Variant for Post-Hoc",
-                            df_clean['experience_variant_label'].unique(),
-                        )
-                        significant_pairs = run_negbin_posthoc(
-                            df=df_clean,
-                            kpi=kpi,
-                            group_col='experience_variant_label',
-                            control_label=control_label,
-                        )
-                    elif not is_significant and num_groups > 2:
-                        st.info("Global test is not significant; pairwise comparisons are not required.")
-
-            except Exception as e:
-                st.error(f"Negative Binomial fit failed: {e}")
-                p_value = np.nan
-
-        elif approach == "Heuristic (Auto-detect)":
-            if is_normal and is_homogeneous:
-                # Standard ANOVA
-                test_name = "Standard One-Way ANOVA"
-                st.info(f"**Test Chosen:** {test_name}")
-                st.markdown("_Reason: Residuals are normal and variances are homogeneous._")
-                anova_results = sm.stats.anova_lm(model_after, typ=2)
-                p_value = anova_results['PR(>F)'].iloc[0]
-                test_statistic = anova_results['F'].iloc[0]
-
-                st.dataframe(anova_results)
-                is_significant = p_value < 0.05
-                
-                if is_significant and num_groups > 2:
-                    st.info("**Post-Hoc Test (Tukey's HSD):**")
-                    st.markdown("_Reason: ANOVA was significant, identifying which specific groups differ._")
-                    tukey_results = pairwise_tukeyhsd(df_clean[kpi], df_clean['experience_variant_label'], alpha=0.05)
-                    st.write(tukey_results.summary())
-                    posthoc_results = tukey_results
-                    tukey_groups = [str(g) for g in tukey_results.groupsunique]
-                    tukey_combos = list(itertools.combinations(tukey_groups, 2))
-                    tukey_pvals = getattr(tukey_results, "pvalues", [None] * len(tukey_combos))
-                    for (a, b), reject, pv in zip(tukey_combos, tukey_results.reject, tukey_pvals):
-                        if reject:
-                            significant_pairs.append(_fmt_pair(a, b, pv))
-
-            elif is_normal and not is_homogeneous: 
-                # Normal, but Heterogeneous Variances (This is where Welch's belongs)
-                test_name = "Welch's ANOVA"
-                st.info(f"**Test Chosen:** {test_name}")
-                st.markdown("_Reason: Residuals are normal, but variances are heterogeneous. Welch's is robust to unequal variances._")
-                aov = welch_anova(data=df_clean, dv=kpi, between='experience_variant_label')
-                p_value = aov['p-unc'].iloc[0]
-                test_statistic = aov['F'].iloc[0]
-                effect_size = aov['np2'].iloc[0] # Partial eta-squared from pingouin
-                st.dataframe(aov)
-                if effect_size is not None:
-                    st.write(f"* _Effect Size (Partial Eta-Squared): {effect_size:.4f}_")
-                is_significant = p_value < 0.05
-                if is_significant and num_groups > 2:
-                    st.info("**Post-Hoc Test (Games-Howell):**")
-                    st.markdown("_Reason: Welch's ANOVA was significant, identifying which specific groups differ (suitable for unequal variances)._")
-                    posthoc_results = pairwise_gameshowell(data=df_clean, dv=kpi, between='experience_variant_label')
-                    st.dataframe(posthoc_results)
-                    for _, gh_row in posthoc_results.iterrows():
-                        if pd.notna(gh_row['pval']) and gh_row['pval'] < 0.05:
-                            significant_pairs.append(_fmt_pair(gh_row['A'], gh_row['B'], gh_row['pval']))
-    
-            else: 
-                # Non-Normal Data -> Drop to Non-parametric tests regardless of variance
-                if num_groups > 2:
-                    # Kruskal-Wallis
-                    test_name = "Kruskal-Wallis H Test"
-                    st.info(f"**Test Chosen:** {test_name}")
-                    st.markdown("_Reason: Data is not normally distributed; non-parametric test suitable for 3+ groups._")
-                    statistic, p_value = kruskal(*groups)
-                    test_statistic = statistic
-                    st.write(f"* H-statistic = {statistic:.4f}")
-                    st.write(f"* p-value = {p_value:.4g}") # Use general format for potentially small p-values
-                    is_significant = p_value < 0.05
-                     # Calculate effect size: Eta-squared_H = (H - k + 1) / (n - k) where k=num groups, n=total samples
-                    n_total = len(df_clean)
-                    if n_total > num_groups: # Avoid division by zero or negative
-                        effect_size_eta_h = (test_statistic - num_groups + 1) / (n_total - num_groups)
-                        st.write(f"* _Approx. Effect Size (Eta-squared_H): {effect_size_eta_h:.4f}_")
-    
-                    if is_significant:
-                        st.info("**Post-Hoc Test (Dunn's Test with Bonferroni correction):**")
-                        st.markdown("_Reason: Kruskal-Wallis was significant, identifying which specific groups differ._")
-    
-                        # Dunn's test for post-hoc analysis                
-                        try:
-                            posthoc_results_df = sp.posthoc_dunn(groups, p_adjust='bonferroni')
-                            group_names = df_clean['experience_variant_label'].unique()
-                            name_map = {i+1: name for i, name in enumerate(group_names)}
-                            posthoc_results_df.rename(columns=name_map, index=name_map, inplace=True)
-                            
-                            st.write("_(p-values adjusted using Bonferroni method)_")
-                            st.dataframe(posthoc_results_df)
-                            dunn_cols = list(posthoc_results_df.columns)
-                            for i in range(len(dunn_cols)):
-                                for j in range(i + 1, len(dunn_cols)):
-                                    pv = posthoc_results_df.iloc[i, j]
-                                    if pd.notna(pv) and pv < 0.05:
-                                        significant_pairs.append(_fmt_pair(dunn_cols[i], dunn_cols[j], pv))
-                        except Exception as posthoc_e:
-                             st.error(f"Error during Dunn's post-hoc test: {posthoc_e}")
-    
-                else: # Exactly 2 groups with Heterogeneous Variances
-                     # Mann-Whitney U
-                    test_name = "Mann-Whitney U Test"
-                    st.info(f"**Test Chosen:** {test_name}")
-                    st.markdown("_Reason: Data is not normally distributed (Non-parametric alternative to ANOVA)._")
-                    # Ensure groups have data
-                    if len(groups[0]) > 0 and len(groups[1]) > 0:
-                        statistic, p_value = mannwhitneyu(groups[0], groups[1], alternative='two-sided')
-                        test_statistic = statistic
-                        st.write(f"* U-statistic = {statistic:.4f}")
-                        st.write(f"* p-value = {p_value:.4g}")
-                        is_significant = p_value < 0.05
-                        # Calculate effect size: Rank-Biserial Correlation r = 1 - (2*U) / (n1*n2)
-                        n1 = len(groups[0])
-                        n2 = len(groups[1])
-                        effect_size_rank_biserial = 1 - (2 * test_statistic) / (n1 * n2)
-                        st.write(f"* _Effect Size (Rank-Biserial Correlation): {effect_size_rank_biserial:.4f}_")
-                    else:
-                        st.warning("Warning: Cannot perform Mann-Whitney U test as at least one group has no data.")
-                        p_value = np.nan # Ensure no significance is declared
-
-    except Exception as e:
-        st.error(f"An error occurred during the main statistical test ({test_name}): {e}")
-        p_value = np.nan # Prevent incorrect conclusion
-
-    # --- Summary Statistics ---
+    # --- 3. Summary Statistics ---
     st.write("### 3. Descriptive Statistics")
     st.caption(f"Means and standard deviations are computed per {unit_label.split(' per ')[-1]} (analysis unit: {unit_label}).")
-    try:
-        summary_stats = df_clean.groupby('experience_variant_label', observed=True)[kpi].agg(['mean', 'std', 'count'])
-        st.dataframe(summary_stats)
+    summary_stats = pd.DataFrame(result.summary_stats).set_index(GROUP_COL)
+    st.dataframe(summary_stats)
+    if not summary_stats.empty:
+        highest_mean_variant = summary_stats['mean'].idxmax()
+        highest_mean_value = summary_stats['mean'].max()
+        st.write(f"* The variant with the highest mean is **'{highest_mean_variant}'** ({highest_mean_value:.4f}).")
 
-        if not summary_stats.empty:
-            highest_mean_variant = summary_stats['mean'].idxmax()
-            highest_mean_value = summary_stats['mean'].max()
-            st.write(f"* The variant with the highest mean is **'{highest_mean_variant}'** ({highest_mean_value:.4f}).")
-
-            # Check if std calculation is possible (requires >1 sample per group)
-            if summary_stats['count'].min() > 1:
-                 highest_std_variant = summary_stats['std'].idxmax()
-                 highest_std_value = summary_stats['std'].max()
-                 st.write(f"* The variant with the highest standard deviation is **'{highest_std_variant}'** ({highest_std_value:.4f}).")
-            else:
-                 st.write("* Standard deviation calculation requires more than one sample per group.")
-    except Exception as e:
-        st.error(f"An error occurred during summary statistics calculation: {e}")
-        summary_stats = None
+        # Check if std calculation is possible (requires >1 sample per group)
+        if summary_stats['count'].min() > 1:
+            highest_std_variant = summary_stats['std'].idxmax()
+            highest_std_value = summary_stats['std'].max()
+            st.write(f"* The variant with the highest standard deviation is **'{highest_std_variant}'** ({highest_std_value:.4f}).")
+        else:
+            st.write("* Standard deviation calculation requires more than one sample per group.")
 
     # --- Business Case (optional) ---
-    if include_business_case and test_duration_days and summary_stats is not None:
+    if include_business_case and test_duration_days:
         st.write("### Business Case")
         with st.expander("How is this calculated?"):
             st.markdown(
@@ -995,11 +455,12 @@ def perform_stat_tests_and_conclusions(
                 "(and order rates, for per-transaction)."
             )
 
-        st.caption(f"_Control (baseline) variant: **{control_label}**._")
+        st.caption(f"_Control (baseline) variant: **{control}**._")
+        group_stats = {row[GROUP_COL]: row for row in result.summary_stats}
 
-        if control_label not in summary_stats.index:
+        if control not in group_stats:
             st.error(
-                f"Control variant '{control_label}' has no data after processing "
+                f"Control variant '{control}' has no data after processing "
                 "(e.g. it may have been entirely removed by outlier handling)."
             )
         elif unit == "per_transaction" and not visitor_counts:
@@ -1010,25 +471,25 @@ def perform_stat_tests_and_conclusions(
         else:
             try:
                 if unit == "per_visitor":
-                    daily_visitors = len(df_clean) / test_duration_days
-                    bc_unit = AnalysisUnit.PER_VISITOR
+                    daily_visitors = len(analysis_df) / test_duration_days
+                    bc_counts = None
                 else:
                     daily_visitors = sum(visitor_counts.values()) / test_duration_days
-                    bc_unit = AnalysisUnit.PER_TRANSACTION
+                    bc_counts = {str(k): v for k, v in visitor_counts.items()}
 
-                group_stats = summary_stats.to_dict(orient="index")
                 bc_results = ContinuousMetricEngine().run_business_case(
                     group_stats=group_stats,
-                    control_label=control_label,
-                    unit=bc_unit,
+                    control_label=control,
+                    unit=config.unit,
                     daily_visitors=daily_visitors,
-                    visitor_counts=visitor_counts,
+                    visitor_counts=bc_counts,
                     alternative=AlternativeHypothesis.TWO_SIDED,
                     projection_period=183,
+                    significance_by_variant=_significance_vs_control(result, control, labels),
                 )
 
                 for res in bc_results:
-                    st.write(f"**{res['variant']}** vs **{control_label}**")
+                    st.write(f"**{res['variant']}** vs **{control}**")
                     bc_col1, bc_col2 = st.columns(2)
                     bc_col1.metric(
                         f"Projected Impact ({res['projection_period']}d)",
@@ -1044,32 +505,27 @@ def perform_stat_tests_and_conclusions(
 
         st.write("---")
 
-    # --- Conclusion ---
+    # --- 4. Conclusion ---
     st.write("### 4. Conclusion")
+    effect_size = result.effect_size
 
-    if pd.isna(p_value):
-        st.warning("Conclusion cannot be drawn due to errors in statistical testing.")
-    elif is_significant:
-        st.success(f"**A statistically significant difference was detected between the groups (p = {p_value:.4g}, using {test_name}).**")
-        
+    if result.is_significant:
+        st.success(f"**A statistically significant difference was detected between the groups (p = {result.p_value:.4g}, using {result.test_name}).**")
+
         if num_groups > 2:
             if significant_pairs:
                 st.write("**Significant pairwise differences** (after multiple-comparison correction):")
                 for pair in significant_pairs:
                     st.markdown(f"* {pair}")
                 st.markdown("_Refer to the summary statistics above to see which side of each pair is higher._")
-            elif approach == "Gamma GLM (Best for Revenue)":
-                st.write("The Likelihood Ratio Test indicates that variant means differ significantly. See the **Pairwise Post-Hoc Comparisons** above to identify which treatments outperformed the control.")
-            elif is_count:
-                st.write("The Likelihood Ratio Test indicates that variant means differ significantly. See the **Pairwise Post-Hoc Comparisons** above to identify which treatments outperformed the control.")
-            elif posthoc_results is not None:
+            elif posthoc:
                 st.write("The global test is significant, but no individual pair remained significant after multiple-comparison correction. See the post-hoc table above.")
             else:
-                st.write("See the post-hoc test results above to determine which specific groups differ significantly.")
-        
+                st.write("No post-hoc comparisons were available; see the warnings above.")
+
         elif num_groups == 2:
-            st.write(f"The difference between the two groups ('{unique_groups[0]}' and '{unique_groups[1]}') is statistically significant.")
-        
+            st.write(f"The difference between the two groups ('{labels[0]}' and '{labels[1]}') is statistically significant.")
+
         # Effect Size Guidance
         if effect_size is not None:
             st.write(f"_Consider the effect size ({effect_size:.4f}) to evaluate the practical importance of this difference._")
@@ -1077,12 +533,12 @@ def perform_stat_tests_and_conclusions(
             st.write("_Consider evaluating the relative lift to understand the practical importance of this difference._")
 
     else:
-        st.info(f"**No statistically significant difference was detected between the groups (p = {p_value:.4g}, using {test_name}).**")
+        st.info(f"**No statistically significant difference was detected between the groups (p = {result.p_value:.4g}, using {result.test_name}).**")
         # Add advice on checking effect size even if not significant
         if effect_size is not None:
-             st.write(f"_The observed differences are likely due to chance. The effect size ({effect_size:.4f}) may indicate the magnitude of any observed, non-significant difference._")
+            st.write(f"_The observed differences are likely due to chance. The effect size ({effect_size:.4f}) may indicate the magnitude of any observed, non-significant difference._")
         else:
-             st.write("_The observed differences are likely due to chance. Consider calculating the effect size if understanding the magnitude of non-significant differences is important._")
+            st.write("_The observed differences are likely due to chance. Consider calculating the effect size if understanding the magnitude of non-significant differences is important._")
         st.markdown("_If a meaningful difference was expected, potential reasons include insufficient data (low power) or a truly small effect. Consider effect size and sample size._")
 
     st.write("---")
@@ -1227,6 +683,19 @@ def run():
             if n_zeros > 0:
                 st.info(f"Per-transaction analysis will exclude {n_zeros:,} zero-value row(s) (non-orders).")
 
+        # --- Control variant (one selector for post-hocs and business case) ---
+        control_label_input = st.selectbox(
+            "Select the control (baseline) variant:",
+            df['experience_variant_label'].unique(),
+            key="control_label",
+            help=(
+                "Used as the baseline for the post-hoc comparisons of the Gamma and "
+                "Negative Binomial tests (3+ variants) and for the business case. "
+                "The Tukey, Games-Howell and Dunn post-hocs compare all pairs and "
+                "don't need a control."
+            ),
+        )
+
         # --- Business case (optional) ---
         st.write("#### Business Case (optional)")
         include_business_case = st.checkbox(
@@ -1239,15 +708,9 @@ def run():
         )
         test_duration_days = None
         visitor_counts_input = None
-        control_label_input = None
         if include_business_case:
             test_duration_days = st.number_input(
                 "Test duration so far (days):", min_value=1, value=14, step=1,
-            )
-            control_label_input = st.selectbox(
-                "Select the control (baseline) variant for the business case:",
-                df['experience_variant_label'].unique(),
-                key="bc_control_label",
             )
             if unit == "per_transaction":
                 st.caption(
@@ -1304,7 +767,7 @@ def run():
                 )
                 count_max_unique_ratio = st.number_input(
                     "Max distinct-values / row-count ratio (%) to still call it a count metric",
-                    min_value=0.1, max_value=100.0, value=5.0, step=0.5,
+                    min_value=0.1, max_value=99.9, value=5.0, step=0.5,
                     help=(
                         "Fallback for large datasets: even if distinct values exceed "
                         "the cap above, the KPI is still treated as a count metric if "
@@ -1327,13 +790,33 @@ def run():
             elif method == 'Percentile':
                 percentile = st.selectbox("Select percentile for Winsorization:", [90, 95, 99])
 
+        # Detection threshold: the chosen SD count, else a default of 5 SD
+        # (for reporting under None / Log Transform / Percentile, and for
+        # Removal + Percentile).
+        detect_k = outlier_stdev if method == 'Standard Deviation' else 5
         with st.spinner("Scanning for outliers…"):
-            outliers_mask, initial_model, large_file_threshold = detect_outliers(df, kpi, outlier_stdev if method == 'Standard Deviation' else 5)  # Default 5 STD for detection purposes
-        #st.write(f"Number of detected outliers: {outliers_mask.sum()}")
-        if (len(df) >= large_file_threshold) and (outliers_mask.sum() > 0):
-            st.warning(f"{outliers_mask.sum()} Outliers detected in a large dataset. The IQR method was used for outlier detection for efficient computation. You can adjust the outlier handling method in the options above.")
-        elif (len(df) < large_file_threshold) and (outliers_mask.sum() > 0):
-            st.warning(f"{outliers_mask.sum()} Outliers detected in a relatively small dataset. The OLS method was used for outlier detection. You can adjust the outlier handling method in the options above.")
+            try:
+                outlier_res = ContinuousMetricEngine.detect_outliers(
+                    df, kpi, group_col='experience_variant_label',
+                    threshold=detect_k, exclude_zeros=True,
+                )
+                outliers_mask = pd.Series(outlier_res.mask, index=df.index)
+            except Exception as e:
+                st.error(f"Error during outlier detection: {e}")
+                outlier_res = None
+                outliers_mask = pd.Series(False, index=df.index)
+
+        if outlier_res is not None:
+            st.info(f"Dataset has {len(df):,} rows ({outlier_res.n_considered:,} non-zero).")
+            if outlier_res.n_outliers > 0:
+                if outlier_res.method == "per_variant_sd":
+                    how = (f"With more than 10,000 non-zero rows, values outside each variant's "
+                           f"mean ± {detect_k} standard deviations were flagged.")
+                else:
+                    how = (f"An OLS influence check was used: a row is flagged when its studentized "
+                           f"residual, leverage or DFFITS exceeds its {detect_k}-SD threshold.")
+                st.warning(f"{outlier_res.n_outliers:,} outlier(s) detected. {how} Zero-value rows are "
+                           "never flagged. You can adjust the outlier handling method in the options above.")
 
         # Distribution charts. For zero-inflated per-visitor data, chart the
         # converting (non-zero) rows so the zero spike doesn't crush the scale.
@@ -1388,7 +871,11 @@ def run():
 
             # --- Outlier Handling ---
             if outlier_handling == 'Winsorizing (STD/Percentile)':
-                processed_df, lower_cap, upper_cap, cap_desc = winsorize_data(processed_df, kpi, method, outlier_stdev, percentile)
+                # FOE's winsorize_series with exclude_zeros=True: caps come from
+                # the non-zero rows and zero rows stay at 0.
+                processed_df, lower_cap, upper_cap, cap_desc = winsorize_continuous_data(
+                    processed_df, kpi, method, outlier_stdev, percentile,
+                )
 
                 # Display a message based on the description returned by the function
                 if lower_cap is not None and upper_cap is not None:
@@ -1410,15 +897,30 @@ def run():
             elif outlier_handling == 'Removal':
                 # Align the precomputed mask to the (possibly zero-filtered) rows.
                 mask_aligned = outliers_mask.reindex(processed_df.index, fill_value=False)
+                variants_before = set(processed_df['experience_variant_label'].unique())
                 processed_df = processed_df[~mask_aligned]
                 st.write(f"Outliers removed: {int(mask_aligned.sum())} rows affected.")
+                emptied = variants_before - set(processed_df['experience_variant_label'].unique())
+                if emptied:
+                    st.warning(
+                        f"Outlier removal removed every row of variant(s) "
+                        f"{', '.join(repr(str(v)) for v in sorted(emptied, key=str))}. This happens "
+                        "when a variant is much smaller than the others (its rows all get high "
+                        "leverage). Consider Winsorizing or a higher threshold instead."
+                    )
             else:
                 st.warning("No outlier handling applied.")
 
             action_bar.progress(45, text="Fitting model…")
 
-            # --- Refit the model after outlier handling ---
-            model_after = smf.ols(f'{kpi} ~ C(experience_variant_label)', data=processed_df).fit()
+            # --- Refit the OLS model after outlier handling ---
+            # Only used for the residual charts below; the tests run in FOE.
+            model_after = None
+            if analysis_approach != "Gamma GLM (Best for Revenue)":
+                try:
+                    model_after = smf.ols(f'{kpi} ~ C(experience_variant_label)', data=processed_df).fit()
+                except Exception as e:
+                    st.warning(f"Could not fit the OLS model for the residual charts: {e}")
 
             action_bar.progress(60, text="Rendering diagnostic charts…")
 
@@ -1436,7 +938,7 @@ def run():
                 st.caption(proc_note)
             plt.clf()
             
-            if analysis_approach != "Gamma GLM (Best for Revenue)":
+            if model_after is not None:
                 st.write("### Refitted QQ Plot")
                 influence = model_after.get_influence()
                 std_residuals = pd.Series(influence.resid_studentized_internal)
@@ -1487,13 +989,13 @@ def run():
 
             action_bar.progress(80, text="Running statistical tests…")
             perform_stat_tests_and_conclusions(
-                processed_df, kpi, model_after, analysis_approach, unit,
+                processed_df, kpi, analysis_approach, unit,
+                control_label=control_label_input,
                 count_max_unique=count_max_unique,
                 count_max_unique_ratio=count_max_unique_ratio / 100.0,
                 include_business_case=include_business_case,
                 test_duration_days=test_duration_days,
                 visitor_counts=visitor_counts_input,
-                control_label=control_label_input,
             )
             action_bar.progress(100, text="Analysis complete.")
             action_bar.empty()

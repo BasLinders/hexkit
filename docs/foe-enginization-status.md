@@ -20,7 +20,7 @@ Legend: ✅ enginized · ⚠️ partially enginized · ❌ not enginized ·
 | SRM Check | ✅ Yes | `foe.srm` | — |
 | Experiment Analysis | ✅ Yes | Bayesian path (`foe.bayesian`); frequentist z-test, p-values, significance, difference CI, Šidák, non-inferiority, variance factor φ, FPR/FNDR risk and monetary impact (`foe.frequentist`); SRM check (`foe.srm`) | Per-variant CIs (no FOE equivalent) |
 | Small Sample Analysis | ✅ Yes | `foe.frequentist` (Boschloo, z-test synthesis, Šidák) | — |
-| User Level Analysis | ⚠️ Partial | Business case only (`foe.continuous`) | Gamma/NegBin tests, outlier handling, ANOVA/Tukey/Kruskal/Mann-Whitney |
+| User Level Analysis | ✅ Yes | `foe.continuous`: test selection and all tests (ANOVA, Welch, Kruskal-Wallis, Mann-Whitney, Gamma / two-part hurdle LRT, Negative Binomial LRT), post-hocs, effect sizes, outlier detection, winsorizing, business case | Outlier *removal* (row filter), log1p transform, charts |
 | Behavioral Analysis | ✅ Yes | `foe.behavioral` | Outlier *removal* (row filter; FOE has no removal step) |
 | Interaction Analysis | ✅ Yes | `foe.interaction` | — |
 | Sequential Analysis | ✅ Yes | `foe.sequential`, `foe.bayesian` (revenue overlay) | — |
@@ -35,7 +35,7 @@ Legend: ✅ enginized · ⚠️ partially enginized · ❌ not enginized ·
 | `foe.core` | Input/output models, validators, priors | ✅ Everywhere FOE is used |
 | `foe.frequentist` | z-test, Šidák, power, non-inferiority, Boschloo, FPR/FNDR risk, variance factor, monetary impact | ✅ Small Sample, Automation, Experiment Analysis |
 | `foe.bayesian` | Beta-Binomial Monte Carlo, lift prior, monetary projection | ✅ Experiment Analysis, Sequential, Automation, `utility/lift_prior_ui.py` |
-| `foe.continuous` | Revenue/AOV metrics, Gamma/NegBin, comparison suite, business case | ⚠️ Pre-Test and Automation; User Level Analysis uses only the business case |
+| `foe.continuous` | Revenue/AOV metrics, Gamma/NegBin, comparison suite, post-hocs, outlier helpers, business case | ✅ Pre-Test, Automation, User Level Analysis |
 | `foe.pretest` | Sample size / MDE / power | ✅ Pre-Test, Automation |
 | `foe.pretest.forecasting` | Prophet-based traffic forecasting | ✅ Pre-Test, Automation |
 | `foe.sequential` | Always-valid LLR sequential testing | ✅ Sequential Analysis |
@@ -181,22 +181,91 @@ native implementation was verified on 205 inputs.
 Enginized: uses `foe.frequentist.boschloo.BoschlooEngine` for exact tests and
 `FrequentistEngine.run_synthesis` / `apply_sidak` for the z-test comparison.
 
-### ⚠️ `pages/user_level_analysis.py` — Revenue / per-user metrics
-Mostly **not** enginized. Only the business case runs on FOE
-(`ContinuousMetricEngine.run_business_case`). The page's own code does
-everything else, although `ContinuousMetricEngine` has equivalents:
+### ✅ `pages/user_level_analysis.py` — Revenue / per-user metrics
+Enginized. The page builds a `ContinuousMetricConfig` and calls
+`ContinuousMetricEngine.run_comparison_suite`, which validates the data and
+chooses and runs the test:
+- heuristic path: the count-KPI gate sends count KPIs to a Negative Binomial
+  LRT. Otherwise D'Agostino K² and Levene choose Standard ANOVA, Welch's
+  ANOVA, Kruskal-Wallis or Mann-Whitney U, with the matching all-pairs
+  post-hoc (Tukey HSD, Games-Howell, Dunn with Bonferroni) and an effect size
+- Gamma path: Gamma LRT (per transaction) or two-part hurdle LRT (per
+  visitor), with LRT post-hocs against the control (Bonferroni)
+- outlier detection: `ContinuousMetricEngine.detect_outliers` (OLS influence
+  up to 10,000 non-zero rows, per-variant SD above; zero rows never flagged)
+- winsorizing: `winsorize_series(..., exclude_zeros=True)`, through
+  `utility/automation_engine.winsorize_continuous_data`, which Automation
+  uses too
+- business case: `run_business_case` on the result's `summary_stats`
 
-| Hexkit-native | FOE equivalent |
-|---|---|
-| `fit_gamma`, `fit_unit_model`, `perform_gamma_test`, `run_gamma_posthoc` | `fit_gamma`, `fit_unit_model`, `run_gamma_posthoc` |
-| `is_count_kpi`, `fit_negbin`, `perform_negbin_test`, `run_negbin_posthoc` | `is_count_kpi`, `fit_negbin`, `run_negbin_posthoc` |
-| `detect_outliers`, `winsorize_data` | `detect_outliers_ols`, `winsorize_series` |
-| ANOVA / Tukey / Kruskal-Wallis / Mann-Whitney in `perform_stat_tests_and_conclusions` | `run_comparison_suite` |
+Still in the page: outlier *removal* (a row filter on FOE's mask), the log1p
+transform (FOE has no transform step), the charts and the Q-Q / residual
+plots (from an OLS refit that only feeds the charts), and the business case
+UI. The page no longer imports pingouin or scikit-posthocs, and both have
+left `requirements.txt`.
 
-Feature parity needs checking before migrating. For example, FOE's comparison
-suite uses Welch's ANOVA (pingouin) for unequal variances and has no Tukey
-post-hoc step. The old version of this doc listed this page as fully
-enginized; that was wrong.
+Checked against the old page code on 1,536 random cases: per transaction
+and per visitor × heuristic and Gamma × 2–5 variants × normal,
+heteroscedastic, skewed and count KPIs × with and without zeros × six
+outlier modes. Separately, 120 outlier checks on files with more than 10,000
+non-zero rows.
+- Outlier masks (both methods), winsorize caps and the processed data:
+  identical.
+- Standard ANOVA, Kruskal-Wallis and Mann-Whitney: p-values and statistics
+  identical. Welch's ANOVA within 2e-14. Effect sizes within 7e-16 (η²_H
+  compared after clamping). Summary statistics identical.
+- Gamma and two-part hurdle: p-values moved by up to 0.012 (exact Gamma
+  MLE). No verdict flips in 744 cases.
+- Automation's `winsorize_continuous_data`: identical caps, values, dtype
+  and descriptions on 3,600 calls.
+
+Behaviour changes:
+- Dunn post-hoc pairs are labelled correctly. The old page labelled its
+  matrix in CSV order but computed it in sorted order, so pairs were
+  mislabelled whenever the file wasn't sorted (164 of 209 Dunn cases in the
+  parity run).
+- Negative Binomial post-hocs use 1 degree of freedom per pair. The old page
+  kept every variant as a dummy column, all-zero outside the pair, so it
+  tested on k−1 df and missed significant pairs (10 cases). The same bug
+  inflated the global df after outlier removal had emptied a variant
+  (1 case: p 0.103 → 0.013). The Negative Binomial LR statistics match the
+  old code to within 1e-6 everywhere; every p-value difference on that path
+  comes from this df bug.
+- One pair where outlier removal left a variant with only zeros (true
+  separation) is no longer reported as significant. FOE refuses the fit; the
+  old page reported p = 0.012 from a fit that wasn't identified. The 2 global
+  tests the old page couldn't fit now give p = 1 with a warning.
+- Underdispersed counts (e.g. items per order, all ≥ 1) are tested as
+  Poisson, the limit of the Negative Binomial: FOE reports α = 0 and the page
+  says so. Since FOE `dc13050` (#24) their p-values equal the old page's
+  exactly (540 seeded runs, max difference 0). At `11ba165` FOE returned
+  p = 1 for these, which is why the pin is `dc13050`.
+- An unfittable model gives p = 1 with a warning. Before, the page said
+  "conclusion cannot be drawn".
+- η²_H is clamped at 0; the old page showed negative values (91 cases).
+  Standard ANOVA now reports η² (before: no effect size).
+- Post-hoc tables read "X vs Y" with X − Y; Tukey and Games-Howell add the
+  mean difference and its CI. Dunn is a long table instead of a matrix.
+- The control variant is chosen once, before the analysis. It's used for the
+  Gamma / Negative Binomial post-hocs and for the business case.
+- Business-case conclusions say whether each variant differed significantly
+  from the control. Before, every conclusion said "not statistically
+  significant".
+- The outlier message names the method actually used. Before, large files
+  claimed "IQR", but it was per-variant SD. When removal empties a variant,
+  the page now says so, and FOE stops the analysis if fewer than two
+  variants remain.
+- The count-ratio input is capped at 99.9% (FOE requires a ratio below 1).
+- The page has no α input, so the analysis stays at α = 0.05 throughout.
+
+The same re-pin gives Pre-Test Analysis the exact Gamma MLE in
+`fit_gamma`: on 500 random samples the fitted CV moved by a median of
+1e-5 (at most 2%), and the log-likelihood is never lower.
+
+Not changed, but worth knowing: the OLS leverage rule flags *every* row of a
+variant with fewer than N / (threshold × number of variants) non-zero rows.
+At a 90/10 split and a 2–4 SD threshold, "Removal" deletes the whole small
+variant. Old and new code agree on this.
 
 ### ✅ `pages/behavioral_analysis.py` — Behavioral metric analysis
 Enginized: outlier detection (IQR / OLS studentized residuals), winsorizing,
@@ -253,18 +322,15 @@ them.
 
 ## Recommended order of remaining work
 
-1. **User Level Analysis → `foe.continuous`.** A large migration. First decide
-   on the differences in the comparison suite (Welch's ANOVA vs. standard ANOVA
-   + Tukey).
-2. **`foe.viz`.** Adopt when chart code gets consolidated; not urgent.
+1. **`foe.viz`.** Adopt when chart code gets consolidated; not urgent.
 
 Done since the previous version of this doc (2026-09-14): Sequential Analysis,
 Interaction Analysis, SRM Check, Behavioral Analysis, Experiment Analysis
-(frequentist path) and Pre-Test Analysis. Small Sample Analysis
+(frequentist path), Pre-Test Analysis and User Level Analysis. Small Sample Analysis
 was built on FOE from the start. Experimentation Growth is now Hexkit-native by
 decision.
 
 *This document reflects the code as of 2026-11-17 (branch `main`, FOE
-pinned at `d6a9ec3`). Re-check each
+pinned at `dc13050`). Re-check each
 page's `foe` imports before relying on this for planning; both repos are under
 active development.*
