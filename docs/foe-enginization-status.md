@@ -18,7 +18,7 @@ Legend: ✅ enginized · ⚠️ partially enginized · ❌ not enginized ·
 |---|---|---|---|
 | Pre-Test Analysis | ⚠️ Partial | `foe.pretest`, `foe.continuous` (sample size, MDE, continuous power, Gamma/NegBin fits) | Binomial power (statsmodels), seasonal Prophet forecast |
 | SRM Check | ✅ Yes | `foe.srm` | — |
-| Experiment Analysis | ⚠️ Partial | Bayesian path (`foe.bayesian`); frequentist z-test, p-values, significance, difference CI, Šidák, non-inferiority, FPR/FNDR risk and monetary impact (`foe.frequentist`); SRM check (`foe.srm`) | Per-variant CIs, variance factor |
+| Experiment Analysis | ✅ Yes | Bayesian path (`foe.bayesian`); frequentist z-test, p-values, significance, difference CI, Šidák, non-inferiority, variance factor φ, FPR/FNDR risk and monetary impact (`foe.frequentist`); SRM check (`foe.srm`) | Per-variant CIs (no FOE equivalent) |
 | Small Sample Analysis | ✅ Yes | `foe.frequentist` (Boschloo, z-test synthesis, Šidák) | — |
 | User Level Analysis | ⚠️ Partial | Business case only (`foe.continuous`) | Gamma/NegBin tests, outlier handling, ANOVA/Tukey/Kruskal/Mann-Whitney |
 | Behavioral Analysis | ✅ Yes | `foe.behavioral` | Outlier *removal* (row filter; FOE has no removal step) |
@@ -33,7 +33,7 @@ Legend: ✅ enginized · ⚠️ partially enginized · ❌ not enginized ·
 | FOE module | Purpose | Used in Hexkit? |
 |---|---|---|
 | `foe.core` | Input/output models, validators, priors | ✅ Everywhere FOE is used |
-| `foe.frequentist` | z-test, Šidák, power, non-inferiority, Boschloo, FPR/FNDR risk, monetary impact | ⚠️ Fully in Small Sample + Automation; only partly in Experiment Analysis |
+| `foe.frequentist` | z-test, Šidák, power, non-inferiority, Boschloo, FPR/FNDR risk, variance factor, monetary impact | ✅ Small Sample, Automation, Experiment Analysis |
 | `foe.bayesian` | Beta-Binomial Monte Carlo, lift prior, monetary projection | ✅ Experiment Analysis, Sequential, Automation, `utility/lift_prior_ui.py` |
 | `foe.continuous` | Revenue/AOV metrics, Gamma/NegBin, comparison suite, business case | ⚠️ Pre-Test and Automation; User Level Analysis uses only the business case |
 | `foe.pretest` | Sample size / MDE / power | ⚠️ Pre-Test (binomial power still via statsmodels), Automation |
@@ -76,16 +76,19 @@ Enginized: the chi-squared goodness-of-fit test runs in
 computes expected counts for the chart and table. Parity with the previous
 native implementation was verified on 205 inputs.
 
-### ⚠️ `pages/experiment_analysis.py` — Frequentist & Bayesian analysis
+### ✅ `pages/experiment_analysis.py` — Frequentist & Bayesian analysis
 - **Bayesian path: enginized.** Uses `foe.bayesian.operations.BayesianEngine`
   (`run_probability_analysis`, `simulate_uplift_distributions`,
   `run_monetary_projection`) and `get_lift_prior`.
-- **Frequentist path: partial.** These come from FOE:
+- **Frequentist path: enginized.** These come from FOE:
   - z-test, p-values, significance verdict and difference CI:
     `FrequentistEngine.run_synthesis` (unpooled SE scaled by φ, Šidák alpha
     at 3+ variants, CI that follows the selected tail)
   - Šidák alpha for display and FPR/FNDR: `foe.frequentist.operations.apply_sidak`
     (the same function `run_synthesis` uses)
+  - variance factor φ from historical daily data:
+    `FrequentistEngine.calculate_aggregate_variance_factor` (day-of-week
+    controlled, n/(n−k) dof correction, clipped to [0.10, 5.0], regime)
   - non-inferiority: `foe.frequentist.confidence.compute_non_inferiority`
     (one-sided, at the page's confidence level, using the φ-adjusted
     unpooled SE)
@@ -99,7 +102,7 @@ native implementation was verified on 205 inputs.
     / `generate_monetary_conclusion`
 
   Šidák, the SRM check, non-inferiority and the z-test were switched over on
-  2026-11-17. Parity with the old inline code was checked on random inputs:
+  2026-11-17 (#117); the variance factor followed. Parity with the old inline code was checked on random inputs:
   - Šidák and SRM (5,000 inputs): Šidák matched exactly, the SRM p-value
     matched to within 2e-16, and there were no verdict flips.
   - Non-inferiority (20,000 inputs, including zero-SE cases): the p-value
@@ -110,6 +113,9 @@ native implementation was verified on 205 inputs.
     difference CI matched to within 6e-17, and there were no significance
     flips. Very small p-values are now more precise: FOE uses `norm.sf`,
     where the old `1 - norm.cdf` underflowed to 0.
+  - Variance factor (5,000 synthetic histories, 14–120 days, campaign
+    spikes, shuffled row order): φ, the clipped factor and the clipped
+    flag matched exactly.
 
   Behaviour changes from the z-test switch:
   - Significance is now p < α (FOE's rule, the same as
@@ -125,17 +131,21 @@ native implementation was verified on 205 inputs.
     needs at least 1 visitor." FOE's input model rejects it.
   - `z_stats` was dropped from the results dict; nothing read it.
 
-  FOE requires 0 < margin < 1, so the page's margin input now starts at 0.1%
-  instead of 0%. With a zero SE, FOE reports p = 1.0 instead of NaN; the
-  verdict is "not non-inferior" either way.
+  Behaviour changes from the non-inferiority switch: FOE requires
+  0 < margin < 1, so the page's margin input now starts at 0.1% instead of
+  0%. With a zero SE, FOE reports p = 1.0 instead of NaN; the verdict is
+  "not non-inferior" either way.
 
-  `calculate_frequentist_statistics` still computes the following in the page
-  with `scipy.stats.norm`:
+  Behaviour changes from the variance-factor switch: the page now uses FOE's
+  regimes (stable < 0.80 ≤ neutral < 1.05 ≤ noisy < 1.50 ≤ high_noise)
+  instead of its own (0.90 / 1.15 / 1.50). The visible change: φ between
+  1.05 and 1.15 now gets the orange "SE inflated" message instead of the
+  green "clean" one. The page keeps its own CSV validation
+  (`validate_timeseries_data`) for readable error messages.
 
-  | Hexkit-native | FOE equivalent |
-  |---|---|
-  | Per-variant (marginal) conversion-rate CIs | none; `run_synthesis` only returns the difference CI |
-  | `calculate_timeseries_reduction_factor` | `FrequentistEngine.calculate_aggregate_variance_factor` |
+  Still computed in the page: the per-variant (marginal) conversion-rate
+  CIs. FOE has no equivalent (`run_synthesis` only returns the difference
+  CI), and they're simple enough to stay.
 
   The page no longer computes power at all, so there's nothing to migrate
   there. `norm.pdf` / `norm.ppf` in the distribution charts are chart code,
@@ -217,26 +227,21 @@ them.
 
 ## Recommended order of remaining work
 
-1. **Experiment Analysis frequentist core → `foe.frequentist`.** This is the
-   biggest remaining gap, on one of the most-used pages. Šidák, SRM,
-   non-inferiority and the z-test are done. What's left is the variance
-   factor: FOE's `calculate_aggregate_variance_factor` must match the page's
-   residual-dof correction, clipping and regime labels. The per-variant
-   marginal CIs have no FOE equivalent and can stay in the page.
-2. **Pre-Test seasonal forecast → `foe.pretest.forecasting.TrafficForecastingEngine`.**
+1. **Pre-Test seasonal forecast → `foe.pretest.forecasting.TrafficForecastingEngine`.**
    This removes the second Prophet integration; `automation_engine.py` already
    uses the FOE version.
-3. **User Level Analysis → `foe.continuous`.** A large migration. First decide
+2. **User Level Analysis → `foe.continuous`.** A large migration. First decide
    on the differences in the comparison suite (Welch's ANOVA vs. standard ANOVA
    + Tukey).
-4. **Pre-Test binomial power → `PretestEngine.calculate_power_binomial`.**
+3. **Pre-Test binomial power → `PretestEngine.calculate_power_binomial`.**
    Needs a decision first, because it changes the method from Cohen's h to an
    unpooled normal approximation. At the same time, replace the page's calls to
    FOE private helpers with public API.
-5. **`foe.viz`.** Adopt when chart code gets consolidated; not urgent.
+4. **`foe.viz`.** Adopt when chart code gets consolidated; not urgent.
 
 Done since the previous version of this doc (2026-09-14): Sequential Analysis,
-Interaction Analysis, SRM Check and Behavioral Analysis. Small Sample Analysis
+Interaction Analysis, SRM Check, Behavioral Analysis and Experiment Analysis
+(frequentist path). Small Sample Analysis
 was built on FOE from the start. Experimentation Growth is now Hexkit-native by
 decision.
 
