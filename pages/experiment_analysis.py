@@ -13,14 +13,15 @@ import matplotlib.patches as mpatches
 import matplotlib.ticker as mticker
 from matplotlib import colormaps
 import plotly.graph_objects as go
-from scipy.stats import beta, norm, chisquare
+from scipy.stats import norm
 import math
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
 
-from foe.frequentist.operations import FrequentistEngine
-from foe.frequentist.confidence import compute_interval_difference
+from foe.frequentist.operations import FrequentistEngine, apply_sidak
+from foe.frequentist.confidence import compute_non_inferiority
 from foe.frequentist import risk as foe_risk
+from foe.srm.operations import SRMEngine
 from foe.core.models import AlternativeHypothesis, BusinessCaseInput, ExperimentInput
 from foe.bayesian.operations import (
     BayesianEngine,
@@ -1146,53 +1147,6 @@ def render_variance_reduction_ui() -> float:
     return reduction_factor
 
 
-def calculate_non_inferiority(
-    cr_control: float,
-    cr_challenger: float,
-    se_control: float,
-    se_challenger: float,
-    margin: float,
-    confidence_noninf: int = 95,
-) -> Dict[str, Any]:
-    """
-    The non-inferiority test now lives in the computation layer (instead
-    of the display function), so it can be unit-tested and exported. SEs passed
-    in already incorporate the overdispersion reduction_factor.
-
-    One-sided NI test: H0 = "challenger is worse than control by more than the
-    margin". Rejecting H0 means the challenger is non-inferior.
-    """
-    se_unpooled = math.sqrt(se_control ** 2 + se_challenger ** 2)
-    observed_diff = cr_challenger - cr_control
-    alpha_ni = 1 - (confidence_noninf / 100)
-
-    if se_unpooled <= 0:
-        return {
-            "se_unpooled": 0.0,
-            "z_stat": float("nan"),
-            "p_value": float("nan"),
-            "lower_bound_diff": observed_diff,
-            "margin": margin,
-            "alpha": alpha_ni,
-            "passed": False,
-        }
-
-    z_stat = (observed_diff + margin) / se_unpooled
-    p_value = 1 - norm.cdf(z_stat)
-    z_crit = norm.ppf(1 - alpha_ni)
-    lower_bound_diff = observed_diff - (z_crit * se_unpooled)
-
-    return {
-        "se_unpooled": se_unpooled,
-        "z_stat": z_stat,
-        "p_value": p_value,
-        "lower_bound_diff": lower_bound_diff,
-        "margin": margin,
-        "alpha": alpha_ni,
-        "passed": p_value <= alpha_ni,
-    }
-
-
 def plot_variance_adjusted_comparison(results, visitor_counts) -> go.Figure:
     """
     Plots the probability density curves for each variant after variance
@@ -1299,8 +1253,10 @@ def calculate_frequentist_statistics(
     non_inferiority_margin: float = 0.01,
     confidence_noninf: int = 95,
 ) -> Dict[str, Any]:
-    if sum(visitor_counts) == 0 or any(v < 0 for v in visitor_counts):
-        raise ValueError("Visitor counts must be positive and sum to a non-zero value.")
+    if any(v <= 0 for v in visitor_counts):
+        # FOE's ExperimentInput rejects zero-visitor variants; fail here with a
+        # readable message instead of a raw pydantic validation error.
+        raise ValueError("Every variant needs at least 1 visitor.")
     if not (0 < confidence_level < 100):
         raise ValueError(
             f"confidence_level must be strictly between 0 and 100 (got {confidence_level}). "
@@ -1311,8 +1267,9 @@ def calculate_frequentist_statistics(
     num_variants = len(visitor_counts)
     alpha = 1 - (confidence_level / 100)
 
-    # Šidák family-wise alpha for 3+ variants.
-    sidak_alpha = 1 - (1 - alpha) ** (1 / (num_variants - 1)) if num_variants > 2 else alpha
+    # Šidák family-wise alpha for 3+ variants (FOE returns alpha unchanged
+    # for a single comparison).
+    sidak_alpha = apply_sidak(alpha, num_variants)
 
     conversion_rates = [c / v if v > 0 else 0 for c, v in zip(conversion_counts, visitor_counts)]
     standard_errors = [
@@ -1336,52 +1293,44 @@ def calculate_frequentist_statistics(
     lowest_interval = min(lower_boundaries)
     highest_interval = max(upper_boundaries)
 
-    # The DIFFERENCE CI, by contrast, must reflect the selected tail: a
-    # one-sided Greater/Less test licenses only a lower/upper bound (the
-    # other side is +/-inf), matching the one-sided p-value computed below.
-    # Delegates to foe's compute_interval_difference (used by
-    # FrequentistEngine.run_synthesis) rather than re-deriving it, so this
-    # app's own CI and the shared engine's stay in lockstep.
-    alternative = _TAIL_TO_ALTERNATIVE[tail]
-    confidence_intervals_diff = []
-    for i in range(1, num_variants):
-        diff_cr = conversion_rates[i] - conversion_rates[0]
-        se_diff = np.sqrt(standard_errors[i] ** 2 + standard_errors[0] ** 2)
-        # Family-wise alpha (Šidák-corrected at 3+ variants) so the CI agrees
-        # with the significance verdict below.
-        ci_diff = compute_interval_difference(diff_cr, se_diff, alpha=sidak_alpha, alternative=alternative)
-        confidence_intervals_diff.append(ci_diff)
+    # Control-vs-challenger z-test, p-values, significance and difference CI
+    # all come from FOE's run_synthesis: unpooled SE scaled by the variance
+    # factor φ, Šidák-corrected alpha at 3+ variants, and a difference CI that
+    # follows the selected tail (one-sided tests leave the other side at
+    # +/-inf). Significance is p < alpha. When both arms sit at 0% or 100%
+    # (unpooled SE = 0), FOE falls back to the pooled SE for the p-value and
+    # Newcombe's interval for the CI, and sets a warning.
+    synthesis = FrequentistEngine().run_synthesis(
+        ExperimentInput(
+            visitors=[int(v) for v in visitor_counts],
+            conversions=[int(c) for c in conversion_counts],
+            alternative=_TAIL_TO_ALTERNATIVE[tail],
+            confidence_level=confidence_level / 100,
+            reduction_factor=reduction_factor,
+        )
+    )
+    p_values = [r.p_value for r in synthesis]
+    significant_results = [r.is_significant for r in synthesis]
+    confidence_intervals_diff = [tuple(r.ci_diff) for r in synthesis]
+    synthesis_warnings = [r.warning for r in synthesis]
 
-    observed = np.array(visitor_counts)
-    expected = np.array([sum(observed) / num_variants] * num_variants)
-    _, srm_p_value = chisquare(f_obs=observed, f_exp=expected)
+    # SRM check against an equal split (alpha = 0.01), via FOE's SRMEngine.
+    srm = SRMEngine.calculate_chi_squared(
+        observed=list(visitor_counts), expected=[1.0] * num_variants, alpha=0.01
+    )
+    srm_p_value = srm["p_value"]
 
-    # FIX #1: pooled_proportion was dead code and has been removed.
-
-    z_stats = [
-        (conversion_rates[i] - conversion_rates[0]) / np.sqrt(standard_errors[i] ** 2 + standard_errors[0] ** 2)
-        if (standard_errors[i] ** 2 + standard_errors[0] ** 2) > 0 else 0
-        for i in range(1, num_variants)
-    ]
-
-    if tail == 'Greater':
-        p_values = [1 - norm.cdf(z) for z in z_stats]
-    elif tail == 'Less':
-        p_values = [norm.cdf(z) for z in z_stats]
-    else:
-        p_values = [2 * (1 - norm.cdf(abs(z))) for z in z_stats]
-
-    significant_results = [p <= sidak_alpha for p in p_values]
-
-    # FIX #6: non-inferiority computed here for every challenger and stored.
+    # One-sided non-inferiority test for every challenger, via FOE. The SEs
+    # already include the overdispersion reduction_factor. A zero SE returns
+    # p = 1.0 / not non-inferior.
+    alpha_noninf = 1 - (confidence_noninf / 100)
     non_inferiority = [
-        calculate_non_inferiority(
-            cr_control=conversion_rates[0],
-            cr_challenger=conversion_rates[i],
-            se_control=standard_errors[0],
-            se_challenger=standard_errors[i],
+        compute_non_inferiority(
+            p_ctrl=conversion_rates[0],
+            p_chal=conversion_rates[i],
+            se_diff=math.sqrt(standard_errors[0] ** 2 + standard_errors[i] ** 2),
             margin=non_inferiority_margin,
-            confidence_noninf=confidence_noninf,
+            alpha=alpha_noninf,
         )
         for i in range(1, num_variants)
     ]
@@ -1403,12 +1352,13 @@ def calculate_frequentist_statistics(
         "lowest boundary": lowest_interval,
         "highest boundary": highest_interval,
         "standard_errors": standard_errors,
-        "z_stats": z_stats,
         "p_values": p_values,
         "is_significant": significant_results,
         "non_inferiority": non_inferiority,
         "insufficient_data": insufficient_data,
+        "synthesis_warnings": synthesis_warnings,
         "srm_p_value": srm_p_value,
+        "srm_mismatch": srm["is_mismatch"],
         "sidak_alpha": sidak_alpha,
         "alpha": alpha,
         "confidence_level": confidence_level,
@@ -1577,7 +1527,7 @@ def display_frequentist_summary(
         return
 
     num_variants = results['num_variants']
-    srm_p_value = results['srm_p_value']
+    srm_mismatch = results['srm_mismatch']
     is_significant = results['is_significant']
     p_values = results['p_values']
     insufficient_data = results['insufficient_data']
@@ -1589,7 +1539,7 @@ def display_frequentist_summary(
     alphabet = string.ascii_uppercase
 
     st.write("### SRM Check")
-    if srm_p_value > 0.01:
+    if not srm_mismatch:
         st.write("This test is <span style='color: #009900; font-weight: 600;'>valid</span>. The distribution is as expected.", unsafe_allow_html=True)
     else:
         st.write("This test is <span style='color: #FF6600; font-weight: 600;'>invalid</span>: The distribution of traffic shows a statistically significant deviation...", unsafe_allow_html=True)
@@ -1618,6 +1568,10 @@ def display_frequentist_summary(
         challenger_index_in_lists = i - 1
 
         st.write(f"### Test results for {alphabet[i]} vs {alphabet[0]}")
+
+        synthesis_warning = results['synthesis_warnings'][challenger_index_in_lists]
+        if synthesis_warning:
+            st.warning(synthesis_warning)
 
         control_ci = results['confidence_intervals'][0]
         challenger_ci = results['confidence_intervals'][i]
@@ -1675,12 +1629,11 @@ def display_frequentist_summary(
                 st.markdown(f" * **Conversion rate change for {alphabet[i]}:** {rel_change:.2f}%")
 
             if tail in ('Greater', 'Two-sided'):
-                # FIX #6: read the pre-computed non-inferiority result.
                 ni = non_inferiority[challenger_index_in_lists]
-                st.markdown(f" * **P-value (non-inferiority test):** {ni['p_value']:.4f} (margin: {ni['margin']*100:.1f}%)")
-                st.markdown(f" * **Lower Bound of Difference:** {ni['lower_bound_diff']*100:.2f}% (Limit: {-ni['margin']*100:.2f}%)")
+                st.markdown(f" * **P-value (non-inferiority test):** {ni['p_value']:.4f} (margin: {ni['margin_used']*100:.1f}%)")
+                st.markdown(f" * **Lower Bound of Difference:** {ni['lower_bound_diff']*100:.2f}% (Limit: {-ni['margin_used']*100:.2f}%)")
 
-                if ni['passed']:
+                if ni['is_non_inferior']:
                     st.success(f"Although not a winner, the non-inferiority test suggests that {alphabet[i]} is **not significantly worse** than {alphabet[0]} within the predefined margin.")
                 else:
                     st.warning(f"The non-inferiority test does not provide sufficient evidence to conclude that {alphabet[i]} performs at least as well as {alphabet[0]}.")
@@ -1723,8 +1676,8 @@ def display_frequentist_summary(
                 "(for example, 0 conversions in both variants)."
             )
         elif is_significant[challenger_index_in_lists]:
-            # Uses the page's own significance decision (p <= alpha) rather than
-            # foe_risk.assess_risk, which counts p == alpha as not significant.
+            # Significance comes from run_synthesis (p < alpha), the same rule
+            # foe_risk.assess_risk uses.
             fpr = foe_risk.false_positive_risk(alpha=fpr_alpha, power=power, prior=prior)
             fpr_at_p = foe_risk.fpr_at_p_value(
                 p_value=p_values[challenger_index_in_lists],
@@ -1953,7 +1906,9 @@ def run():
         suggest_small_sample_analysis(visitor_counts, conversion_counts, confidence_level)
         non_inferiority_margin = st.number_input(
             "Non-inferiority margin (absolute %)",
-            min_value=0.0, max_value=10.0, value=1.0, step=0.1,
+            # FOE's compute_non_inferiority requires 0 < margin < 1; a 0%
+            # margin would just be a one-sided superiority test.
+            min_value=0.1, max_value=10.0, value=1.0, step=0.1,
             help="Set the acceptable negative performance margin for non-significant results."
         ) / 100
         st.write("")
