@@ -16,7 +16,7 @@ Legend: ✅ enginized · ⚠️ partially enginized · ❌ not enginized ·
 
 | Page | Status | Runs on FOE | Still Hexkit-native |
 |---|---|---|---|
-| Pre-Test Analysis | ⚠️ Partial | `foe.pretest`, `foe.continuous` (sample size, MDE, continuous power, Gamma/NegBin fits) | Binomial power (statsmodels), seasonal Prophet forecast |
+| Pre-Test Analysis | ✅ Yes | `foe.pretest` incl. forecasting (MDE tables, sample size, power, seasonal forecast), `foe.continuous` (Gamma/NegBin fits) | — |
 | SRM Check | ✅ Yes | `foe.srm` | — |
 | Experiment Analysis | ✅ Yes | Bayesian path (`foe.bayesian`); frequentist z-test, p-values, significance, difference CI, Šidák, non-inferiority, variance factor φ, FPR/FNDR risk and monetary impact (`foe.frequentist`); SRM check (`foe.srm`) | Per-variant CIs (no FOE equivalent) |
 | Small Sample Analysis | ✅ Yes | `foe.frequentist` (Boschloo, z-test synthesis, Šidák) | — |
@@ -36,8 +36,8 @@ Legend: ✅ enginized · ⚠️ partially enginized · ❌ not enginized ·
 | `foe.frequentist` | z-test, Šidák, power, non-inferiority, Boschloo, FPR/FNDR risk, variance factor, monetary impact | ✅ Small Sample, Automation, Experiment Analysis |
 | `foe.bayesian` | Beta-Binomial Monte Carlo, lift prior, monetary projection | ✅ Experiment Analysis, Sequential, Automation, `utility/lift_prior_ui.py` |
 | `foe.continuous` | Revenue/AOV metrics, Gamma/NegBin, comparison suite, business case | ⚠️ Pre-Test and Automation; User Level Analysis uses only the business case |
-| `foe.pretest` | Sample size / MDE / power | ⚠️ Pre-Test (binomial power still via statsmodels), Automation |
-| `foe.pretest.forecasting` | Prophet-based traffic forecasting | ⚠️ Automation only; Pre-Test seasonal mode still calls Prophet directly |
+| `foe.pretest` | Sample size / MDE / power | ✅ Pre-Test, Automation |
+| `foe.pretest.forecasting` | Prophet-based traffic forecasting | ✅ Pre-Test, Automation |
 | `foe.sequential` | Always-valid LLR sequential testing | ✅ Sequential Analysis |
 | `foe.srm` | Sample Ratio Mismatch (chi-squared) | ✅ SRM Check, Experiment Analysis |
 | `foe.behavioral` | Outliers, transforms, Welch's t-test | ✅ Behavioral Analysis |
@@ -50,25 +50,51 @@ Legend: ✅ enginized · ⚠️ partially enginized · ❌ not enginized ·
 
 ## Detail per Hexkit surface
 
-### ⚠️ `pages/pre_test_analysis.py` — Pre-test sample size, MDE & power
-Mostly enginized. Sample size and MDE use `foe.pretest.operations.PretestEngine`,
-continuous-KPI power uses `PretestEngine._power_two_sample`, and the Gamma /
-NegBin baseline fits use `foe.continuous.operations.ContinuousMetricEngine`.
+### ✅ `pages/pre_test_analysis.py` — Pre-test sample size, MDE & power
+Enginized, using public FOE API only:
+- MDE tables: `PretestEngine.calculate_mde_table` (binomial) and
+  `calculate_mde_table_continuous` (with `variance_scaling`), including the
+  traffic-scenario sensitivity matrix
+- sample size: `calculate_fixed_sample_size` /
+  `calculate_fixed_sample_size_continuous`
+- power: `calculate_power_binomial` / `calculate_power_continuous`
+- seasonal mode: `foe.pretest.forecasting.TrafficForecastingEngine.run_seasonal_forecast`
+  plus `PretestEngine.calculate_mde_from_forecast`, the same pair Automation
+  uses
+- Gamma / NegBin baseline fits and per-visitor moments:
+  `ContinuousMetricEngine`, `PretestEngine.compound_per_visitor_moments`
 
-**Gaps:**
-- **Seasonal ("Prophet Forecast") mode** calls `prophet.Prophet` directly in
-  `run_prophet_forecast` instead of `foe.pretest.forecasting.TrafficForecastingEngine`.
-  `utility/automation_engine.py` already uses the FOE engine for the same job,
-  and its docstring notes the two are "functionally equivalent" but separately
-  implemented.
-- **Binomial power** (`calculate_power`) uses statsmodels' Cohen's h
-  (`proportion_effectsize` + `zt_ind_solve_power`). FOE's
-  `PretestEngine.calculate_power_binomial` uses an unpooled normal
-  approximation instead, so switching changes the numbers slightly and needs a
-  deliberate decision.
-- **Private API use:** the page calls FOE's private helpers (`_relative_mde`,
-  `_sample_size_per_variant`, `_power_two_sample`). These can change without
-  notice when the pinned FOE commit is bumped.
+The page no longer imports statsmodels or Prophet, and no longer calls FOE's
+private helpers.
+
+Since FOE `d6a9ec3` (#20, #21), power, sample size and MDE all target
+`run_synthesis`'s unpooled z-test (variance p1q1 + p2q2, or σ² + σ²_treat).
+Each MDE table is the exact inverse of the matching sample size, and power
+is the inverse of that in turn, so the three modes agree. Checked against
+the old page code on random inputs:
+- Continuous with equal variance (3,000 inputs: MDE table at several
+  traffic multipliers, sample size, power): identical.
+- Binomial: sample size is 0.1–15% higher, power 0–0.3 points lower, and
+  MDE 3–15% higher at realistic settings. MDE rises more only where it was
+  already above 100%. The old formula used 2·p1q1 and under-powered:
+  simulated real power fell to 74% for a planned 80% at p = 0.2% and a 50%
+  MDE.
+- Round trip: week n → MDE → sample size gives n back (±1 visitor), and
+  power at that n equals the target within 3e-4. This holds for binomial and
+  for continuous with CV-constant.
+- Seasonal forecast: the Prophet point forecasts are identical to the old
+  code. The interval bands vary from run to run (Prophet samples them), as
+  they did before.
+
+Behaviour changes:
+- The continuous variance assumption (equal vs. constant CV) is now shown in
+  MDE and seasonal mode too, not just sample size and power. Under constant
+  CV a week with too little volume for any lift to reach the target power
+  shows "N/A".
+- Sample size mode now refuses a binomial MDE that would push the treatment
+  rate above 100%. Before, it warned and computed with a clipped variance.
+- Seasonal mode needs at least 14 days of history (FOE's minimum) and shows
+  FOE's forecast summary under the chart.
 
 ### ✅ `pages/srm_calculator.py` — Sample Ratio Mismatch
 Enginized: the chi-squared goodness-of-fit test runs in
@@ -227,25 +253,18 @@ them.
 
 ## Recommended order of remaining work
 
-1. **Pre-Test seasonal forecast → `foe.pretest.forecasting.TrafficForecastingEngine`.**
-   This removes the second Prophet integration; `automation_engine.py` already
-   uses the FOE version.
-2. **User Level Analysis → `foe.continuous`.** A large migration. First decide
+1. **User Level Analysis → `foe.continuous`.** A large migration. First decide
    on the differences in the comparison suite (Welch's ANOVA vs. standard ANOVA
    + Tukey).
-3. **Pre-Test binomial power → `PretestEngine.calculate_power_binomial`.**
-   Needs a decision first, because it changes the method from Cohen's h to an
-   unpooled normal approximation. At the same time, replace the page's calls to
-   FOE private helpers with public API.
-4. **`foe.viz`.** Adopt when chart code gets consolidated; not urgent.
+2. **`foe.viz`.** Adopt when chart code gets consolidated; not urgent.
 
 Done since the previous version of this doc (2026-09-14): Sequential Analysis,
-Interaction Analysis, SRM Check, Behavioral Analysis and Experiment Analysis
-(frequentist path). Small Sample Analysis
+Interaction Analysis, SRM Check, Behavioral Analysis, Experiment Analysis
+(frequentist path) and Pre-Test Analysis. Small Sample Analysis
 was built on FOE from the start. Experimentation Growth is now Hexkit-native by
 decision.
 
 *This document reflects the code as of 2026-11-17 (branch `main`, FOE
-pinned at `5774d86`). Re-check each
+pinned at `d6a9ec3`). Re-check each
 page's `foe` imports before relying on this for planning; both repos are under
 active development.*
