@@ -23,15 +23,5 @@ db-dtypes
 requests>=2.31.0
 pydantic>=2.0.0
 google-genai>=0.3.0
-# Pinned to first-order-engine dc13050 (#24): the Negative Binomial LRT no
-# longer returns p = 1 on equi-/underdispersed counts (alpha at the Poisson
-# boundary) and reports alpha = 0 there. Builds on 11ba165 (#23):
-# ContinuousMetricEngine runs Welch's ANOVA, Tukey HSD, Games-Howell and Dunn
-# natively (no pingouin / scikit-posthocs), reports effect sizes and
-# diagnostics, has zero-aware outlier helpers and an exact Gamma MLE.
-# pages/user_level_analysis.py runs on it. Pinned to a SHA rather than @main
-# because first-order-engine has no versioned releases yet.
-# utility/sql_builder.py and utility/bq_client.py prefer this backend when
-# available (see USING_FOE_BACKEND in each), falling back to their own native
-# implementation otherwise. Bump this SHA deliberately, not accidentally.
-foe[bigquery] @ git+https://github.com/BasLinders/first-order-engine.git@dc1305013e2f092234e049f7abc0904103e2c4c3
+# FOE on main:
+foe[bigquery] @ git+https://github.com/BasLinders/first-order-engine.git@cf10d3d9ee648602a88bcf6332f9103f1854277a
